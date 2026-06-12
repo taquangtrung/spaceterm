@@ -1,0 +1,14 @@
+[package]
+name = "spaceterm-render"
+version = "0.1.0"
+description = "SpaceTerm terminal screen model: a VT-driven cell grid (CPU side of the text grid)."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+glyphon = "0.11"
+pollster = "0.4"
+vte.workspace = true
+wgpu = "29"

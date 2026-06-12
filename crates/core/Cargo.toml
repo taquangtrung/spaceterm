@@ -1,0 +1,17 @@
+[package]
+name = "spaceterm-core"
+version = "0.1.0"
+description = "SpaceTerm core: PTY-driven terminal that parses a session into a block list."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+spaceterm-proto.workspace = true
+portable-pty.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+vte.workspace = true

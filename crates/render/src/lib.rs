@@ -1,0 +1,32 @@
+//! The terminal screen model: a 2D cell grid driven by VT sequences.
+//!
+//! This is the CPU side of the native text grid. [`Grid`] holds styled cells
+//! and a cursor; [`Screen`] drives it from a byte stream via `vte` (printing,
+//! cursor motion, SGR colors, erase, scroll). [`gpu::GpuRenderer`] draws a
+//! `Grid` to a wgpu surface using `cosmic-text` + `glyphon` for glyph rendering.
+
+pub mod gpu;
+mod grid;
+mod screen;
+mod theme;
+
+pub use gpu::{start_font_load, FontConfig, FontLoad, PaneRect, PaneView, StatusBar};
+pub use grid::{Cell, Color, CursorShape, EraseMode, Grid, RgbColor, Style};
+pub use screen::Screen;
+pub use theme::{Rgb as ThemeRgb, Theme};
+
+// ========================================================================
+// Tests
+// ========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_screen_new_dimensions() {
+        let screen = Screen::new(80, 24);
+        assert_eq!(screen.grid().cols(), 80);
+        assert_eq!(screen.grid().rows(), 24);
+    }
+}

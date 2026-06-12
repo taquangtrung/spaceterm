@@ -1,0 +1,23 @@
+[package]
+name = "spaceterm-bindings"
+version = "0.1.0"
+description = "Node native addon (napi-rs) exposing spaceterm-core to JavaScript."
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi.workspace = true
+napi-derive.workspace = true
+spaceterm-core.workspace = true
+
+[build-dependencies]
+napi-build.workspace = true
+
+[dev-dependencies]
+serde_json = { workspace = true }

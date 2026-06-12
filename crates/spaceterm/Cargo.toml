@@ -1,0 +1,36 @@
+[package]
+name = "spaceterm"
+version = "0.0.1"
+description = "SpaceTerm native app."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "spaceterm_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spaceterm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+arboard = "3"
+knuffel = "3.2.0"
+knuffel-derive = "3.2.0"
+spaceterm-core.workspace = true
+spaceterm-mux.workspace = true
+spaceterm-render.workspace = true
+pollster = "0.4"
+portable-pty.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+vte.workspace = true
+wgpu = "29"
+winit = "0.30"
+wry = "0.55"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"

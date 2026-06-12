@@ -1,0 +1,16 @@
+[package]
+name = "spaceterm-mux"
+version = "0.1.0"
+description = "Multiplexer server: headless PTY session manager with attach/detach over Unix sockets."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+spaceterm-core.workspace = true
+spaceterm-render.workspace = true
+portable-pty.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true

@@ -1,0 +1,22 @@
+{
+  "name": "@spaceterm/bindings",
+  "version": "0.1.0",
+  "description": "Node native addon exposing spaceterm-core to JavaScript.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "name": "spaceterm",
+    "triples": {}
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "test": "node test.cjs"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

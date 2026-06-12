@@ -1,0 +1,18 @@
+{
+  "name": "@spaceterm/block-renderer",
+  "version": "0.1.0",
+  "description": "Render TBP MIME bundles to DOM. Shared by the VSCode and native frontends.",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "jsdom": "^25",
+    "prettier": "^3",
+    "typescript": "^5.5",
+    "vitest": "^2"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "@spaceterm/rich-renderers",
+  "version": "0.1.0",
+  "description": "Heavy MIME renderers (KaTeX, Markdown) registered into @spaceterm/block-renderer.",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "katex": "^0.16",
+    "marked": "^12"
+  },
+  "devDependencies": {
+    "@types/katex": "^0.16",
+    "jsdom": "^25",
+    "prettier": "^3",
+    "typescript": "^5.5",
+    "vitest": "^2"
+  }
+}

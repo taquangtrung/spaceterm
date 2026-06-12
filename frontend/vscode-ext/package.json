@@ -1,0 +1,36 @@
+{
+  "name": "spaceterm-vscode",
+  "displayName": "SpaceTerm",
+  "version": "0.1.0",
+  "description": "Rich, web-native terminal inside VSCode (Terminal Block Protocol).",
+  "publisher": "spaceterm",
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Other"],
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      { "command": "spaceterm.open", "title": "SpaceTerm: Open Terminal" },
+      { "command": "spaceterm.commandPalette", "title": "SpaceTerm: Command Palette" }
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p media/tsconfig.json --noEmit",
+    "build": "node esbuild.mjs",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "@xterm/xterm": "^5.5.0",
+    "katex": "^0.16",
+    "marked": "^12",
+    "node-pty": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/katex": "^0.16",
+    "@types/node": "^20",
+    "@types/vscode": "^1.90.0",
+    "esbuild": "^0.23",
+    "prettier": "^3",
+    "typescript": "^5.5"
+  }
+}

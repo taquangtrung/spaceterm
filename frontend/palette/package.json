@@ -1,0 +1,18 @@
+{
+  "name": "@spaceterm/palette",
+  "version": "0.1.0",
+  "description": "Command-palette abstraction: one interface, host-specific backends (VSCode QuickPick, native overlay).",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.90.0",
+    "prettier": "^3",
+    "typescript": "^5.5",
+    "vitest": "^2"
+  }
+}
