@@ -1,7 +1,7 @@
 [package]
 name = "spaceterm"
 version = "0.0.1"
-description = "SpaceTerm native app."
+description = "SpaceTerm: a web-native terminal emulator with GPU rendering and rich MIME-typed block output."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
