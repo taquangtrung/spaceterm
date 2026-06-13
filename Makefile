@@ -1,6 +1,8 @@
 # SpaceTerm — build & test orchestration.
 # Run `make help` for the target list.
 
+.DEFAULT_GOAL := build
+
 CMD ?= ls -la
 FRONTEND_PKGS := frontend/block-renderer frontend/palette frontend/rich-renderers
 

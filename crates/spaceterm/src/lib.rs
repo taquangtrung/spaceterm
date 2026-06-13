@@ -3,19 +3,14 @@
 //! point that creates an [`app::App`] and runs the winit event loop.
 
 pub mod app;
-mod block_queue;
 pub mod config;
-mod input;
-mod layout;
-mod mode;
-pub mod palette;
-pub mod pane;
+pub mod model;
 pub mod session;
-mod webview;
+pub mod terminal;
 
-pub use input::{resolve, Action, BlockNav, Key, KeyCode};
-pub use layout::{Direction, FocusDir, PaneId, Rect, Tab};
-pub use mode::{Mode, ModeEvent};
+pub use model::input::{resolve, Action, BlockNav, Key, KeyCode};
+pub use model::layout::{Direction, FocusDir, PaneId, Rect, Tab};
+pub use model::mode::{Mode, ModeEvent};
 
 // ========================================================================
 // Tests

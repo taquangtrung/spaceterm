@@ -5,8 +5,8 @@
 //! In Block-focus, keys forward to the block until `Esc`. The default bindings
 //! live here; KDL-configured keymaps (§5.7) replace this map later.
 
-use crate::layout::{Direction, FocusDir};
-use crate::mode::{Mode, ModeEvent};
+use super::layout::{Direction, FocusDir};
+use super::mode::{Mode, ModeEvent};
 
 // ========================================================================
 // Data Structures

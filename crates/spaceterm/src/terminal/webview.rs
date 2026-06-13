@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use winit::window::Window;
 use wry::{WebView, WebViewBuilder};
 
-use crate::block_queue::BlockEntry;
+use super::block_queue::BlockEntry;
 use spaceterm_core::spaceterm_proto::{EmitBlock, TrustTier};
 
 // ========================================================================
@@ -53,14 +53,14 @@ pub struct WebViewManager {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct TileKey {
-    pane_id: crate::layout::PaneId,
+    pane_id: crate::model::layout::PaneId,
     block_index: usize,
     segment_index: usize,
 }
 
 struct TileSlot {
     grid_row: usize,
-    pane_id: crate::layout::PaneId,
+    pane_id: crate::model::layout::PaneId,
     trust: TrustTier,
     webview: WebView,
 }
@@ -78,7 +78,7 @@ impl WebViewManager {
 
     pub fn create_block_tile(
         &mut self,
-        pane_id: crate::layout::PaneId,
+        pane_id: crate::model::layout::PaneId,
         entry: &BlockEntry,
         params: TileParams,
         window: &Window,
@@ -166,7 +166,7 @@ impl WebViewManager {
     /// Update the HTML content of an existing tile (for live-block patches).
     pub fn update_tile_html(
         &mut self,
-        pane_id: crate::layout::PaneId,
+        pane_id: crate::model::layout::PaneId,
         entry: &BlockEntry,
         html: &str,
     ) -> Result<(), wry::Error> {
@@ -187,12 +187,12 @@ impl WebViewManager {
     }
 
     /// Remove all WebView tiles belonging to a closed pane.
-    pub fn remove_tiles_for_pane(&mut self, pane_id: crate::layout::PaneId) {
+    pub fn remove_tiles_for_pane(&mut self, pane_id: crate::model::layout::PaneId) {
         self.tiles.retain(|key, _| key.pane_id != pane_id);
     }
 
     /// Hide all WebView tiles for a folded block.
-    pub fn fold_block(&mut self, pane_id: crate::layout::PaneId, block_index: usize) {
+    pub fn fold_block(&mut self, pane_id: crate::model::layout::PaneId, block_index: usize) {
         for (key, slot) in self.tiles.iter_mut() {
             if key.pane_id == pane_id && key.block_index == block_index {
                 let _ = slot.webview.set_visible(false);
@@ -201,7 +201,7 @@ impl WebViewManager {
     }
 
     /// Show all WebView tiles for an unfolded block.
-    pub fn unfold_block(&mut self, pane_id: crate::layout::PaneId, block_index: usize) {
+    pub fn unfold_block(&mut self, pane_id: crate::model::layout::PaneId, block_index: usize) {
         for (key, slot) in self.tiles.iter_mut() {
             if key.pane_id == pane_id && key.block_index == block_index {
                 let _ = slot.webview.set_visible(true);
@@ -214,7 +214,7 @@ impl WebViewManager {
     /// for the focused pane.
     pub fn forward_key_event(
         &mut self,
-        pane_id: crate::layout::PaneId,
+        pane_id: crate::model::layout::PaneId,
         bytes: &[u8],
     ) -> bool {
         let key = String::from_utf8_lossy(bytes);
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn test_tile_key_equality() {
-        let pid = crate::layout::PaneId(0);
+        let pid = crate::model::layout::PaneId(0);
         let a = TileKey {
             pane_id: pid,
             block_index: 1,

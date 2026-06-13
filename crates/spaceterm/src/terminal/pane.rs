@@ -11,7 +11,7 @@ use spaceterm_render::Grid;
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use vte::{Params, Perform};
 
-use crate::block_queue::BlockQueue;
+use super::block_queue::BlockQueue;
 
 // ========================================================================
 // Constants

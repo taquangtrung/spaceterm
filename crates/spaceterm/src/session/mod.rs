@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::layout::{PaneId, Tab};
+use crate::model::layout::{PaneId, Tab};
 
 // ========================================================================
 // Data Structures
@@ -40,7 +40,7 @@ pub struct SplitNode {
 // ========================================================================
 
 impl Session {
-    pub fn save(tab: &Tab, panes: &HashMap<PaneId, crate::pane::Pane>) {
+    pub fn save(tab: &Tab, panes: &HashMap<PaneId, crate::terminal::pane::Pane>) {
         let session = Self::capture(tab, panes);
         if let Ok(json) = serde_json::to_string_pretty(&session) {
             let path = session_path();
@@ -64,7 +64,7 @@ impl Session {
         }
     }
 
-    fn capture(tab: &Tab, panes: &HashMap<PaneId, crate::pane::Pane>) -> Self {
+    fn capture(tab: &Tab, panes: &HashMap<PaneId, crate::terminal::pane::Pane>) -> Self {
         let focused = tab.focused().0;
         let pane_sessions: Vec<PaneSession> = panes
             .keys()
