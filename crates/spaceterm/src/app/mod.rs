@@ -28,7 +28,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::config::Config;
+use crate::config::{Config, StatusBarIconsConfig};
 use crate::model::input::{self, KeyCode, PendingPrefix};
 use crate::model::layout::{Direction, FocusDir, PaneId, Rect, Tab};
 use crate::model::mode::Mode;
@@ -36,7 +36,7 @@ use crate::model::palette::Palette;
 use crate::session::Session;
 use crate::terminal::pane::Pane;
 use crate::terminal::webview::WebViewManager;
-use spaceterm_render::gpu::{GpuRenderer, PaneRect};
+use spaceterm_render::renderer::{GpuRenderer, PaneRect};
 use spaceterm_render::{StatusBar, Theme};
 
 // ========================================================================
@@ -81,17 +81,37 @@ pub(crate) fn content_rows(full_rows: usize) -> usize {
     full_rows.saturating_sub(STATUS_BAR_ROWS).max(1)
 }
 
-/// The status bar for the focused pane's mode: a padded label and a mode-coded
-/// accent color drawn from the theme's ANSI palette.
-fn status_bar(mode: Mode, theme: &Theme) -> StatusBar {
-    let (label, accent) = match mode {
-        Mode::Insert => ("INSERT", theme.ansi[2]),
-        Mode::Normal => ("NORMAL", theme.ansi[4]),
-        Mode::BlockFocus => ("BLOCK", theme.ansi[5]),
+fn status_bar(
+    mode: Mode,
+    theme: &Theme,
+    pane_title: Option<String>,
+    icons: &StatusBarIconsConfig,
+) -> StatusBar {
+    let (mode_name, accent) = match mode {
+        Mode::Insert => ("Insert", theme.ansi[2]),
+        Mode::Normal => ("Normal", theme.ansi[4]),
+        Mode::BlockFocus => ("Block", theme.ansi[5]),
+    };
+    let mode_icon = match mode {
+        Mode::Insert => &icons.insert,
+        Mode::Normal => &icons.normal,
+        Mode::BlockFocus => &icons.block,
+    };
+    let mode_label = if mode_icon.is_empty() {
+        mode_name.to_string()
+    } else {
+        format!("{} {}", mode_icon, mode_name)
+    };
+    let right_label = if icons.branding.is_empty() {
+        None
+    } else {
+        Some(format!("{} spaceterm", icons.branding))
     };
     StatusBar {
         accent,
-        label: format!(" {label} "),
+        mode: mode_label,
+        pane_title,
+        right_label,
     }
 }
 
@@ -140,6 +160,8 @@ pub struct App {
     pub(crate) cursor_pos: (f32, f32),
     pub(crate) dirty: bool,
     pub(crate) folded_blocks: HashMap<PaneId, HashSet<usize>>,
+    /// Raster-image blocks rendered natively on the GPU (instead of a WebView).
+    pub(crate) image_blocks: Vec<ImageBlock>,
     pub(crate) last_click: Option<(Instant, f32, f32)>,
     pub(crate) last_edit_key: Option<Instant>,
     pub(crate) last_tile_layout: Option<(usize, usize, u32, u32)>,
@@ -148,6 +170,7 @@ pub struct App {
     /// The Normal-mode traversal cursor for the focused pane, in viewport
     /// `(row, col)`. `Some` only while that pane is in Normal mode.
     pub(crate) nav_cursor: Option<(usize, usize)>,
+    pub(crate) next_image_id: u64,
     pub(crate) panes: HashMap<PaneId, Pane>,
     pub(crate) palette: Option<Palette>,
     pub(crate) pane_titles: HashMap<PaneId, String>,
@@ -161,6 +184,33 @@ pub struct App {
     pub(crate) webview_mgr: WebViewManager,
     pub(crate) window: Option<Arc<Window>>,
     pub(crate) window_title: String,
+}
+
+/// A block drawn natively via the GPU. `id` keys the renderer's texture cache;
+/// `nat_w`/`nat_h` are the rendered pixel dimensions, used to preserve aspect
+/// ratio when placing it at `grid_row`. Width-wrapped blocks carry their source
+/// in `reflow` so they can be re-rasterized at `rastered_width` on resize.
+pub(crate) struct ImageBlock {
+    /// True for images/SVG (scaled down to fit the reserved band); false for
+    /// text/markdown (shown at native size and clipped to the band).
+    pub fit_to_band: bool,
+    pub grid_row: usize,
+    pub id: u64,
+    /// Band height in rows the block is drawn into — matches the rows reserved
+    /// for it in the grid, so the following prompt sits flush below.
+    pub max_rows: usize,
+    pub nat_h: u32,
+    pub nat_w: u32,
+    pub pane_id: PaneId,
+    pub rastered_width: u32,
+    pub reflow: Option<ReflowSource>,
+}
+
+/// Source content for a width-wrapped native block, retained so the block can
+/// be re-rasterized when the pane width changes.
+pub(crate) enum ReflowSource {
+    Markdown(String),
+    Text(String),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -202,10 +252,12 @@ impl App {
             folded_blocks: HashMap::new(),
             last_click: None,
             last_edit_key: None,
+            image_blocks: Vec::new(),
             last_tile_layout: None,
             modifiers: winit::event::Modifiers::default(),
             mouse_down: false,
             nav_cursor: None,
+            next_image_id: 0,
             panes: HashMap::new(),
             palette: None,
             pane_titles: HashMap::new(),
@@ -260,7 +312,9 @@ impl App {
     }
 
     pub(crate) fn update_window_title(&mut self) {
-        let Some(window) = self.window.clone() else { return };
+        let Some(window) = self.window.clone() else {
+            return;
+        };
 
         let title = if let Some(palette) = &self.palette {
             let selected = palette.selected_action().unwrap_or("");
@@ -326,6 +380,7 @@ impl App {
         self.modes.remove(&pane_id);
         self.pane_titles.remove(&pane_id);
         self.webview_mgr.remove_tiles_for_pane(pane_id);
+        self.image_blocks.retain(|img| img.pane_id != pane_id);
         self.last_tile_layout = None;
         self.tab.close(pane_id);
         if let Some(renderer) = &self.renderer {
@@ -411,7 +466,12 @@ impl App {
             (9.0, 20.0)
         };
 
-        let layout_vp = Rect::new(0.0, 0.0, full_cols as f32 * cw, content_rows(full_rows) as f32 * ch);
+        let layout_vp = Rect::new(
+            0.0,
+            0.0,
+            full_cols as f32 * cw,
+            content_rows(full_rows) as f32 * ch,
+        );
         let rects = self.tab.rects(layout_vp);
 
         for (id, rect) in rects {
@@ -480,8 +540,7 @@ impl App {
                     _ => FocusDir::Right,
                 };
                 let viewport = self.viewport_rect();
-                let layout_vp =
-                    Rect::new(viewport.x, viewport.y, viewport.width, viewport.height);
+                let layout_vp = Rect::new(viewport.x, viewport.y, viewport.width, viewport.height);
                 self.tab.focus_in_direction(dir, layout_vp);
             }
             "search" => {
@@ -500,10 +559,7 @@ impl App {
                 self.yank_block_source(focused);
             }
             "toggle_fold" => {
-                let folded = self
-                    .folded_blocks
-                    .entry(focused)
-                    .or_default();
+                let folded = self.folded_blocks.entry(focused).or_default();
                 if folded.is_empty() {
                     folded.insert(0);
                 } else {
@@ -656,10 +712,7 @@ impl ApplicationHandler for App {
 
             WindowEvent::MouseInput { state, button, .. } => {
                 let focused = self.tab.focused();
-                let mouse_active = self
-                    .panes
-                    .get(&focused)
-                    .is_some_and(|p| p.mouse_tracking());
+                let mouse_active = self.panes.get(&focused).is_some_and(|p| p.mouse_tracking());
 
                 if mouse_active {
                     self.forward_mouse_event(state, button, focused);
@@ -667,37 +720,37 @@ impl ApplicationHandler for App {
                 }
 
                 match (state, button) {
-                (ElementState::Pressed, MouseButton::Left) => {
-                    self.mouse_down = true;
-                    self.selection = None;
+                    (ElementState::Pressed, MouseButton::Left) => {
+                        self.mouse_down = true;
+                        self.selection = None;
 
-                    let (x, y) = self.cursor_pos;
-                    if let Some((pane_id, pane_rect)) = self.pane_at_pixel(x, y) {
-                        self.tab.focus(pane_id);
-                        let (row, col) = self.pixel_to_cell(x, y, pane_rect);
-                        let now = Instant::now();
-                        if let Some((prev_time, prev_x, prev_y)) = self.last_click {
-                            let dist = ((x - prev_x).powi(2) + (y - prev_y).powi(2)).sqrt();
-                            if now.duration_since(prev_time) < Duration::from_millis(400)
-                                && dist < 5.0
-                            {
-                                self.select_word_at(pane_id, row, col);
+                        let (x, y) = self.cursor_pos;
+                        if let Some((pane_id, pane_rect)) = self.pane_at_pixel(x, y) {
+                            self.tab.focus(pane_id);
+                            let (row, col) = self.pixel_to_cell(x, y, pane_rect);
+                            let now = Instant::now();
+                            if let Some((prev_time, prev_x, prev_y)) = self.last_click {
+                                let dist = ((x - prev_x).powi(2) + (y - prev_y).powi(2)).sqrt();
+                                if now.duration_since(prev_time) < Duration::from_millis(400)
+                                    && dist < 5.0
+                                {
+                                    self.select_word_at(pane_id, row, col);
+                                }
                             }
+                            self.last_click = Some((now, x, y));
                         }
-                        self.last_click = Some((now, x, y));
-                    }
 
-                    self.dirty = true;
+                        self.dirty = true;
+                    }
+                    (ElementState::Released, MouseButton::Left) => {
+                        self.mouse_down = false;
+                        self.copy_selection();
+                    }
+                    (ElementState::Pressed, MouseButton::Middle) => {
+                        self.paste_from_clipboard();
+                    }
+                    _ => {}
                 }
-                (ElementState::Released, MouseButton::Left) => {
-                    self.mouse_down = false;
-                    self.copy_selection();
-                }
-                (ElementState::Pressed, MouseButton::Middle) => {
-                    self.paste_from_clipboard();
-                }
-                _ => {}
-            }
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -747,11 +800,7 @@ impl ApplicationHandler for App {
                 };
 
                 let focused = self.tab.focused();
-                if self
-                    .panes
-                    .get(&focused)
-                    .is_some_and(|p| p.mouse_tracking())
-                {
+                if self.panes.get(&focused).is_some_and(|p| p.mouse_tracking()) {
                     self.forward_mouse_scroll(scroll_lines, focused);
                     return;
                 }
@@ -873,12 +922,22 @@ mod tests {
     #[test]
     fn test_status_bar_labels_each_mode() {
         let theme = Theme::dark();
-        assert_eq!(status_bar(Mode::Insert, &theme).label, " INSERT ");
-        assert_eq!(status_bar(Mode::Normal, &theme).label, " NORMAL ");
-        assert_eq!(status_bar(Mode::BlockFocus, &theme).label, " BLOCK ");
+        let icons = StatusBarIconsConfig::default();
+        assert_eq!(
+            status_bar(Mode::Insert, &theme, None, &icons).mode,
+            "\u{f03eb} Insert"
+        );
+        assert_eq!(
+            status_bar(Mode::Normal, &theme, None, &icons).mode,
+            "\u{e795} Normal"
+        );
+        assert_eq!(
+            status_bar(Mode::BlockFocus, &theme, None, &icons).mode,
+            "\u{f0485} Block"
+        );
         assert_ne!(
-            status_bar(Mode::Insert, &theme).accent,
-            status_bar(Mode::Normal, &theme).accent
+            status_bar(Mode::Insert, &theme, None, &icons).accent,
+            status_bar(Mode::Normal, &theme, None, &icons).accent
         );
     }
 

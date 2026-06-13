@@ -69,7 +69,7 @@ impl Session {
         let pane_sessions: Vec<PaneSession> = panes
             .keys()
             .map(|id| PaneSession {
-            id: id.0 as usize,
+                id: id.0 as usize,
                 command: None,
                 cwd: None,
             })

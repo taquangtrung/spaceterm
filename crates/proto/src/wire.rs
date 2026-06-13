@@ -96,6 +96,22 @@ fn encode_emit(block: &EmitBlock) -> String {
     frame(VERB_EMIT, &params, Some(encode_json(&block.bundle)))
 }
 
+/// Render a file-referenced emit: the block carries a `file=` reference (a name
+/// the terminal resolves through its side-channel directory) and its `mime`,
+/// instead of an inline base64 payload. This keeps the escape tiny regardless of
+/// payload size, so large images are not dropped by the terminal's OSC length
+/// limit. The reader side is [`decode_with_sidechannel`].
+pub fn encode_emit_file(id: BlockId, trust: TrustTier, file_name: &str, mime: &str) -> String {
+    let params = [
+        (PARAM_VERSION, PROTOCOL_VERSION.0.to_string()),
+        (PARAM_ID, id.0.to_string()),
+        (PARAM_TRUST, trust.as_str().to_string()),
+        (PARAM_MIME, mime.to_string()),
+        (PARAM_FILE, file_name.to_string()),
+    ];
+    frame(VERB_EMIT, &params, None)
+}
+
 fn encode_open(block: &OpenBlock) -> String {
     let params = [
         (PARAM_ID, block.id.0.to_string()),
@@ -288,6 +304,25 @@ mod tests {
     }
 
     #[test]
+    fn test_file_referenced_emit_resolves_via_sidechannel() {
+        let escape = encode_emit_file(BlockId(7), TrustTier::Restricted, "img.bin", "image/png");
+        // The escape stays tiny: no inline payload regardless of file size.
+        assert!(!escape.contains(";9001;emit;") || escape.len() < 100);
+        let message = decode_with_sidechannel(strip_frame(&escape), |path| {
+            assert_eq!(path, "img.bin");
+            Ok(b"RAWPNGBYTES".to_vec())
+        })
+        .expect("decodes");
+        match message {
+            Message::Emit(block) => {
+                assert_eq!(block.id, BlockId(7));
+                assert!(block.bundle.get("image/png").is_some());
+            }
+            other => panic!("expected emit, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_open_patch_close_round_trip() {
         let open = Message::Open(OpenBlock {
             id: BlockId(7),
@@ -380,9 +415,7 @@ mod tests {
 
     #[test]
     fn test_side_channel_path_traversal_calls_reader() {
-        let body = format!(
-            "{OSC_NUMBER};{VERB_EMIT};{PARAM_ID}=1,{PARAM_FILE}=../etc/passwd"
-        );
+        let body = format!("{OSC_NUMBER};{VERB_EMIT};{PARAM_ID}=1,{PARAM_FILE}=../etc/passwd");
         let result = decode_with_sidechannel(&body, |path| {
             assert!(path.contains(".."));
             Err(ProtoError::MalformedFrame)
@@ -394,8 +427,7 @@ mod tests {
     fn test_side_channel_falls_back_to_inline_when_no_file_param() {
         let bundle = encode_json(&MimeBundle::new());
         let body = format!("{OSC_NUMBER};{VERB_EMIT};{PARAM_ID}=5;{bundle}");
-        let result =
-            decode_with_sidechannel(&body, |_path| Err(ProtoError::MalformedFrame));
+        let result = decode_with_sidechannel(&body, |_path| Err(ProtoError::MalformedFrame));
         assert!(result.is_ok());
     }
 }

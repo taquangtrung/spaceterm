@@ -9,9 +9,9 @@
 use std::env;
 use std::process::ExitCode;
 
+use portable_pty::CommandBuilder;
 use spaceterm_core::run_to_completion;
 use spaceterm_render::Screen;
-use portable_pty::CommandBuilder;
 
 // ============================================================================
 // Entry point

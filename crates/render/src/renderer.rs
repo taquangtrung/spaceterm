@@ -24,6 +24,7 @@ use wgpu::{
 };
 
 use crate::grid::{Color as GridColor, CursorShape, Grid, RgbColor};
+use crate::image::{ImagePass, ImagePlacement};
 use crate::theme::{Rgb, Theme};
 
 // ========================================================================
@@ -36,6 +37,7 @@ const BG_SHADER: &str = include_str!("bg.wgsl");
 const CURSOR_BAR_WIDTH_RATIO: f32 = 0.15;
 const CURSOR_UNDERLINE_HEIGHT_RATIO: f32 = 0.2;
 const BG_BUFFER_SIZE: u64 = 4 * 1024 * 1024;
+const MAX_SVG_DIM: u32 = 4096;
 
 // ========================================================================
 // Data Structures
@@ -70,7 +72,9 @@ pub struct PaneView<'a> {
 /// colors. Occupies the bottom-most cell row of the surface.
 pub struct StatusBar {
     pub accent: Rgb,
-    pub label: String,
+    pub mode: String,
+    pub pane_title: Option<String>,
+    pub right_label: Option<String>,
 }
 
 /// Font selection for the renderer. `family` is the primary family name (e.g.
@@ -141,6 +145,11 @@ pub struct GpuRenderer {
     /// Persistent one-line buffer for the bottom status bar, reused like the
     /// pane buffers so its glyphs are only reshaped when the label changes.
     status_buffer: Option<glyphon::Buffer>,
+    /// Textured-quad pass for image blocks rendered natively (no webview).
+    image_pass: ImagePass,
+    /// System fonts for SVG text, loaded lazily on first SVG with text and then
+    /// reused (the scan costs ~150ms, so it is deferred off the startup path).
+    svg_fontdb: Option<std::sync::Arc<resvg::usvg::fontdb::Database>>,
 }
 
 #[repr(C)]
@@ -210,8 +219,12 @@ impl GpuRenderer {
         let viewport = Viewport::new(&device, &cache);
 
         let mut font_system = font_load.join();
-        let (cell_width, cell_height) =
-            measure_cell(&mut font_system, font_size, line_height, font_family.as_deref());
+        let (cell_width, cell_height) = measure_cell(
+            &mut font_system,
+            font_size,
+            line_height,
+            font_family.as_deref(),
+        );
 
         let bg_pipeline = create_bg_pipeline(&device, format);
         let bg_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -223,6 +236,8 @@ impl GpuRenderer {
 
         let cols = (width as f32 / cell_width).floor() as usize;
         let rows = (height as f32 / cell_height).floor() as usize;
+
+        let image_pass = ImagePass::new(&device, format);
 
         Self {
             device,
@@ -247,12 +262,202 @@ impl GpuRenderer {
             theme: Theme::default(),
             text_buffers: Vec::new(),
             status_buffer: None,
+            image_pass,
+            svg_fontdb: None,
         }
     }
 
     /// Apply a new color theme.
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
+    }
+
+    /// Decode `encoded` image bytes (PNG/JPEG/GIF/WebP) and cache them as a GPU
+    /// texture under `id`. Returns the pixel dimensions, or `None` if the bytes
+    /// could not be decoded.
+    pub fn upload_image(&mut self, id: u64, encoded: &[u8]) -> Option<(u32, u32)> {
+        let rgba = image::load_from_memory(encoded).ok()?.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        self.image_pass
+            .upload(&self.device, &self.queue, id, &rgba, width, height);
+        Some((width, height))
+    }
+
+    /// Rasterize an SVG document (at its intrinsic size) and cache it as a GPU
+    /// texture under `id`. Returns the rasterized pixel dimensions, or `None` if
+    /// the SVG could not be parsed. (Rasterizing at intrinsic size keeps sizing
+    /// consistent with raster images; display-size re-rasterization is a future
+    /// refinement.)
+    pub fn upload_svg(&mut self, id: u64, svg: &[u8]) -> Option<(u32, u32)> {
+        let fontdb = self.svg_fontdb();
+        let options = resvg::usvg::Options {
+            fontdb,
+            ..Default::default()
+        };
+        let tree = resvg::usvg::Tree::from_data(svg, &options).ok()?;
+        let size = tree.size();
+        if size.width() <= 0.0 || size.height() <= 0.0 {
+            return None;
+        }
+        let width = (size.width().round() as u32).clamp(1, MAX_SVG_DIM);
+        let height = (size.height().round() as u32).clamp(1, MAX_SVG_DIM);
+
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+        let transform = resvg::tiny_skia::Transform::from_scale(
+            width as f32 / size.width(),
+            height as f32 / size.height(),
+        );
+        resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+        // tiny-skia stores premultiplied alpha; the image pass blends straight
+        // alpha, so demultiply on the way out.
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for pixel in pixmap.pixels() {
+            let color = pixel.demultiply();
+            rgba.extend_from_slice(&[color.red(), color.green(), color.blue(), color.alpha()]);
+        }
+
+        self.image_pass
+            .upload(&self.device, &self.queue, id, &rgba, width, height);
+        Some((width, height))
+    }
+
+    /// The system-font database for SVG text, scanned once on first use and
+    /// then reused.
+    fn svg_fontdb(&mut self) -> std::sync::Arc<resvg::usvg::fontdb::Database> {
+        if let Some(db) = &self.svg_fontdb {
+            return db.clone();
+        }
+        let mut db = resvg::usvg::fontdb::Database::new();
+        db.load_system_fonts();
+        let db = std::sync::Arc::new(db);
+        self.svg_fontdb = Some(db.clone());
+        db
+    }
+
+    /// Lay out `markdown` with `cosmic-text` (wrapped to `wrap_width`), software-
+    /// rasterize it over the theme background, and cache it as a GPU texture
+    /// under `id`. Returns the rendered pixel dimensions.
+    pub fn upload_markdown(
+        &mut self,
+        id: u64,
+        markdown: &str,
+        wrap_width: f32,
+    ) -> Option<(u32, u32)> {
+        let width = (wrap_width.floor() as u32).clamp(1, MAX_SVG_DIM);
+        let spans = crate::markdown::parse(markdown);
+        let fam = self.font_family.clone();
+        let fg = self.theme.foreground.to_glyphon();
+        let code_color = self.theme.ansi[3].to_glyphon();
+
+        let mut buffer = glyphon::Buffer::new(
+            &mut self.font_system,
+            glyphon::Metrics::new(self.font_size, self.line_height),
+        );
+        buffer.set_size(&mut self.font_system, Some(width as f32), None);
+
+        let default_attrs = Attrs::new().family(base_family(fam.as_deref())).color(fg);
+        let attr_spans: Vec<(&str, Attrs)> = spans
+            .iter()
+            .map(|span| {
+                let mut attrs = if span.mono {
+                    Attrs::new().family(Family::Monospace).color(code_color)
+                } else {
+                    Attrs::new().family(base_family(fam.as_deref())).color(fg)
+                };
+                if span.bold {
+                    attrs = attrs.weight(glyphon::cosmic_text::Weight::BOLD);
+                }
+                if span.italic {
+                    attrs = attrs.style(glyphon::cosmic_text::Style::Italic);
+                }
+                (span.text.as_str(), attrs)
+            })
+            .collect();
+        buffer.set_rich_text(
+            &mut self.font_system,
+            attr_spans,
+            &default_attrs,
+            Shaping::Advanced,
+            None,
+        );
+        self.rasterize_buffer(id, buffer, width)
+    }
+
+    /// Lay out preformatted monospace text (CSV tables, pretty-printed JSON, ...)
+    /// wrapped to `wrap_width` and rasterize it to a cached texture. Returns the
+    /// rendered pixel dimensions.
+    pub fn upload_text(&mut self, id: u64, text: &str, wrap_width: f32) -> Option<(u32, u32)> {
+        let width = (wrap_width.floor() as u32).clamp(1, MAX_SVG_DIM);
+        let attrs = Attrs::new()
+            .family(Family::Monospace)
+            .color(self.theme.foreground.to_glyphon());
+        let mut buffer = glyphon::Buffer::new(
+            &mut self.font_system,
+            glyphon::Metrics::new(self.font_size, self.line_height),
+        );
+        buffer.set_size(&mut self.font_system, Some(width as f32), None);
+        buffer.set_rich_text(
+            &mut self.font_system,
+            [(text, attrs.clone())],
+            &attrs,
+            Shaping::Advanced,
+            None,
+        );
+        self.rasterize_buffer(id, buffer, width)
+    }
+
+    /// Shape `buffer`, measure its height, software-rasterize its glyphs over an
+    /// opaque themed background, and cache the result as a texture under `id`.
+    fn rasterize_buffer(
+        &mut self,
+        id: u64,
+        mut buffer: glyphon::Buffer,
+        width: u32,
+    ) -> Option<(u32, u32)> {
+        buffer.shape_until_scroll(&mut self.font_system, false);
+        let mut content_h = 0.0_f32;
+        for run in buffer.layout_runs() {
+            content_h = content_h.max(run.line_top + run.line_height);
+        }
+        let height = (content_h.ceil() as u32).clamp(1, MAX_SVG_DIM);
+
+        // Software-composite glyph coverage over an opaque themed background.
+        let bg = self.theme.background;
+        let fg = self.theme.foreground.to_glyphon();
+        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[bg.r, bg.g, bg.b, 255]);
+        }
+        let font_system = &mut self.font_system;
+        let swash_cache = &mut self.swash_cache;
+        buffer.draw(font_system, swash_cache, fg, |x, y, w, h, color| {
+            let alpha = color.a() as f32 / 255.0;
+            if alpha <= 0.0 {
+                return;
+            }
+            let (cr, cg, cb) = (color.r() as f32, color.g() as f32, color.b() as f32);
+            for py in y..y + h as i32 {
+                for px in x..x + w as i32 {
+                    if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
+                        continue;
+                    }
+                    let idx = ((py as u32 * width + px as u32) * 4) as usize;
+                    rgba[idx] = (cr * alpha + rgba[idx] as f32 * (1.0 - alpha)) as u8;
+                    rgba[idx + 1] = (cg * alpha + rgba[idx + 1] as f32 * (1.0 - alpha)) as u8;
+                    rgba[idx + 2] = (cb * alpha + rgba[idx + 2] as f32 * (1.0 - alpha)) as u8;
+                }
+            }
+        });
+
+        self.image_pass
+            .upload(&self.device, &self.queue, id, &rgba, width, height);
+        Some((width, height))
+    }
+
+    /// Whether an image texture is already cached for `id`.
+    pub fn has_image(&self, id: u64) -> bool {
+        self.image_pass.has(id)
     }
 
     /// Current theme colors.
@@ -295,7 +500,13 @@ impl GpuRenderer {
     /// and its viewport rect. Pane dividers are drawn between adjacent panes.
     /// When `status` is set, a status bar is drawn across the bottom cell row;
     /// callers must leave that row free of panes (see [`Self::cell_size`]).
-    pub fn render(&mut self, panes: &[PaneView], status: Option<&StatusBar>, bell_active: bool) {
+    pub fn render(
+        &mut self,
+        panes: &[PaneView],
+        status: Option<&StatusBar>,
+        bell_active: bool,
+        images: &[ImagePlacement],
+    ) {
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => t,
             wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -455,9 +666,12 @@ impl GpuRenderer {
                 if i < buffer.lines.len() {
                     buffer.lines[i].set_text(&text, ending, attrs_list);
                 } else {
-                    buffer
-                        .lines
-                        .push(BufferLine::new(&text, ending, attrs_list, Shaping::Advanced));
+                    buffer.lines.push(BufferLine::new(
+                        &text,
+                        ending,
+                        attrs_list,
+                        Shaping::Advanced,
+                    ));
                 }
             }
             buffer.lines.truncate(row_count);
@@ -486,38 +700,114 @@ impl GpuRenderer {
         });
         let status_top = surface_h - self.cell_height;
         if let Some(status) = status {
-            let label_width = status.label.chars().count() as f32 * self.cell_width;
+            // Draw a thin 1px top border divider using the theme's divider color
             all_bg_verts.extend_from_slice(&quad_vertices(
                 0.0,
                 status_top,
+                surface_w,
+                status_top + 1.0,
+                self.theme.divider.as_linear(),
+                surface_w,
+                surface_h,
+            ));
+
+            // Draw status bar background spanning full width
+            all_bg_verts.extend_from_slice(&quad_vertices(
+                0.0,
+                status_top + 1.0,
                 surface_w,
                 surface_h,
                 self.theme.status_bar_bg.as_linear(),
                 surface_w,
                 surface_h,
             ));
+
+            // Draw a subtle vertical accent bar on the left edge (4px wide)
             all_bg_verts.extend_from_slice(&quad_vertices(
                 0.0,
-                status_top,
-                label_width,
+                status_top + 1.0,
+                4.0,
                 surface_h,
                 status.accent.as_linear(),
                 surface_w,
                 surface_h,
             ));
 
-            let attrs = Attrs::new()
+            // Build status bar text segments dynamically
+            let mut status_text = String::new();
+            let mut spans = Vec::new();
+
+            // Font attributes
+            let accent_attrs = Attrs::new()
                 .family(base_family(fam))
                 .weight(glyphon::cosmic_text::Weight::BOLD)
-                .color(self.theme.status_bar_fg.to_glyphon());
-            let attrs_list = glyphon::AttrsList::new(&attrs);
+                .color(status.accent.to_glyphon());
+            let foreground_attrs = Attrs::new()
+                .family(base_family(fam))
+                .color(self.theme.foreground.to_glyphon());
+            let muted_attrs = Attrs::new()
+                .family(base_family(fam))
+                .color(self.theme.ansi[8].to_glyphon());
+
+            // Left padding
+            status_text.push_str("  ");
+
+            // Mode Label (e.g. Normal, Insert, Block)
+            let mode_start = status_text.len();
+            status_text.push_str(&status.mode);
+            let mode_end = status_text.len();
+            spans.push((mode_start..mode_end, accent_attrs));
+
+            // Pane Title / Command (if present)
+            if let Some(ref title) = status.pane_title {
+                let sep_start = status_text.len();
+                status_text.push_str("  •  ");
+                let sep_end = status_text.len();
+                spans.push((sep_start..sep_end, muted_attrs.clone()));
+
+                let title_start = status_text.len();
+                status_text.push_str(title);
+                let title_end = status_text.len();
+                spans.push((title_start..title_end, foreground_attrs));
+            }
+
+            // Right-aligned branding info
+            let right_text_str = status
+                .right_label
+                .as_deref()
+                .unwrap_or("\u{f0697} spaceterm");
+            let right_text = format!("{}  ", right_text_str);
+            let left_len = status_text.chars().count();
+            let right_len = right_text.chars().count();
+            if left_len + right_len < self.cols {
+                let spaces = self.cols - left_len - right_len;
+                status_text.extend(std::iter::repeat(' ').take(spaces));
+
+                let right_start = status_text.len();
+                status_text.push_str(&right_text);
+                let right_end = status_text.len();
+                spans.push((right_start..right_end, muted_attrs));
+            }
+
+            // Apply attributes to the text buffer line
+            let default_attrs = Attrs::new()
+                .family(base_family(fam))
+                .color(self.theme.ansi[8].to_glyphon());
+            let mut attrs_list = glyphon::AttrsList::new(&default_attrs);
+            for (range, attrs) in spans {
+                attrs_list.add_span(range, &attrs);
+            }
+
             let ending = glyphon::cosmic_text::LineEnding::default();
             if status_buffer.lines.is_empty() {
-                status_buffer
-                    .lines
-                    .push(BufferLine::new(&status.label, ending, attrs_list, Shaping::Advanced));
+                status_buffer.lines.push(BufferLine::new(
+                    &status_text,
+                    ending,
+                    attrs_list,
+                    Shaping::Advanced,
+                ));
             } else {
-                status_buffer.lines[0].set_text(&status.label, ending, attrs_list);
+                status_buffer.lines[0].set_text(&status_text, ending, attrs_list);
             }
             status_buffer.lines.truncate(1);
             status_buffer.shape_until_scroll(&mut self.font_system, false);
@@ -576,6 +866,9 @@ impl GpuRenderer {
         let bg_count = all_bg_verts.len() as u32;
         let bg_bytes: Vec<u8> = all_bg_verts.iter().flat_map(|v| v.to_bytes()).collect();
         self.queue.write_buffer(&self.bg_buffer, 0, &bg_bytes);
+
+        self.image_pass
+            .prepare(&self.queue, images, surface_w, surface_h);
 
         let mut text_areas: Vec<TextArea> = text_buffers
             .iter()
@@ -667,6 +960,8 @@ impl GpuRenderer {
             self.text_renderer
                 .render(&self.text_atlas, &self.viewport, &mut pass)
                 .expect("glyphon render");
+
+            self.image_pass.render(&mut pass);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

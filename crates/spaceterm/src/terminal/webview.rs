@@ -253,7 +253,9 @@ fn sandboxed_html(content_html: &str, trust: TrustTier) -> String {
             if content_html.contains("<head>") {
                 content_html.replace(
                     "<head>",
-                    &format!("<head><meta http-equiv=\"Content-Security-Policy\" content=\"{policy}\">"),
+                    &format!(
+                        "<head><meta http-equiv=\"Content-Security-Policy\" content=\"{policy}\">"
+                    ),
                 )
             } else {
                 format!(
@@ -265,9 +267,41 @@ fn sandboxed_html(content_html: &str, trust: TrustTier) -> String {
     }
 }
 
-pub fn render_block_html(emit: &EmitBlock) -> String {
+pub fn render_block_html(
+    emit: &EmitBlock,
+    theme: &spaceterm_render::Theme,
+    font_family: Option<&str>,
+    font_size: f32,
+) -> String {
     let content = richest_content(emit);
-    BLOCK_HTML_SHELL.replace("{{CONTENT}}", &content)
+    let bg_color = format!(
+        "#{:02x}{:02x}{:02x}",
+        theme.background.r, theme.background.g, theme.background.b
+    );
+    let fg_color = format!(
+        "#{:02x}{:02x}{:02x}",
+        theme.foreground.r, theme.foreground.g, theme.foreground.b
+    );
+    let font_family_str = match font_family {
+        Some(f) if !f.trim().is_empty() => format!("'{}', monospace", f),
+        _ => "monospace".to_string(),
+    };
+
+    BLOCK_HTML_SHELL
+        .replace("{{BG_COLOR}}", &bg_color)
+        .replace("{{FG_COLOR}}", &fg_color)
+        .replace("{{FONT_FAMILY}}", &font_family_str)
+        .replace("{{FONT_SIZE}}", &font_size.to_string())
+        .replace("{{CONTENT}}", &content)
+}
+
+/// The richest MIME present in the bundle, per the render priority order. Used
+/// by the app to route a block to the right backend (native GPU vs WebView).
+pub fn richest_mime(emit: &EmitBlock) -> Option<&'static str> {
+    MIME_RICHNESS
+        .iter()
+        .copied()
+        .find(|mime| emit.bundle.get(mime).is_some())
 }
 
 fn richest_content(emit: &EmitBlock) -> String {
@@ -414,8 +448,8 @@ impl Default for WebViewManager {
 
 #[cfg(test)]
 mod tests {
-    use spaceterm_core::spaceterm_proto::{BlockId, EmitBlock, MimeBundle, TrustTier};
     use serde_json::Value;
+    use spaceterm_core::spaceterm_proto::{BlockId, EmitBlock, MimeBundle, TrustTier};
 
     use super::*;
 
@@ -460,7 +494,8 @@ mod tests {
 
     #[test]
     fn test_render_block_html_svg() {
-        let html = render_block_html(&svg_emit());
+        let theme = spaceterm_render::Theme::dark();
+        let html = render_block_html(&svg_emit(), &theme, None, 14.0);
         assert!(html.contains("<svg width='10'/>"), "{html}");
         assert!(!html.contains("{{CONTENT}}"), "{html}");
     }
@@ -474,7 +509,8 @@ mod tests {
             id: BlockId(2),
             trust: TrustTier::Restricted,
         };
-        let html = render_block_html(&emit);
+        let theme = spaceterm_render::Theme::dark();
+        let html = render_block_html(&emit, &theme, None, 14.0);
         assert!(html.contains("hello &lt;world&gt;"), "{html}");
     }
 
@@ -538,7 +574,8 @@ mod tests {
             id: BlockId(10),
             trust: TrustTier::Trusted,
         };
-        let html = render_block_html(&emit);
+        let theme = spaceterm_render::Theme::dark();
+        let html = render_block_html(&emit, &theme, None, 14.0);
         assert!(html.contains("<h2>Hello</h2>"), "{html}");
         assert!(html.contains("<p>world</p>"), "{html}");
     }
@@ -552,7 +589,8 @@ mod tests {
             id: BlockId(11),
             trust: TrustTier::Restricted,
         };
-        let html = render_block_html(&emit);
+        let theme = spaceterm_render::Theme::dark();
+        let html = render_block_html(&emit, &theme, None, 14.0);
         assert!(html.contains("&quot;key&quot;"), "{html}");
     }
 
@@ -565,7 +603,8 @@ mod tests {
             id: BlockId(12),
             trust: TrustTier::Restricted,
         };
-        let html = render_block_html(&emit);
+        let theme = spaceterm_render::Theme::dark();
+        let html = render_block_html(&emit, &theme, None, 14.0);
         assert!(html.contains("<th"), "{html}");
         assert!(html.contains("<td"), "{html}");
         assert!(html.contains("Alice"), "{html}");

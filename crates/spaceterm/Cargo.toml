@@ -18,6 +18,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 arboard = "3"
+base64.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 knuffel = "3.2.0"
 knuffel-derive = "3.2.0"
 spaceterm-core.workspace = true

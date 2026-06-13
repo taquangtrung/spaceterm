@@ -42,6 +42,25 @@ use spaceterm_render::{Theme, ThemeRgb};
 // ========================================================================
 
 #[derive(Clone, Debug)]
+pub struct StatusBarIconsConfig {
+    pub normal: String,
+    pub insert: String,
+    pub block: String,
+    pub branding: String,
+}
+
+impl Default for StatusBarIconsConfig {
+    fn default() -> Self {
+        Self {
+            normal: "\u{e795}".to_string(),    // 
+            insert: "\u{f03eb}".to_string(),   // 󰏫
+            block: "\u{f0485}".to_string(),    // 󰒅
+            branding: "\u{f0697}".to_string(), // 󰚗
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Config {
     pub colors: ColorOverrides,
     pub font_family: Option<String>,
@@ -49,6 +68,7 @@ pub struct Config {
     pub keybindings: HashMap<String, HashMap<String, String>>,
     pub opacity: f32,
     pub theme: ThemeSetting,
+    pub status_bar_icons: StatusBarIconsConfig,
 }
 
 /// Per-color overrides parsed from the KDL `colors` block. Applied on top of the
@@ -137,6 +157,20 @@ struct KdlConfig {
     opacity: Option<KdlOpacity>,
     #[knuffel(child)]
     theme: Option<KdlTheme>,
+    #[knuffel(child)]
+    status_bar: Option<KdlStatusBar>,
+}
+
+#[derive(knuffel::Decode)]
+struct KdlStatusBar {
+    #[knuffel(child, unwrap(argument))]
+    normal_icon: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    insert_icon: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    block_icon: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    branding_icon: Option<String>,
 }
 
 #[derive(knuffel::Decode)]
@@ -269,23 +303,34 @@ impl Config {
                 kb.modes
                     .into_iter()
                     .map(|m| {
-                        let bindings = m
-                            .bindings
-                            .into_iter()
-                            .map(|b| (b.key, b.action))
-                            .collect();
+                        let bindings = m.bindings.into_iter().map(|b| (b.key, b.action)).collect();
                         (m.name, bindings)
                     })
                     .collect()
             })
             .unwrap_or_default();
 
+        let status_bar_icons = kdl
+            .status_bar
+            .map(|sb| StatusBarIconsConfig {
+                normal: sb
+                    .normal_icon
+                    .unwrap_or_else(|| StatusBarIconsConfig::default().normal),
+                insert: sb
+                    .insert_icon
+                    .unwrap_or_else(|| StatusBarIconsConfig::default().insert),
+                block: sb
+                    .block_icon
+                    .unwrap_or_else(|| StatusBarIconsConfig::default().block),
+                branding: sb
+                    .branding_icon
+                    .unwrap_or_else(|| StatusBarIconsConfig::default().branding),
+            })
+            .unwrap_or_default();
+
         Config {
             colors: kdl.colors.map(color_overrides_from_kdl).unwrap_or_default(),
-            font_family: kdl
-                .font
-                .map(|f| f.value)
-                .filter(|s| !s.trim().is_empty()),
+            font_family: kdl.font.map(|f| f.value).filter(|s| !s.trim().is_empty()),
             font_size: kdl
                 .font_size
                 .as_ref()
@@ -299,6 +344,7 @@ impl Config {
                 .unwrap_or(1.0f32)
                 .clamp(0.1, 1.0),
             theme,
+            status_bar_icons,
         }
     }
 }
@@ -312,6 +358,7 @@ impl Default for Config {
             keybindings: HashMap::new(),
             opacity: 1.0,
             theme: ThemeSetting::default(),
+            status_bar_icons: StatusBarIconsConfig::default(),
         }
     }
 }
@@ -321,8 +368,13 @@ fn color_overrides_from_kdl(kdl: KdlColors) -> ColorOverrides {
         s.and_then(|v| ThemeRgb::parse_hex(&v))
     }
     fn hex_list(list: Option<KdlColorList>) -> Vec<ThemeRgb> {
-        list.map(|l| l.values.iter().filter_map(|s| ThemeRgb::parse_hex(s)).collect())
-            .unwrap_or_default()
+        list.map(|l| {
+            l.values
+                .iter()
+                .filter_map(|s| ThemeRgb::parse_hex(s))
+                .collect()
+        })
+        .unwrap_or_default()
     }
 
     ColorOverrides {
@@ -454,10 +506,7 @@ keybindings {
         assert_eq!(normal.get("j"), Some(&"focus_down".to_string()));
         assert_eq!(normal.get("k"), Some(&"focus_up".to_string()));
         let insert = config.keybindings.get("insert").unwrap();
-        assert_eq!(
-            insert.get("Ctrl-Space"),
-            Some(&"toggle_mode".to_string())
-        );
+        assert_eq!(insert.get("Ctrl-Space"), Some(&"toggle_mode".to_string()));
     }
 
     #[test]
@@ -470,5 +519,23 @@ keybindings {
     fn test_parse_invalid_returns_default() {
         let config = Config::parse("this is not valid kdl {{{{");
         assert_eq!(config.font_size, 15.0);
+    }
+
+    #[test]
+    fn test_parse_status_bar_icons() {
+        let config = Config::parse(
+            r#"
+status-bar {
+    normal-icon "N"
+    insert-icon "I"
+    block-icon "B"
+    branding-icon "S"
+}
+"#,
+        );
+        assert_eq!(config.status_bar_icons.normal, "N");
+        assert_eq!(config.status_bar_icons.insert, "I");
+        assert_eq!(config.status_bar_icons.block, "B");
+        assert_eq!(config.status_bar_icons.branding, "S");
     }
 }

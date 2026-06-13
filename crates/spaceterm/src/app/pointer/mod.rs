@@ -5,7 +5,7 @@ mod clipboard;
 mod mouse;
 
 use crate::model::layout::{PaneId, Rect};
-use spaceterm_render::gpu::PaneRect;
+use spaceterm_render::renderer::PaneRect;
 
 use super::App;
 

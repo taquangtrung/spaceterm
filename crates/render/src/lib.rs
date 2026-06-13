@@ -2,16 +2,19 @@
 //!
 //! This is the CPU side of the native text grid. [`Grid`] holds styled cells
 //! and a cursor; [`Screen`] drives it from a byte stream via `vte` (printing,
-//! cursor motion, SGR colors, erase, scroll). [`gpu::GpuRenderer`] draws a
+//! cursor motion, SGR colors, erase, scroll). [`renderer::GpuRenderer`] draws a
 //! `Grid` to a wgpu surface using `cosmic-text` + `glyphon` for glyph rendering.
 
-pub mod gpu;
 mod grid;
+mod image;
+mod markdown;
+pub mod renderer;
 mod screen;
 mod theme;
 
-pub use gpu::{start_font_load, FontConfig, FontLoad, PaneRect, PaneView, StatusBar};
 pub use grid::{Cell, Color, CursorShape, EraseMode, Grid, RgbColor, Style};
+pub use image::ImagePlacement;
+pub use renderer::{start_font_load, FontConfig, FontLoad, PaneRect, PaneView, StatusBar};
 pub use screen::Screen;
 pub use theme::{Rgb as ThemeRgb, Theme};
 

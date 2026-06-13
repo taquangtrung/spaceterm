@@ -7,10 +7,10 @@ use winit::window::WindowAttributes;
 
 use crate::config::ThemeSetting;
 use crate::terminal::pane::Pane;
-use spaceterm_render::gpu::GpuRenderer;
+use spaceterm_render::renderer::GpuRenderer;
 use spaceterm_render::{FontConfig, Theme};
 
-use super::{content_rows, App, DEFAULT_COLS, DEFAULT_ROWS, APPROX_CELL_WIDTH, APPROX_CELL_HEIGHT};
+use super::{content_rows, App, APPROX_CELL_HEIGHT, APPROX_CELL_WIDTH, DEFAULT_COLS, DEFAULT_ROWS};
 
 // ========================================================================
 // App — window initialization
@@ -38,8 +38,7 @@ impl App {
         // renderer's precise cell grid after the GPU is ready.
         let pane_init_cols = DEFAULT_COLS as usize;
         let pane_init_rows = content_rows(DEFAULT_ROWS as usize);
-        let pane_handle =
-            std::thread::spawn(move || Pane::new(pane_init_cols, pane_init_rows));
+        let pane_handle = std::thread::spawn(move || Pane::new(pane_init_cols, pane_init_rows));
 
         #[cfg(target_os = "linux")]
         {
@@ -117,12 +116,12 @@ impl App {
 
         let (cols, rows) = renderer.grid_size();
         let want_rows = content_rows(rows);
-        let mut pane = pane_handle
-            .join()
-            .expect("PTY spawn thread panicked");
+        let mut pane = pane_handle.join().expect("PTY spawn thread panicked");
         if cols != pane_init_cols || want_rows != pane_init_rows {
             pane.resize(cols, want_rows);
         }
+        let (cell_w, cell_h) = renderer.cell_size();
+        pane.set_cell_size(cell_w, cell_h);
         let focused = self.tab.focused();
         self.panes.insert(focused, pane);
 

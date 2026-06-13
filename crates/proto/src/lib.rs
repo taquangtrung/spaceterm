@@ -19,7 +19,7 @@ pub use bundle::{BlockMeta, MimeBundle, TEXT_PLAIN};
 pub use caps::Caps;
 pub use message::{EmitBlock, Message, OpenBlock, PatchBlock};
 pub use tier::TrustTier;
-pub use wire::{decode, decode_with_sidechannel, encode, ProtoError};
+pub use wire::{decode, decode_with_sidechannel, encode, encode_emit_file, ProtoError};
 
 // ============================================================================
 // Constants

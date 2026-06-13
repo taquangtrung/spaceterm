@@ -98,11 +98,7 @@ impl App {
                 .unwrap_or(0),
         };
         let diff = target_row.abs_diff(current_offset);
-        let grid = self
-            .panes
-            .get_mut(&focused)
-            .unwrap()
-            .grid_mut();
+        let grid = self.panes.get_mut(&focused).unwrap().grid_mut();
         if target_row > current_offset {
             grid.scroll_up_history(diff);
         } else {

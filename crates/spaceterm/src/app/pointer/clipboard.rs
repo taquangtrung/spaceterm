@@ -62,7 +62,9 @@ impl App {
         };
         let Some(text) = text else { return };
         let focused = self.tab.focused();
-        let Some(pane) = self.panes.get_mut(&focused) else { return };
+        let Some(pane) = self.panes.get_mut(&focused) else {
+            return;
+        };
         if pane.bracketed_paste() {
             let mut bytes = Vec::with_capacity(text.len() + 8);
             bytes.extend_from_slice(b"\x1b[200~");

@@ -82,7 +82,9 @@ pub(super) fn word_end(line: &[char], col: usize, big: bool) -> Option<usize> {
 
 /// The column of the first non-blank character (Vim `^`), or 0 for a blank line.
 pub(super) fn first_non_blank(line: &[char]) -> usize {
-    line.iter().position(|c| char_class(*c, false) != 0).unwrap_or(0)
+    line.iter()
+        .position(|c| char_class(*c, false) != 0)
+        .unwrap_or(0)
 }
 
 // ========================================================================
@@ -109,7 +111,12 @@ pub(super) fn motion_word_forward(
 
 /// `b`/`B`: the previous word start, wrapping to the prior line (scrolling at the
 /// top edge) when nothing precedes the cursor on the current line.
-pub(super) fn motion_word_back(grid: &mut Grid, row: usize, col: usize, big: bool) -> (usize, usize) {
+pub(super) fn motion_word_back(
+    grid: &mut Grid,
+    row: usize,
+    col: usize,
+    big: bool,
+) -> (usize, usize) {
     match prev_word_start(&line_chars(grid, row), col, big) {
         Some(c) => (row, c),
         None => {

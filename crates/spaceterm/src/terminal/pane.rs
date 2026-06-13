@@ -6,9 +6,13 @@ use std::io::Write;
 use std::sync::mpsc;
 use std::thread;
 
-use spaceterm_core::{Performer, Scrollback};
-use spaceterm_render::Grid;
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+use std::io::Cursor;
+
+use base64::Engine;
+use spaceterm_core::spaceterm_proto::EmitBlock;
+use spaceterm_core::{Performer, Scrollback, Segment};
+use spaceterm_render::Grid;
 use vte::{Params, Perform};
 
 use super::block_queue::BlockQueue;
@@ -24,6 +28,75 @@ const CARRIAGE_RETURN: u8 = b'\r';
 const BACKSPACE: u8 = 0x08;
 const HORIZONTAL_TAB: u8 = b'\t';
 
+/// Default grid rows reserved for a content block whose displayed height is not
+/// known at emit time (markdown, SVG, HTML). Reserved in-sequence (at the
+/// escape) so the shell's subsequent output flows below the block instead of
+/// under it, without desyncing the shell's cursor.
+pub(crate) const BLOCK_RESERVE_ROWS: usize = 12;
+
+/// Upper bound on rows an image block may reserve, so a tall image cannot eat
+/// the whole screen. Raster images reserve exactly the rows they occupy, capped
+/// here; the app scales them to fit the same cap.
+pub(crate) const MAX_IMAGE_ROWS: usize = 24;
+
+/// Raster image MIME types whose displayed height can be computed from their
+/// pixel dimensions at emit time (so they reserve an exact band).
+const RASTER_MIMES: [&str; 4] = ["image/gif", "image/jpeg", "image/png", "image/webp"];
+
+/// Number of renderable (`Content`/`Live`) segments across the scrollback, used
+/// to detect how many blocks an escape just produced.
+fn content_segment_count(scrollback: &Scrollback) -> usize {
+    scrollback
+        .blocks()
+        .iter()
+        .flat_map(|block| &block.output)
+        .filter(|segment| matches!(segment, Segment::Content(_) | Segment::Live(_)))
+        .count()
+}
+
+/// The most recently emitted content block, used to size its reserved band.
+fn last_content_block(scrollback: &Scrollback) -> Option<&EmitBlock> {
+    scrollback
+        .blocks()
+        .iter()
+        .rev()
+        .flat_map(|block| block.output.iter().rev())
+        .find_map(|segment| match segment {
+            Segment::Content(emit) => Some(emit),
+            _ => None,
+        })
+}
+
+/// Exact rows a raster image occupies fit to the pane width, capped at
+/// [`MAX_IMAGE_ROWS`]. `None` when the block is not a raster image (the caller
+/// then uses the default band).
+fn image_reserve_rows(
+    emit: &EmitBlock,
+    cols: usize,
+    cell_width: f32,
+    cell_height: f32,
+) -> Option<usize> {
+    let value = RASTER_MIMES
+        .iter()
+        .find_map(|mime| emit.bundle.get(mime).and_then(|v| v.as_str()))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .ok()?;
+    let (nat_w, nat_h) = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    if nat_w == 0 || nat_h == 0 || cell_height <= 0.0 {
+        return None;
+    }
+    let pane_w = cols as f32 * cell_width;
+    let display_w = (nat_w as f32).min(pane_w);
+    let display_h = display_w * nat_h as f32 / nat_w as f32;
+    let rows = (display_h / cell_height).ceil() as usize;
+    Some(rows.clamp(1, MAX_IMAGE_ROWS))
+}
+
 // ========================================================================
 // Data Structures
 // ========================================================================
@@ -33,6 +106,14 @@ const HORIZONTAL_TAB: u8 = b'\t';
 /// the previous dual-parser setup where every PTY byte was parsed twice.
 struct CombinedPerformer {
     bell: bool,
+    /// Grid rows (one per emitted block, in emission order) where the block was
+    /// anchored, drained by [`Pane::drain_output`] into the block queue.
+    block_anchors: Vec<usize>,
+    /// Pixel cell size, used to convert an image's pixel height into reserved
+    /// rows. Set by the app once the renderer is up; defaults are close enough
+    /// until then.
+    cell_height: f32,
+    cell_width: f32,
     grid: Grid,
     performer: Performer,
 }
@@ -45,8 +126,34 @@ impl CombinedPerformer {
     fn new(cols: usize, rows: usize) -> Self {
         Self {
             bell: false,
+            block_anchors: Vec::new(),
+            // Approximate defaults until the app sets the real cell size.
+            cell_height: 20.0,
+            cell_width: 9.0,
             grid: Grid::new(cols, rows),
             performer: Performer::new(),
+        }
+    }
+
+    /// Anchor rows of blocks emitted since the last call, in emission order.
+    fn take_block_anchors(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.block_anchors)
+    }
+
+    fn set_cell_size(&mut self, width: f32, height: f32) {
+        self.cell_width = width;
+        self.cell_height = height;
+    }
+
+    /// Rows to reserve for the most recently emitted block: the exact rows a
+    /// raster image will occupy (capped), else a default band.
+    fn reserve_rows_for_last_block(&self) -> usize {
+        match last_content_block(self.performer.scrollback()) {
+            Some(emit) => {
+                image_reserve_rows(emit, self.grid.cols(), self.cell_width, self.cell_height)
+                    .unwrap_or(BLOCK_RESERVE_ROWS)
+            }
+            None => BLOCK_RESERVE_ROWS,
         }
     }
 
@@ -95,32 +202,31 @@ impl Perform for CombinedPerformer {
         }
     }
 
-    fn csi_dispatch(
-        &mut self,
-        params: &Params,
-        intermediates: &[u8],
-        ignore: bool,
-        action: char,
-    ) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         Perform::csi_dispatch(&mut self.grid, params, intermediates, ignore, action);
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        let before = content_segment_count(self.performer.scrollback());
         Perform::osc_dispatch(&mut self.performer, params, bell_terminated);
+        let after = content_segment_count(self.performer.scrollback());
+
+        // For each block this escape produced, anchor it at the current row and
+        // reserve rows so the shell's following output flows below it.
+        let rows = self.reserve_rows_for_last_block();
+        for _ in before..after {
+            self.block_anchors.push(self.grid.cursor().0);
+            for _ in 0..rows {
+                self.grid.line_feed();
+            }
+        }
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
         Perform::esc_dispatch(&mut self.grid, intermediates, ignore, byte);
     }
 
-    fn hook(
-        &mut self,
-        _params: &Params,
-        _intermediates: &[u8],
-        _ignore: bool,
-        _action: char,
-    ) {
-    }
+    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
 
     fn put(&mut self, _byte: u8) {}
 
@@ -161,7 +267,13 @@ impl Pane {
     }
 
     /// Spawn `command` under a PTY with the given grid dimensions.
-    pub fn with_command(cols: usize, rows: usize, command: CommandBuilder) -> Self {
+    pub fn with_command(cols: usize, rows: usize, mut command: CommandBuilder) -> Self {
+        // Advertise SpaceTerm to the child so capability-detecting tools (e.g.
+        // `spacecat`, `clients/client.sh`) emit rich blocks instead of the
+        // plain-text fallback.
+        command.env("TERM_PROGRAM", "spaceterm");
+        command.env("SPACETERM", "1");
+
         let pty_system = NativePtySystem::default();
         let pair = pty_system
             .openpty(PtySize {
@@ -224,7 +336,9 @@ impl Pane {
         }
         if got_any {
             let (row, _) = self.combined.grid().cursor();
-            self.block_queue.update(self.combined.scrollback(), row);
+            let anchors = self.combined.take_block_anchors();
+            self.block_queue
+                .update(self.combined.scrollback(), row, &anchors);
         }
         got_any
     }
@@ -257,6 +371,12 @@ impl Pane {
     /// The terminal cell grid (read-only for rendering).
     pub fn grid(&self) -> &Grid {
         self.combined.grid()
+    }
+
+    /// Set the pixel cell size so image blocks reserve the exact rows they
+    /// occupy. Called once the renderer's metrics are known.
+    pub fn set_cell_size(&mut self, width: f32, height: f32) {
+        self.combined.set_cell_size(width, height);
     }
 
     /// The terminal cell grid (mutable, for scrollback navigation).

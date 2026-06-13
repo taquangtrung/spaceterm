@@ -1,0 +1,16 @@
+[package]
+name = "webview-probe"
+description = "Diagnostic: does a wry webview paint in a GTK-backed (tao) window? Validates the fix for blank native block rendering under winit/X11."
+version = "0.0.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "webview-probe"
+path = "src/main.rs"
+
+[dependencies]
+tao = "0.30"
+wry = "0.55"

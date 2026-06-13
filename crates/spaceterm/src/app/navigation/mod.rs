@@ -65,8 +65,12 @@ impl App {
             CursorMove::LineStart => col = 0,
             CursorMove::LineEnd => col = cols,
             CursorMove::FirstNonBlank => col = vim::first_non_blank(&vim::line_chars(grid, row)),
-            CursorMove::WordForward => (row, col) = vim::motion_word_forward(grid, rows, row, col, false),
-            CursorMove::WordForwardBig => (row, col) = vim::motion_word_forward(grid, rows, row, col, true),
+            CursorMove::WordForward => {
+                (row, col) = vim::motion_word_forward(grid, rows, row, col, false)
+            }
+            CursorMove::WordForwardBig => {
+                (row, col) = vim::motion_word_forward(grid, rows, row, col, true)
+            }
             CursorMove::WordBack => (row, col) = vim::motion_word_back(grid, row, col, false),
             CursorMove::WordBackBig => (row, col) = vim::motion_word_back(grid, row, col, true),
             CursorMove::WordEnd => (row, col) = vim::motion_word_end(grid, rows, row, col, false),

@@ -63,13 +63,7 @@ impl App {
         let cb_code = 32 + btn_code;
 
         let bytes = if sgr {
-            format!(
-                "\x1b[<{};{};{}M",
-                cb_code,
-                col + 1,
-                row + 1
-            )
-            .into_bytes()
+            format!("\x1b[<{};{};{}M", cb_code, col + 1, row + 1).into_bytes()
         } else {
             let cb = (32 + cb_code) as u8;
             let cv = 32u8.saturating_add((col.min(222) + 1) as u8);

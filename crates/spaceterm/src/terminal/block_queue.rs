@@ -46,8 +46,10 @@ impl BlockQueue {
     }
 
     /// Scan the scrollback for content segments not yet seen and append them.
-    /// `cursor_row` is the grid row where new content was detected.
-    pub fn update(&mut self, scrollback: &Scrollback, cursor_row: usize) {
+    /// `anchors` gives the grid row each new block was reserved at, in emission
+    /// order; `fallback_row` is used if anchors run short.
+    pub fn update(&mut self, scrollback: &Scrollback, fallback_row: usize, anchors: &[usize]) {
+        let mut anchors = anchors.iter();
         let blocks = scrollback.blocks();
         for (block_index, block) in blocks.iter().enumerate() {
             if block_index >= self.scanned_segments.len() {
@@ -60,7 +62,7 @@ impl BlockQueue {
                         self.entries.push(BlockEntry {
                             block_index,
                             emit: emit.clone(),
-                            grid_row: cursor_row,
+                            grid_row: anchors.next().copied().unwrap_or(fallback_row),
                             kind: BlockKind::Content,
                             segment_index,
                             trust: emit.trust,
@@ -80,7 +82,7 @@ impl BlockQueue {
                         self.entries.push(BlockEntry {
                             block_index,
                             emit,
-                            grid_row: cursor_row,
+                            grid_row: anchors.next().copied().unwrap_or(fallback_row),
                             kind: BlockKind::Live,
                             segment_index,
                             trust: TrustTier::Restricted,
@@ -124,9 +126,9 @@ impl BlockQueue {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
     use spaceterm_core::spaceterm_proto::{BlockId, EmitBlock, MimeBundle, TrustTier};
     use spaceterm_core::Terminal;
-    use serde_json::Value;
 
     use super::*;
 
@@ -142,8 +144,10 @@ mod tests {
     }
 
     fn emit_escape(block: &EmitBlock) -> Vec<u8> {
-        spaceterm_core::spaceterm_proto::encode(&spaceterm_core::spaceterm_proto::Message::Emit(block.clone()))
-            .into_bytes()
+        spaceterm_core::spaceterm_proto::encode(&spaceterm_core::spaceterm_proto::Message::Emit(
+            block.clone(),
+        ))
+        .into_bytes()
     }
 
     #[test]
@@ -160,7 +164,7 @@ mod tests {
         term.feed(b"after");
 
         let mut queue = BlockQueue::new();
-        queue.update(term.scrollback(), 0);
+        queue.update(term.scrollback(), 0, &[]);
         assert_eq!(queue.entries().len(), 1);
         assert_eq!(queue.entries()[0].block_index, 0);
         assert_eq!(queue.entries()[0].segment_index, 1);
@@ -172,13 +176,13 @@ mod tests {
         term.feed(&emit_escape(&svg_emit()));
 
         let mut queue = BlockQueue::new();
-        queue.update(term.scrollback(), 0);
+        queue.update(term.scrollback(), 0, &[]);
         assert_eq!(queue.entries().len(), 1);
 
         let mut second = svg_emit();
         second.id = BlockId(2);
         term.feed(&emit_escape(&second));
-        queue.update(term.scrollback(), 0);
+        queue.update(term.scrollback(), 0, &[]);
         assert_eq!(queue.entries().len(), 2);
     }
 
@@ -197,7 +201,7 @@ mod tests {
         term.feed(esc.as_bytes());
 
         let mut queue = BlockQueue::new();
-        queue.update(term.scrollback(), 5);
+        queue.update(term.scrollback(), 5, &[]);
         assert_eq!(queue.entries().len(), 1);
         assert_eq!(queue.entries()[0].kind, BlockKind::Live);
         assert_eq!(queue.entries()[0].grid_row, 5);
