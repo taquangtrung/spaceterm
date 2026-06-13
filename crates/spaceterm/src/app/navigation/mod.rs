@@ -56,7 +56,7 @@ impl App {
                 }
             }
             CursorMove::Down => {
-                if row + 1 < rows {
+                if row < grid.last_content_row() {
                     row += 1;
                 } else {
                     grid.scroll_down_history(1);
@@ -82,7 +82,7 @@ impl App {
             }
             CursorMove::Bottom => {
                 grid.set_scroll_offset(0);
-                row = rows.saturating_sub(1);
+                row = grid.last_content_row();
             }
             CursorMove::PageUp => grid.scroll_up_history(rows),
             CursorMove::PageDown => grid.scroll_down_history(rows),

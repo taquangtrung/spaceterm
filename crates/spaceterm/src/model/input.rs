@@ -47,11 +47,19 @@ pub enum KeyCode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
     ClosePane,
+    DeleteCharForward,
+    DeleteLine,
+    DeleteToLineEnd,
+    DeleteToLineStart,
+    DeleteWordBack,
+    DeleteWordForward,
+    EnterVisual(VisualKind),
     FocusBlock(BlockNav),
     FocusPane(FocusDir),
     ForwardToBlock(Vec<u8>),
     Ignore,
     MoveCursor(CursorMove),
+    Paste,
     QuickCancel,
     QuickJump(char),
     QuickSelect,
@@ -67,6 +75,14 @@ pub enum Action {
     SwitchMode(Mode),
     ToggleFold,
     YankBlock,
+    YankSelection,
+}
+
+/// Whether a Visual selection spans characters or whole lines (vim `v` vs `V`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VisualKind {
+    Char,
+    Line,
 }
 
 /// Direction of a block-selection move in Normal mode.
@@ -107,6 +123,8 @@ pub enum CursorMove {
 pub enum PendingPrefix {
     BracketClose,
     BracketOpen,
+    CtrlW,
+    Delete,
     G,
     None,
     QuickSelect,
@@ -135,6 +153,7 @@ pub fn resolve(mode: Mode, key: &Key, pending: &mut PendingPrefix, fullscreen: b
     match mode {
         Mode::Insert => resolve_insert(key, fullscreen),
         Mode::Normal => resolve_normal(key, pending),
+        Mode::Visual => resolve_visual(key, pending),
         Mode::BlockFocus => resolve_block_focus(key),
     }
 }
@@ -153,6 +172,12 @@ fn resolve_insert(key: &Key, fullscreen: bool) -> Action {
 
 fn resolve_normal(key: &Key, pending: &mut PendingPrefix) -> Action {
     if key.ctrl {
+        // `Ctrl-w` opens the window prefix (vim/tmux-style split bindings); every
+        // other control chord resolves immediately and clears any pending prefix.
+        if key.code == KeyCode::Char('w') {
+            *pending = PendingPrefix::CtrlW;
+            return Action::Ignore;
+        }
         *pending = PendingPrefix::None;
         return match key.code {
             KeyCode::Char('h') => Action::FocusPane(FocusDir::Left),
@@ -175,6 +200,20 @@ fn resolve_normal(key: &Key, pending: &mut PendingPrefix) -> Action {
         },
         PendingPrefix::BracketOpen => match key.code {
             KeyCode::Char('b') => Action::FocusBlock(BlockNav::Previous),
+            _ => Action::Ignore,
+        },
+        PendingPrefix::CtrlW => match key.code {
+            KeyCode::Char('v') => Action::SplitPane(Direction::Vertical),
+            KeyCode::Char('s') => Action::SplitPane(Direction::Horizontal),
+            KeyCode::Char('c') | KeyCode::Char('q') => Action::ClosePane,
+            _ => Action::Ignore,
+        },
+        PendingPrefix::Delete => match key.code {
+            KeyCode::Char('d') => Action::DeleteLine,
+            KeyCode::Char('w') => Action::DeleteWordForward,
+            KeyCode::Char('b') => Action::DeleteWordBack,
+            KeyCode::Char('$') => Action::DeleteToLineEnd,
+            KeyCode::Char('0') => Action::DeleteToLineStart,
             _ => Action::Ignore,
         },
         PendingPrefix::G => match key.code {
@@ -223,9 +262,15 @@ fn resolve_normal(key: &Key, pending: &mut PendingPrefix) -> Action {
             KeyCode::Char('G') => Action::MoveCursor(CursorMove::Bottom),
             KeyCode::PageDown => Action::MoveCursor(CursorMove::PageDown),
             KeyCode::PageUp => Action::MoveCursor(CursorMove::PageUp),
-            KeyCode::Char('v') => Action::SplitPane(Direction::Vertical),
-            KeyCode::Char('s') => Action::SplitPane(Direction::Horizontal),
-            KeyCode::Char('x') => Action::ClosePane,
+            KeyCode::Char('v') => Action::EnterVisual(VisualKind::Char),
+            KeyCode::Char('V') => Action::EnterVisual(VisualKind::Line),
+            KeyCode::Char('p') => Action::Paste,
+            KeyCode::Char('x') => Action::DeleteCharForward,
+            KeyCode::Char('D') => Action::DeleteToLineEnd,
+            KeyCode::Char('d') => {
+                *pending = PendingPrefix::Delete;
+                Action::Ignore
+            }
             KeyCode::Char('/') => {
                 *pending = PendingPrefix::SearchInput;
                 Action::SearchStart
@@ -255,6 +300,58 @@ fn resolve_normal(key: &Key, pending: &mut PendingPrefix) -> Action {
             }
             _ => Action::Ignore,
         },
+    }
+}
+
+/// Resolve a key in Visual mode: the same motions as Normal extend the
+/// selection, `y` yanks it, and `v`/`V`/`Esc` leave Visual.
+fn resolve_visual(key: &Key, pending: &mut PendingPrefix) -> Action {
+    if key.ctrl {
+        *pending = PendingPrefix::None;
+        return match key.code {
+            KeyCode::Char('d') => Action::MoveCursor(CursorMove::HalfPageDown),
+            KeyCode::Char('u') => Action::MoveCursor(CursorMove::HalfPageUp),
+            _ => Action::Ignore,
+        };
+    }
+
+    let prev = *pending;
+    *pending = PendingPrefix::None;
+
+    if prev == PendingPrefix::G {
+        return match key.code {
+            KeyCode::Char('g') => Action::MoveCursor(CursorMove::Top),
+            _ => Action::Ignore,
+        };
+    }
+
+    match key.code {
+        KeyCode::Char('h') | KeyCode::Left => Action::MoveCursor(CursorMove::Left),
+        KeyCode::Char('j') | KeyCode::Down => Action::MoveCursor(CursorMove::Down),
+        KeyCode::Char('k') | KeyCode::Up => Action::MoveCursor(CursorMove::Up),
+        KeyCode::Char('l') | KeyCode::Right => Action::MoveCursor(CursorMove::Right),
+        KeyCode::Char('0') => Action::MoveCursor(CursorMove::LineStart),
+        KeyCode::Char('$') => Action::MoveCursor(CursorMove::LineEnd),
+        KeyCode::Char('^') => Action::MoveCursor(CursorMove::FirstNonBlank),
+        KeyCode::Char('w') => Action::MoveCursor(CursorMove::WordForward),
+        KeyCode::Char('b') => Action::MoveCursor(CursorMove::WordBack),
+        KeyCode::Char('e') => Action::MoveCursor(CursorMove::WordEnd),
+        KeyCode::Char('W') => Action::MoveCursor(CursorMove::WordForwardBig),
+        KeyCode::Char('B') => Action::MoveCursor(CursorMove::WordBackBig),
+        KeyCode::Char('E') => Action::MoveCursor(CursorMove::WordEndBig),
+        KeyCode::Char('G') => Action::MoveCursor(CursorMove::Bottom),
+        KeyCode::PageDown => Action::MoveCursor(CursorMove::PageDown),
+        KeyCode::PageUp => Action::MoveCursor(CursorMove::PageUp),
+        KeyCode::Char('g') => {
+            *pending = PendingPrefix::G;
+            Action::Ignore
+        }
+        KeyCode::Char('y') => Action::YankSelection,
+        KeyCode::Char('v') => Action::EnterVisual(VisualKind::Char),
+        KeyCode::Char('V') => Action::EnterVisual(VisualKind::Line),
+        KeyCode::Char('i') => Action::SwitchMode(Mode::Visual.apply(ModeEvent::ToInsert)),
+        KeyCode::Escape => Action::SwitchMode(Mode::Visual.apply(ModeEvent::Escape)),
+        _ => Action::Ignore,
     }
 }
 
@@ -654,5 +751,133 @@ mod tests {
         let action = resolve(Mode::Normal, &key(KeyCode::Backspace), &mut pending, false);
         assert_eq!(action, Action::SearchBackspace);
         assert_eq!(pending, PendingPrefix::SearchInput);
+    }
+
+    #[test]
+    fn test_v_enters_charwise_visual() {
+        assert_eq!(
+            resolve_simple(Mode::Normal, &key(KeyCode::Char('v'))),
+            Action::EnterVisual(VisualKind::Char)
+        );
+    }
+
+    #[test]
+    fn test_shift_v_enters_linewise_visual() {
+        assert_eq!(
+            resolve_simple(Mode::Normal, &key(KeyCode::Char('V'))),
+            Action::EnterVisual(VisualKind::Line)
+        );
+    }
+
+    #[test]
+    fn test_p_pastes_in_normal() {
+        assert_eq!(
+            resolve_simple(Mode::Normal, &key(KeyCode::Char('p'))),
+            Action::Paste
+        );
+    }
+
+    #[test]
+    fn test_ctrl_w_prefix_splits_panes() {
+        let mut pending = PendingPrefix::None;
+        let ctrl_w = Key {
+            ctrl: true,
+            ..key(KeyCode::Char('w'))
+        };
+        assert_eq!(
+            resolve(Mode::Normal, &ctrl_w, &mut pending, false),
+            Action::Ignore
+        );
+        assert_eq!(pending, PendingPrefix::CtrlW);
+        assert_eq!(
+            resolve(Mode::Normal, &key(KeyCode::Char('v')), &mut pending, false),
+            Action::SplitPane(Direction::Vertical)
+        );
+        assert_eq!(pending, PendingPrefix::None);
+    }
+
+    #[test]
+    fn test_visual_motion_extends_and_y_yanks() {
+        assert_eq!(
+            resolve_simple(Mode::Visual, &key(KeyCode::Char('j'))),
+            Action::MoveCursor(CursorMove::Down)
+        );
+        assert_eq!(
+            resolve_simple(Mode::Visual, &key(KeyCode::Char('y'))),
+            Action::YankSelection
+        );
+    }
+
+    #[test]
+    fn test_visual_escape_returns_to_normal() {
+        assert_eq!(
+            resolve_simple(Mode::Visual, &key(KeyCode::Escape)),
+            Action::SwitchMode(Mode::Normal)
+        );
+    }
+
+    #[test]
+    fn test_visual_v_toggles_back_to_normal() {
+        // `v` in Visual resolves to EnterVisual; the handler toggles it off.
+        assert_eq!(
+            resolve_simple(Mode::Visual, &key(KeyCode::Char('v'))),
+            Action::EnterVisual(VisualKind::Char)
+        );
+    }
+
+    #[test]
+    fn test_visual_gg_jumps_to_top() {
+        let mut pending = PendingPrefix::None;
+        let action = resolve(Mode::Visual, &key(KeyCode::Char('g')), &mut pending, false);
+        assert_eq!(action, Action::Ignore);
+        assert_eq!(pending, PendingPrefix::G);
+        let action = resolve(Mode::Visual, &key(KeyCode::Char('g')), &mut pending, false);
+        assert_eq!(action, Action::MoveCursor(CursorMove::Top));
+    }
+
+    #[test]
+    fn test_x_deletes_char_on_prompt() {
+        assert_eq!(
+            resolve_simple(Mode::Normal, &key(KeyCode::Char('x'))),
+            Action::DeleteCharForward
+        );
+    }
+
+    #[test]
+    fn test_shift_d_deletes_to_line_end() {
+        assert_eq!(
+            resolve_simple(Mode::Normal, &key(KeyCode::Char('D'))),
+            Action::DeleteToLineEnd
+        );
+    }
+
+    #[test]
+    fn test_dd_deletes_line() {
+        let mut pending = PendingPrefix::None;
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('d')), &mut pending, false);
+        assert_eq!(action, Action::Ignore);
+        assert_eq!(pending, PendingPrefix::Delete);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('d')), &mut pending, false);
+        assert_eq!(action, Action::DeleteLine);
+        assert_eq!(pending, PendingPrefix::None);
+    }
+
+    #[test]
+    fn test_dw_deletes_word() {
+        let mut pending = PendingPrefix::None;
+        resolve(Mode::Normal, &key(KeyCode::Char('d')), &mut pending, false);
+        assert_eq!(
+            resolve(Mode::Normal, &key(KeyCode::Char('w')), &mut pending, false),
+            Action::DeleteWordForward
+        );
+    }
+
+    #[test]
+    fn test_ctrl_w_c_closes_pane() {
+        let mut pending = PendingPrefix::CtrlW;
+        assert_eq!(
+            resolve(Mode::Normal, &key(KeyCode::Char('c')), &mut pending, false),
+            Action::ClosePane
+        );
     }
 }

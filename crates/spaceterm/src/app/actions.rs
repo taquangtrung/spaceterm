@@ -2,10 +2,11 @@
 
 use std::time::Instant;
 
-use crate::model::input::{self, Action};
+use crate::model::input::{self, Action, VisualKind};
 use crate::model::layout::{PaneId, Rect};
-use crate::model::mode::Mode;
+use crate::model::mode::{Mode, ModeEvent};
 
+use super::prompt_edit::{prompt_delete_bytes, PromptDelete};
 use super::{is_boundary_ding_key, App};
 
 // ========================================================================
@@ -26,15 +27,50 @@ impl App {
             Action::SwitchMode(new_mode) => {
                 let old_mode = self.modes.get(&focused).copied().unwrap_or_default();
                 self.modes.insert(focused, new_mode);
-                if new_mode == Mode::Normal && old_mode != Mode::Normal {
-                    self.init_nav_cursor(focused);
-                } else if new_mode != Mode::Normal {
-                    self.nav_cursor = None;
+                // Leaving Visual: the selection and anchor were ours to clear.
+                if old_mode == Mode::Visual {
+                    self.visual_anchor = None;
+                    self.selection = None;
                 }
+                match new_mode {
+                    // Entering Normal afresh (from Insert/Block) seeds the nav
+                    // cursor at the prompt; returning from Visual keeps it put.
+                    Mode::Normal => {
+                        if old_mode != Mode::Normal && old_mode != Mode::Visual {
+                            self.init_nav_cursor(focused);
+                        }
+                    }
+                    Mode::Insert | Mode::BlockFocus => self.nav_cursor = None,
+                    Mode::Visual => {}
+                }
+                self.dirty = true;
             }
             Action::MoveCursor(mv) => {
                 self.move_nav_cursor(mv, focused);
+                if self.modes.get(&focused) == Some(&Mode::Visual) {
+                    self.update_visual_selection(focused);
+                }
             }
+            Action::EnterVisual(kind) => {
+                self.toggle_visual(kind, focused);
+            }
+            Action::YankSelection => {
+                self.copy_selection();
+                self.modes
+                    .insert(focused, Mode::Visual.apply(ModeEvent::Escape));
+                self.visual_anchor = None;
+                self.selection = None;
+                self.dirty = true;
+            }
+            Action::Paste => {
+                self.paste_from_clipboard();
+            }
+            Action::DeleteCharForward => self.delete_on_prompt(PromptDelete::CharForward, focused),
+            Action::DeleteLine => self.delete_on_prompt(PromptDelete::Line, focused),
+            Action::DeleteToLineEnd => self.delete_on_prompt(PromptDelete::ToLineEnd, focused),
+            Action::DeleteToLineStart => self.delete_on_prompt(PromptDelete::ToLineStart, focused),
+            Action::DeleteWordBack => self.delete_on_prompt(PromptDelete::WordBack, focused),
+            Action::DeleteWordForward => self.delete_on_prompt(PromptDelete::WordForward, focused),
             Action::SplitPane(direction) => {
                 self.split_pane(direction);
             }
@@ -99,5 +135,55 @@ impl App {
             }
             Action::Ignore => {}
         }
+    }
+
+    /// Apply a Vim delete operator to the last prompt by sending the shell the
+    /// equivalent readline edit. Only the live prompt line (the row holding the
+    /// shell cursor) is editable; deletes aimed at scrollback history are ignored.
+    fn delete_on_prompt(&mut self, op: PromptDelete, focused: PaneId) {
+        let Some(pane) = self.panes.get(&focused) else {
+            return;
+        };
+        let (prompt_row, pty_col) = pane.grid().cursor();
+        let (nav_row, nav_col) = self.nav_cursor.unwrap_or((prompt_row, pty_col));
+        if nav_row != prompt_row {
+            return;
+        }
+        let bytes = prompt_delete_bytes(op, pty_col, nav_col);
+        if let Some(pane) = self.panes.get_mut(&focused) {
+            pane.write(&bytes);
+        }
+        self.nav_resync_pending = true;
+        self.dirty = true;
+    }
+
+    /// Enter Visual mode from Normal, toggle it off when the same kind is pressed
+    /// again, or switch between charwise and linewise while staying in Visual.
+    fn toggle_visual(&mut self, kind: VisualKind, focused: PaneId) {
+        let mode = self.modes.get(&focused).copied().unwrap_or_default();
+        let want_line = matches!(kind, VisualKind::Line);
+        match mode {
+            Mode::Normal => {
+                self.modes
+                    .insert(focused, Mode::Normal.apply(ModeEvent::EnterVisual));
+                self.visual_anchor = Some(self.nav_cursor.unwrap_or((0, 0)));
+                self.visual_line = want_line;
+                self.update_visual_selection(focused);
+            }
+            Mode::Visual if self.visual_line == want_line => {
+                // Same kind again leaves Visual, back to Normal.
+                self.modes
+                    .insert(focused, Mode::Visual.apply(ModeEvent::EnterVisual));
+                self.visual_anchor = None;
+                self.selection = None;
+            }
+            Mode::Visual => {
+                // Switch charwise <-> linewise, keeping the anchor.
+                self.visual_line = want_line;
+                self.update_visual_selection(focused);
+            }
+            Mode::Insert | Mode::BlockFocus => {}
+        }
+        self.dirty = true;
     }
 }

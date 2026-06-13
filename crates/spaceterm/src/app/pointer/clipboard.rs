@@ -32,7 +32,7 @@ impl App {
             let col_start = if row == sr { sc } else { 0 };
             let col_end = if row == er { ec + 1 } else { grid.cols() };
             for col in col_start..col_end.min(grid.cols()) {
-                let ch = grid.cell(row, col).map(|c| c.ch).unwrap_or(' ');
+                let ch = grid.visible_cell(row, col).map(|c| c.ch).unwrap_or(' ');
                 text.push(ch);
             }
             if row < er {
@@ -45,6 +45,37 @@ impl App {
         } else {
             Some(trimmed)
         }
+    }
+
+    /// Recompute the highlighted selection from the Visual-mode anchor and the
+    /// current nav cursor. Charwise spans anchor->cursor; linewise covers every
+    /// column of the rows between them.
+    pub(crate) fn update_visual_selection(&mut self, focused: PaneId) {
+        let (Some((ar, ac)), Some((cr, cc))) = (self.visual_anchor, self.nav_cursor) else {
+            self.selection = None;
+            return;
+        };
+        let Some(pane) = self.panes.get(&focused) else {
+            return;
+        };
+        let last_col = pane.grid().cols().saturating_sub(1);
+        self.selection = Some(if self.visual_line {
+            Selection {
+                start_row: ar.min(cr),
+                start_col: 0,
+                end_row: ar.max(cr),
+                end_col: last_col,
+                pane: focused,
+            }
+        } else {
+            Selection {
+                start_row: ar,
+                start_col: ac,
+                end_row: cr,
+                end_col: cc,
+                pane: focused,
+            }
+        });
     }
 
     pub(crate) fn copy_selection(&self) {

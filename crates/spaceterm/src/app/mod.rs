@@ -16,6 +16,7 @@ mod blocks;
 mod init;
 mod navigation;
 mod pointer;
+mod prompt_edit;
 mod render;
 
 use std::collections::{HashMap, HashSet};
@@ -90,11 +91,14 @@ fn status_bar(
     let (mode_name, accent) = match mode {
         Mode::Insert => ("Insert", theme.ansi[2]),
         Mode::Normal => ("Normal", theme.ansi[4]),
+        Mode::Visual => ("Visual", theme.ansi[6]),
         Mode::BlockFocus => ("Block", theme.ansi[5]),
     };
+    // Visual shares the Normal icon: it is a navigation sub-mode, not a separate
+    // configurable glyph.
     let mode_icon = match mode {
         Mode::Insert => &icons.insert,
-        Mode::Normal => &icons.normal,
+        Mode::Normal | Mode::Visual => &icons.normal,
         Mode::BlockFocus => &icons.block,
     };
     let mode_label = if mode_icon.is_empty() {
@@ -170,6 +174,9 @@ pub struct App {
     /// The Normal-mode traversal cursor for the focused pane, in viewport
     /// `(row, col)`. `Some` only while that pane is in Normal mode.
     pub(crate) nav_cursor: Option<(usize, usize)>,
+    /// Set after a Vim prompt edit so the nav cursor is re-seeded to the shell
+    /// cursor once the resulting PTY echo is drained.
+    pub(crate) nav_resync_pending: bool,
     pub(crate) next_image_id: u64,
     pub(crate) panes: HashMap<PaneId, Pane>,
     pub(crate) palette: Option<Palette>,
@@ -181,6 +188,12 @@ pub struct App {
     pub(crate) selection: Option<Selection>,
     pub(crate) tab: Tab,
     pub(crate) modes: HashMap<PaneId, Mode>,
+    /// Visual-mode anchor (viewport `(row, col)`) where the selection began.
+    /// `Some` only while the focused pane is in Visual mode.
+    pub(crate) visual_anchor: Option<(usize, usize)>,
+    /// Whether the active Visual selection is linewise (`V`) rather than
+    /// charwise (`v`).
+    pub(crate) visual_line: bool,
     pub(crate) webview_mgr: WebViewManager,
     pub(crate) window: Option<Arc<Window>>,
     pub(crate) window_title: String,
@@ -257,6 +270,7 @@ impl App {
             modifiers: winit::event::Modifiers::default(),
             mouse_down: false,
             nav_cursor: None,
+            nav_resync_pending: false,
             next_image_id: 0,
             panes: HashMap::new(),
             palette: None,
@@ -268,6 +282,8 @@ impl App {
             selection: None,
             tab: Tab::new(),
             modes,
+            visual_anchor: None,
+            visual_line: false,
             webview_mgr: WebViewManager::new(),
             window: None,
             window_title: String::new(),
@@ -519,7 +535,7 @@ impl App {
                 let mode = self.modes.get(&focused).copied().unwrap_or_default();
                 let new_mode = match mode {
                     Mode::Insert => Mode::Normal,
-                    Mode::Normal | Mode::BlockFocus => Mode::Insert,
+                    Mode::Normal | Mode::Visual | Mode::BlockFocus => Mode::Insert,
                 };
                 self.modes.insert(focused, new_mode);
             }
@@ -873,6 +889,15 @@ impl ApplicationHandler for App {
         self.reap_dead_panes();
         let any_output = self.drain_all_panes();
         if any_output {
+            // A Vim prompt edit just echoed back: re-seed the nav cursor onto the
+            // shell's new cursor position so it tracks the edited line.
+            if self.nav_resync_pending {
+                let focused = self.tab.focused();
+                if self.modes.get(&focused) == Some(&Mode::Normal) {
+                    self.init_nav_cursor(focused);
+                }
+                self.nav_resync_pending = false;
+            }
             self.dirty = true;
             if let Some(window) = &self.window {
                 window.request_redraw();

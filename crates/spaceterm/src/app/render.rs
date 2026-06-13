@@ -71,7 +71,7 @@ impl App {
                 } else {
                     None
                 };
-                let nav_cursor = if *id == focused && mode == Mode::Normal {
+                let nav_cursor = if *id == focused && matches!(mode, Mode::Normal | Mode::Visual) {
                     self.nav_cursor
                 } else {
                     None

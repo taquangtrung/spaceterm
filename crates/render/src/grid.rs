@@ -611,6 +611,25 @@ impl Grid {
         end
     }
 
+    /// The last visible row that holds any printed character, or 0 when the
+    /// screen is blank. The vertical analog of [`Grid::visible_line_end`]: lets
+    /// Normal-mode navigation stop at the real bottom of content instead of
+    /// descending into the blank padding below the prompt.
+    pub fn last_content_row(&self) -> usize {
+        (0..self.rows)
+            .rev()
+            .find(|&row| self.row_has_content(row))
+            .unwrap_or(0)
+    }
+
+    /// Whether visible `row` holds any non-blank cell.
+    fn row_has_content(&self, row: usize) -> bool {
+        (0..self.cols).any(|col| {
+            self.visible_cell(row, col)
+                .is_some_and(|cell| cell.ch != '\0' && !cell.ch.is_whitespace())
+        })
+    }
+
     /// Resize the grid, preserving the top-left overlap and clamping the cursor.
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let mut next = vec![Cell::default(); cols * rows];
@@ -1002,6 +1021,37 @@ mod tests {
         assert_eq!(grid.visible_line_end(0), 1);
         // A row with no printed content reports column 0.
         assert_eq!(grid.visible_line_end(1), 0);
+    }
+
+    #[test]
+    fn test_last_content_row_ignores_trailing_blank_rows() {
+        let mut grid = Grid::new(10, 4);
+        // Two rows of content, then blank padding rows below.
+        for ch in "first".chars() {
+            grid.print(ch);
+        }
+        grid.line_feed();
+        grid.carriage_return();
+        for ch in "second".chars() {
+            grid.print(ch);
+        }
+        // Content ends at row 1; rows 2 and 3 are blank padding.
+        assert_eq!(grid.last_content_row(), 1);
+    }
+
+    #[test]
+    fn test_last_content_row_zero_when_blank() {
+        let grid = Grid::new(10, 4);
+        assert_eq!(grid.last_content_row(), 0);
+    }
+
+    #[test]
+    fn test_last_content_row_counts_single_char_at_column_zero() {
+        let mut grid = Grid::new(10, 3);
+        grid.line_feed();
+        grid.print('x');
+        // A lone 'x' at column 0 of row 1 still counts as content.
+        assert_eq!(grid.last_content_row(), 1);
     }
 
     #[test]

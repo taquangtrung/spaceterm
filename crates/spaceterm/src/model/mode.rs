@@ -18,6 +18,8 @@ pub enum Mode {
     Insert,
     /// SpaceTerm intercepts keys to traverse the block list.
     Normal,
+    /// Like Normal, but motions extend a text selection (vim Visual).
+    Visual,
 }
 
 /// A mode-changing input, already resolved from a keybinding (the entry chord is
@@ -27,6 +29,8 @@ pub enum Mode {
 pub enum ModeEvent {
     /// The configurable entry chord (default `Ctrl-Shift-Space`).
     EnterNormal,
+    /// `v`/`V` in Normal mode (and the toggle back out of Visual).
+    EnterVisual,
     /// `Enter` on an interactive block.
     FocusBlock,
     /// `Esc` (state-dependent: leaves Block-focus, or exits Normal to Insert).
@@ -46,16 +50,29 @@ impl Mode {
     pub fn apply(self, event: ModeEvent) -> Mode {
         match (self, event) {
             (Mode::Insert, ModeEvent::EnterNormal) => Mode::Normal,
-            (Mode::Insert, ModeEvent::FocusBlock | ModeEvent::Escape | ModeEvent::ToInsert) => {
-                Mode::Insert
-            }
+            (
+                Mode::Insert,
+                ModeEvent::EnterVisual
+                | ModeEvent::FocusBlock
+                | ModeEvent::Escape
+                | ModeEvent::ToInsert,
+            ) => Mode::Insert,
+            (Mode::Normal, ModeEvent::EnterVisual) => Mode::Visual,
             (Mode::Normal, ModeEvent::Escape | ModeEvent::ToInsert) => Mode::Insert,
             (Mode::Normal, ModeEvent::FocusBlock) => Mode::BlockFocus,
             (Mode::Normal, ModeEvent::EnterNormal) => Mode::Normal,
+            (Mode::Visual, ModeEvent::ToInsert) => Mode::Insert,
+            (Mode::Visual, ModeEvent::EnterNormal | ModeEvent::EnterVisual | ModeEvent::Escape) => {
+                Mode::Normal
+            }
+            (Mode::Visual, ModeEvent::FocusBlock) => Mode::Visual,
             (Mode::BlockFocus, ModeEvent::Escape) => Mode::Normal,
             (
                 Mode::BlockFocus,
-                ModeEvent::EnterNormal | ModeEvent::FocusBlock | ModeEvent::ToInsert,
+                ModeEvent::EnterNormal
+                | ModeEvent::EnterVisual
+                | ModeEvent::FocusBlock
+                | ModeEvent::ToInsert,
             ) => Mode::BlockFocus,
         }
     }
@@ -97,5 +114,29 @@ mod tests {
     fn test_escape_in_insert_is_a_noop() {
         // Esc in Insert belongs to the PTY; the mode does not change.
         assert_eq!(Mode::Insert.apply(ModeEvent::Escape), Mode::Insert);
+    }
+
+    #[test]
+    fn test_normal_enters_visual_and_escape_returns() {
+        let mode = Mode::Normal.apply(ModeEvent::EnterVisual);
+        assert_eq!(mode, Mode::Visual);
+        assert_eq!(mode.apply(ModeEvent::Escape), Mode::Normal);
+    }
+
+    #[test]
+    fn test_visual_toggles_back_to_normal_on_enter_visual() {
+        let mode = Mode::Visual.apply(ModeEvent::EnterVisual);
+        assert_eq!(mode, Mode::Normal);
+    }
+
+    #[test]
+    fn test_visual_to_insert() {
+        assert_eq!(Mode::Visual.apply(ModeEvent::ToInsert), Mode::Insert);
+    }
+
+    #[test]
+    fn test_enter_visual_only_from_normal() {
+        // Insert ignores EnterVisual; it is reachable only via Normal.
+        assert_eq!(Mode::Insert.apply(ModeEvent::EnterVisual), Mode::Insert);
     }
 }
