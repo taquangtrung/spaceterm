@@ -77,6 +77,9 @@ impl App {
             Action::ClosePane => {
                 self.close_pane(focused);
             }
+            Action::CloseOtherPanes => {
+                self.close_other_panes(focused);
+            }
             Action::FocusPane(dir) => {
                 let viewport = self.viewport_rect();
                 let layout_vp = Rect::new(viewport.x, viewport.y, viewport.width, viewport.height);
@@ -147,6 +150,10 @@ impl App {
         let (prompt_row, pty_col) = pane.grid().cursor();
         let (nav_row, nav_col) = self.nav_cursor.unwrap_or((prompt_row, pty_col));
         if nav_row != prompt_row {
+            // The cursor is on scrollback history, not the live prompt: only the
+            // prompt line is editable, so report the attempt instead of silently
+            // dropping it.
+            self.set_error("Cannot delete: not on the editable prompt line");
             return;
         }
         let bytes = prompt_delete_bytes(op, pty_col, nav_col);

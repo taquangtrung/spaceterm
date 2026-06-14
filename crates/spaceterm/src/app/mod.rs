@@ -30,7 +30,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::config::{Config, StatusBarIconsConfig};
-use crate::model::input::{self, KeyCode, PendingPrefix};
+use crate::model::input::{self, KeyCode, PendingPrefix, WindowKeymap};
 use crate::model::layout::{Direction, FocusDir, PaneId, Rect, Tab};
 use crate::model::mode::Mode;
 use crate::model::palette::Palette;
@@ -49,6 +49,9 @@ const SPLIT_RATIO: f32 = 0.5;
 /// Cell rows reserved at the bottom of the surface for the status bar.
 pub(crate) const STATUS_BAR_ROWS: usize = 1;
 const BELL_FLASH_DURATION: Duration = Duration::from_millis(150);
+/// How long a transient status-bar error notice stays on screen before it
+/// expires and the bar returns to showing the pane title.
+const ERROR_NOTICE_DURATION: Duration = Duration::from_secs(3);
 /// A bell arriving within this window after a cursor-navigation or edit key is
 /// treated as the shell's boundary ding (e.g. Backspace with nothing to delete,
 /// or Left at the start of the prompt), and its flash is suppressed.
@@ -86,6 +89,7 @@ fn status_bar(
     mode: Mode,
     theme: &Theme,
     pane_title: Option<String>,
+    notice: Option<String>,
     icons: &StatusBarIconsConfig,
 ) -> StatusBar {
     let (mode_name, accent) = match mode {
@@ -114,6 +118,7 @@ fn status_bar(
     StatusBar {
         accent,
         mode: mode_label,
+        notice,
         pane_title,
         right_label,
     }
@@ -163,6 +168,9 @@ pub struct App {
     pub(crate) config: Config,
     pub(crate) cursor_pos: (f32, f32),
     pub(crate) dirty: bool,
+    /// A transient error notice and the instant it expires, shown in the status
+    /// bar (e.g. a Vim edit aimed at the non-editable scrollback area).
+    pub(crate) error_notice: Option<(String, Instant)>,
     pub(crate) folded_blocks: HashMap<PaneId, HashSet<usize>>,
     /// Raster-image blocks rendered natively on the GPU (instead of a WebView).
     pub(crate) image_blocks: Vec<ImageBlock>,
@@ -196,6 +204,9 @@ pub struct App {
     pub(crate) visual_line: bool,
     pub(crate) webview_mgr: WebViewManager,
     pub(crate) window: Option<Arc<Window>>,
+    /// Configurable split/close/focus key bindings (the `window` keybindings
+    /// block), resolved against in Normal mode.
+    pub(crate) window_keymap: WindowKeymap,
     pub(crate) window_title: String,
 }
 
@@ -257,11 +268,15 @@ impl App {
         let mut modes = HashMap::new();
         modes.insert(PaneId(0), Mode::default());
 
+        let config = Config::load();
+        let window_keymap = WindowKeymap::from_config(config.keybindings.get("window"));
+
         Self {
             bell_until: None,
-            config: Config::load(),
+            config,
             cursor_pos: (0.0, 0.0),
             dirty: true,
+            error_notice: None,
             folded_blocks: HashMap::new(),
             last_click: None,
             last_edit_key: None,
@@ -286,6 +301,7 @@ impl App {
             visual_line: false,
             webview_mgr: WebViewManager::new(),
             window: None,
+            window_keymap,
             window_title: String::new(),
         }
     }
@@ -364,6 +380,20 @@ impl App {
         self.bell_until.is_some_and(|t| Instant::now() < t)
     }
 
+    /// Show `message` as a transient error notice in the status bar.
+    pub(crate) fn set_error(&mut self, message: impl Into<String>) {
+        self.error_notice = Some((message.into(), Instant::now() + ERROR_NOTICE_DURATION));
+        self.dirty = true;
+    }
+
+    /// The current error notice text, if one is set and has not yet expired.
+    pub(crate) fn active_error_notice(&self) -> Option<&str> {
+        self.error_notice
+            .as_ref()
+            .filter(|(_, expiry)| Instant::now() < *expiry)
+            .map(|(text, _)| text.as_str())
+    }
+
     pub(crate) fn split_pane(&mut self, direction: Direction) {
         let new_id = self.tab.split(direction, SPLIT_RATIO);
 
@@ -404,6 +434,19 @@ impl App {
             self.resize_all_panes(grid_size);
         }
         self.dirty = true;
+    }
+
+    /// Close every pane in the tab except `focused` (Vim `Ctrl-w o`).
+    pub(crate) fn close_other_panes(&mut self, focused: PaneId) {
+        let others: Vec<PaneId> = self
+            .tab
+            .panes()
+            .into_iter()
+            .filter(|&id| id != focused)
+            .collect();
+        for id in others {
+            self.close_pane(id);
+        }
     }
 
     pub(crate) fn reap_dead_panes(&mut self) {
@@ -718,7 +761,13 @@ impl ApplicationHandler for App {
                     .panes
                     .get(&focused)
                     .is_some_and(|p| p.grid().is_alt_screen());
-                let action = input::resolve(mode, &key, &mut self.pending, fullscreen);
+                let action = input::resolve_with(
+                    mode,
+                    &key,
+                    &mut self.pending,
+                    fullscreen,
+                    &self.window_keymap,
+                );
                 self.handle_action(action, focused);
                 self.update_window_title();
                 if let Some(window) = &self.window {
@@ -918,6 +967,15 @@ impl ApplicationHandler for App {
             }
         }
 
+        // Once an error notice expires, redraw once to clear it from the bar.
+        if self.error_notice.is_some() && self.active_error_notice().is_none() {
+            self.error_notice = None;
+            self.dirty = true;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + PTY_POLL_INTERVAL));
     }
 }
@@ -949,20 +1007,20 @@ mod tests {
         let theme = Theme::dark();
         let icons = StatusBarIconsConfig::default();
         assert_eq!(
-            status_bar(Mode::Insert, &theme, None, &icons).mode,
+            status_bar(Mode::Insert, &theme, None, None, &icons).mode,
             "\u{f03eb} Insert"
         );
         assert_eq!(
-            status_bar(Mode::Normal, &theme, None, &icons).mode,
+            status_bar(Mode::Normal, &theme, None, None, &icons).mode,
             "\u{e795} Normal"
         );
         assert_eq!(
-            status_bar(Mode::BlockFocus, &theme, None, &icons).mode,
+            status_bar(Mode::BlockFocus, &theme, None, None, &icons).mode,
             "\u{f0485} Block"
         );
         assert_ne!(
-            status_bar(Mode::Insert, &theme, None, &icons).accent,
-            status_bar(Mode::Normal, &theme, None, &icons).accent
+            status_bar(Mode::Insert, &theme, None, None, &icons).accent,
+            status_bar(Mode::Normal, &theme, None, None, &icons).accent
         );
     }
 
@@ -1015,5 +1073,35 @@ mod tests {
     fn test_app_new_has_no_quick_select() {
         let app = App::new();
         assert!(app.quick_select.is_none());
+    }
+
+    #[test]
+    fn test_set_error_surfaces_a_live_notice() {
+        let mut app = App::new();
+        assert!(app.active_error_notice().is_none());
+        app.set_error("boom");
+        assert_eq!(app.active_error_notice(), Some("boom"));
+    }
+
+    #[test]
+    fn test_expired_error_notice_is_not_active() {
+        let mut app = App::new();
+        // An already-elapsed expiry reads as inactive.
+        app.error_notice = Some(("stale".to_string(), Instant::now() - Duration::from_secs(1)));
+        assert!(app.active_error_notice().is_none());
+    }
+
+    #[test]
+    fn test_status_bar_notice_overrides_pane_title() {
+        let theme = Theme::dark();
+        let icons = StatusBarIconsConfig::default();
+        let bar = status_bar(
+            Mode::Normal,
+            &theme,
+            Some("title".to_string()),
+            Some("oops".to_string()),
+            &icons,
+        );
+        assert_eq!(bar.notice.as_deref(), Some("oops"));
     }
 }

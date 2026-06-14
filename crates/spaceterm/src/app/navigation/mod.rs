@@ -24,7 +24,7 @@ impl App {
             let grid = pane.grid();
             let (cursor_row, cursor_col) = grid.cursor();
             let row = cursor_row.min(grid.rows().saturating_sub(1));
-            let col = cursor_col.min(grid.visible_line_end(row));
+            let col = cursor_col.min(vim::nav_line_end(grid, row));
             self.nav_cursor = Some((row, col));
         }
     }
@@ -92,7 +92,9 @@ impl App {
 
         // Respect each line's real end: never sit on the blank padding past the
         // last printed character (snapping to a shorter line on vertical moves).
-        col = col.min(grid.visible_line_end(row));
+        // The prompt row extends to the shell cursor so typed trailing whitespace
+        // stays reachable.
+        col = col.min(vim::nav_line_end(grid, row));
         self.nav_cursor = Some((row, col));
         self.dirty = true;
     }

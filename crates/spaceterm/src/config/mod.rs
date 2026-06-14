@@ -29,6 +29,17 @@
 //!     insert {
 //!         binding "Ctrl-Space" "toggle_mode"
 //!     }
+//!     // Window management (split / close / focus). The key is one or two
+//!     // chords; a two-chord binding sets the leader (default `Ctrl-w`).
+//!     // Actions: split_vertical, split_horizontal, close_pane,
+//!     // close_other_panes, focus_left, focus_down, focus_up, focus_right.
+//!     window {
+//!         binding "Ctrl-w v" "split_vertical"
+//!         binding "Ctrl-w s" "split_horizontal"
+//!         binding "Ctrl-w c" "close_pane"
+//!         binding "Ctrl-w o" "close_other_panes"
+//!         binding "Ctrl-h" "focus_left"
+//!     }
 //! }
 //! ```
 

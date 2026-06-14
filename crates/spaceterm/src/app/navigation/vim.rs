@@ -169,6 +169,24 @@ fn prev_row(grid: &mut Grid, row: usize) -> usize {
     }
 }
 
+/// The rightmost column the Normal-mode cursor may occupy on visible `row`.
+///
+/// Usually the last printed character ([`Grid::visible_line_end`]), so the
+/// cursor never wanders into the blank padding past a line. On the live prompt
+/// row it extends to the shell cursor: a typed trailing space is indistinguishable
+/// from blank padding in the cell grid (both are `' '`), so the shell cursor is
+/// the only marker of the command's true end, keeping its trailing whitespace
+/// navigable for editing.
+pub(super) fn nav_line_end(grid: &Grid, row: usize) -> usize {
+    let end = grid.visible_line_end(row);
+    let (cursor_row, cursor_col) = grid.cursor();
+    if grid.scroll_offset() == 0 && row == cursor_row {
+        end.max(cursor_col.saturating_sub(1))
+    } else {
+        end
+    }
+}
+
 /// The printed characters of a visible row, trimmed of trailing blank padding so
 /// motions see real line ends. A fully blank row yields an empty slice.
 pub(super) fn line_chars(grid: &Grid, row: usize) -> Vec<char> {
@@ -215,6 +233,43 @@ mod tests {
         // `^`: first non-blank.
         assert_eq!(first_non_blank(&"   hi".chars().collect::<Vec<_>>()), 3);
         assert_eq!(first_non_blank(&"".chars().collect::<Vec<_>>()), 0);
+    }
+
+    #[test]
+    fn test_nav_line_end_extends_to_shell_cursor_for_trailing_space() {
+        // A command typed with a trailing space: the cell grid stores the space
+        // like blank padding, so the shell cursor (col 3) marks the real end.
+        let mut grid = Grid::new(20, 3);
+        for ch in "cd ".chars() {
+            grid.print(ch);
+        }
+        assert_eq!(grid.visible_line_end(0), 1); // last printed glyph is 'd'
+        assert_eq!(grid.cursor(), (0, 3));
+        // The trailing space at col 2 stays navigable.
+        assert_eq!(nav_line_end(&grid, 0), 2);
+    }
+
+    #[test]
+    fn test_nav_line_end_stops_at_last_char_without_trailing_space() {
+        let mut grid = Grid::new(20, 3);
+        for ch in "cd".chars() {
+            grid.print(ch);
+        }
+        // No trailing whitespace: stop on 'd' (Vim leaves the cursor on the
+        // last character, not one past it).
+        assert_eq!(nav_line_end(&grid, 0), 1);
+    }
+
+    #[test]
+    fn test_nav_line_end_does_not_extend_non_prompt_rows() {
+        let mut grid = Grid::new(20, 3);
+        for ch in "out ".chars() {
+            grid.print(ch);
+        }
+        grid.line_feed(); // shell cursor moves to row 1
+        grid.carriage_return();
+        // Row 0 is no longer the cursor row, so its trailing space is padding.
+        assert_eq!(nav_line_end(&grid, 0), 2); // last glyph 't'
     }
 
     #[test]

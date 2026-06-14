@@ -73,6 +73,9 @@ pub struct PaneView<'a> {
 pub struct StatusBar {
     pub accent: Rgb,
     pub mode: String,
+    /// A transient error notice; when set it takes the pane-title slot and is
+    /// drawn in the theme's red to stand out.
+    pub notice: Option<String>,
     pub pane_title: Option<String>,
     pub right_label: Option<String>,
 }
@@ -748,6 +751,10 @@ impl GpuRenderer {
             let muted_attrs = Attrs::new()
                 .family(base_family(fam))
                 .color(self.theme.ansi[8].to_glyphon());
+            let error_attrs = Attrs::new()
+                .family(base_family(fam))
+                .weight(glyphon::cosmic_text::Weight::BOLD)
+                .color(self.theme.ansi[1].to_glyphon());
 
             // Left padding
             status_text.push_str("  ");
@@ -758,8 +765,19 @@ impl GpuRenderer {
             let mode_end = status_text.len();
             spans.push((mode_start..mode_end, accent_attrs));
 
-            // Pane Title / Command (if present)
-            if let Some(ref title) = status.pane_title {
+            // A transient error notice claims the pane-title slot in red;
+            // otherwise show the pane title / command if present.
+            if let Some(ref notice) = status.notice {
+                let sep_start = status_text.len();
+                status_text.push_str("  •  ");
+                let sep_end = status_text.len();
+                spans.push((sep_start..sep_end, muted_attrs.clone()));
+
+                let notice_start = status_text.len();
+                status_text.push_str(notice);
+                let notice_end = status_text.len();
+                spans.push((notice_start..notice_end, error_attrs));
+            } else if let Some(ref title) = status.pane_title {
                 let sep_start = status_text.len();
                 status_text.push_str("  •  ");
                 let sep_end = status_text.len();

@@ -33,6 +33,7 @@ const SVG_MIME: &str = "image/svg+xml";
 impl App {
     pub(crate) fn render_frame(&mut self) {
         let bell_active = self.is_bell_active();
+        let notice = self.active_error_notice().map(str::to_string);
         let Some(renderer) = &mut self.renderer else {
             return;
         };
@@ -175,6 +176,7 @@ impl App {
             mode,
             renderer.theme(),
             pane_title,
+            notice,
             &self.config.status_bar_icons,
         );
         renderer.render(&views, Some(&status), bell_active, &placements);
