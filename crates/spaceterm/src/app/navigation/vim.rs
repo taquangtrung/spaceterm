@@ -297,7 +297,11 @@ mod tests {
     fn test_find_char_forward_backward_and_till() {
         use crate::model::input::FindChar;
         let line: Vec<char> = "abcabc".chars().collect();
-        let find = |forward, till| FindChar { ch: 'c', forward, till };
+        let find = |forward, till| FindChar {
+            ch: 'c',
+            forward,
+            till,
+        };
 
         // `fc` from 0 lands on the first 'c' (index 2); repeating from there
         // (`;`) advances to the next 'c' at 5.

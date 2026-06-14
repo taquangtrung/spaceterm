@@ -171,6 +171,10 @@ fn builtin_commands() -> Vec<PaletteEntry> {
             label: "Theme: Auto".into(),
             action: "theme_auto".into(),
         },
+        PaletteEntry {
+            label: "Settings".into(),
+            action: "open_settings".into(),
+        },
     ]
 }
 

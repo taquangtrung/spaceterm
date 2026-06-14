@@ -68,19 +68,14 @@ const SEARCH_ITEMS: &[ItemDef] = &[
     leaf("toggle_fold", "Toggle Fold", ""),
 ];
 
-const THEME_ITEMS: &[ItemDef] = &[
-    leaf("theme_dark", "Dark", ""),
-    leaf("theme_light", "Light", ""),
-    leaf("theme_auto", "Auto", ""),
-];
-
 const MODERN_ITEMS: &[ItemDef] = &[
     leaf("new_tab", "New Tab", "Ctrl-Shift-T"),
     leaf("close_tab", "Close Tab", "Ctrl-Shift-W"),
     SEPARATOR,
     parent("Layout", LAYOUT_ITEMS),
     parent("Search & Fold", SEARCH_ITEMS),
-    parent("Theme", THEME_ITEMS),
+    SEPARATOR,
+    leaf("open_settings", "Settings", "Ctrl-,"),
 ];
 
 const MODERN_MENUS: &[MenuDef] = &[MenuDef {
@@ -96,6 +91,8 @@ const CLASSIC_MENUS: &[MenuDef] = &[
             leaf("close_tab", "Close Tab", "Ctrl-Shift-W"),
             SEPARATOR,
             leaf("close_pane", "Close Pane", ""),
+            SEPARATOR,
+            leaf("open_settings", "Settings", "Ctrl-,"),
         ],
     },
     MenuDef {
@@ -114,7 +111,6 @@ const CLASSIC_MENUS: &[MenuDef] = &[
             leaf("split_horizontal", "Split Horizontal", ""),
             SEPARATOR,
             leaf("toggle_fold", "Toggle Fold", ""),
-            parent("Theme", THEME_ITEMS),
         ],
     },
     MenuDef {
@@ -169,7 +165,10 @@ impl App {
     fn open_submenu_item(&self, child: usize) -> Option<&'static ItemDef> {
         let open = self.open_menu?;
         let parent = self.open_submenu?;
-        let item = menu_defs(self.config.menu_style).get(open)?.items.get(parent)?;
+        let item = menu_defs(self.config.menu_style)
+            .get(open)?
+            .items
+            .get(parent)?;
         item.children.get(child)
     }
 
@@ -370,7 +369,11 @@ mod tests {
                     }
                 } else {
                     // A submenu parent opens a child panel; it has no command.
-                    assert!(item.command.is_empty(), "parent {} should not dispatch", item.label);
+                    assert!(
+                        item.command.is_empty(),
+                        "parent {} should not dispatch",
+                        item.label
+                    );
                     check(item.children);
                 }
             }
@@ -384,21 +387,24 @@ mod tests {
     }
 
     #[test]
-    fn test_modern_menu_has_a_theme_submenu() {
-        let theme = MODERN_ITEMS
+    fn test_modern_menu_has_a_layout_submenu() {
+        let layout = MODERN_ITEMS
             .iter()
-            .find(|it| it.label == "Theme")
-            .expect("Theme parent");
-        assert_eq!(theme.children.len(), 3);
-        assert_eq!(theme.children[0].command, "theme_dark");
+            .find(|it| it.label == "Layout")
+            .expect("Layout parent");
+        assert_eq!(layout.children.len(), 3);
+        assert_eq!(layout.children[0].command, "split_vertical");
     }
 
     #[test]
     fn test_open_submenu_item_resolves_the_child_command() {
         let mut app = App::new();
         app.open_menu = Some(0);
-        app.open_submenu = MODERN_ITEMS.iter().position(|it| it.label == "Theme");
-        assert_eq!(app.open_submenu_item(0).map(|it| it.command), Some("theme_dark"));
+        app.open_submenu = MODERN_ITEMS.iter().position(|it| it.label == "Layout");
+        assert_eq!(
+            app.open_submenu_item(0).map(|it| it.command),
+            Some("split_vertical")
+        );
         assert!(app.open_submenu_item(99).is_none());
     }
 
@@ -406,14 +412,17 @@ mod tests {
     fn test_build_top_chrome_carries_submenu_children_and_state() {
         let mut app = App::new();
         app.open_menu = Some(0);
-        let theme_idx = MODERN_ITEMS.iter().position(|it| it.label == "Theme").unwrap();
-        app.open_submenu = Some(theme_idx);
+        let layout_idx = MODERN_ITEMS
+            .iter()
+            .position(|it| it.label == "Layout")
+            .unwrap();
+        app.open_submenu = Some(layout_idx);
         app.selected_subitem = Some(1);
         let chrome = app.build_top_chrome();
-        assert_eq!(chrome.open_submenu, Some(theme_idx));
+        assert_eq!(chrome.open_submenu, Some(layout_idx));
         assert_eq!(chrome.selected_subitem, Some(1));
-        assert!(chrome.menus[0].items[theme_idx].has_children());
-        assert_eq!(chrome.menus[0].items[theme_idx].children.len(), 3);
+        assert!(chrome.menus[0].items[layout_idx].has_children());
+        assert_eq!(chrome.menus[0].items[layout_idx].children.len(), 3);
     }
 
     #[test]

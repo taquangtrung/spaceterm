@@ -196,13 +196,7 @@ impl App {
             &self.config.status_bar,
         );
         let status = self.config.status_bar.enabled.then_some(&status);
-        renderer.render(
-            &views,
-            status,
-            Some(&chrome),
-            bell_active,
-            &placements,
-        );
+        renderer.render(&views, status, Some(&chrome), bell_active, &placements);
 
         let focused = self.tabs[self.active_tab].focused();
         // Tiles for panes outside the active tab are hidden so background tabs

@@ -3,4 +3,5 @@
 
 pub mod block_queue;
 pub mod pane;
+pub mod settings_view;
 pub mod webview;

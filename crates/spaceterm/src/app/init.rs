@@ -104,7 +104,7 @@ impl App {
         let mut renderer =
             GpuRenderer::new(surface, adapter, size.width, size.height, font, font_load);
 
-        let mut initial_theme = match self.config.theme {
+        let mut initial_theme = match &self.config.theme {
             ThemeSetting::Auto => window
                 .theme()
                 .map(|t| match t {
@@ -114,6 +114,10 @@ impl App {
                 .unwrap_or_default(),
             ThemeSetting::Dark => Theme::dark(),
             ThemeSetting::Light => Theme::light(),
+            // A user theme file; fall back to the dark preset if it is missing.
+            ThemeSetting::Named(name) => {
+                crate::config::load_named_theme(name).unwrap_or_else(Theme::dark)
+            }
         };
         self.config.colors.apply(&mut initial_theme);
         renderer.set_theme(initial_theme);

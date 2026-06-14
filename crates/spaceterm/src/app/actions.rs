@@ -103,7 +103,9 @@ impl App {
                 self.switch_tab(n.saturating_sub(1));
             }
             Action::CloseTab(which) => {
-                let index = which.map(|n| n.saturating_sub(1)).unwrap_or(self.active_tab);
+                let index = which
+                    .map(|n| n.saturating_sub(1))
+                    .unwrap_or(self.active_tab);
                 self.close_tab(index);
             }
             Action::FocusPane(dir) => {

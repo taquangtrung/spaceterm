@@ -9,6 +9,17 @@
 //! A legacy single-file `spaceterm.kdl` (settings + a `keybindings` block) is
 //! still read when neither split file is present.
 //!
+//! User themes live in `themes/<name>.kdl`; set `theme "<name>"` to select one
+//! (the reserved words `dark`/`light`/`auto` stay built-in). A theme file is an
+//! optional `base "dark"|"light"` plus a `colors` block layered over it:
+//! ```kdl
+//! base "dark"
+//! colors {
+//!     background "#282a36"
+//!     foreground "#f8f8f2"
+//! }
+//! ```
+//!
 //! `settings.kdl`:
 //! ```kdl
 //! theme "auto"
@@ -174,12 +185,38 @@ impl ColorOverrides {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// The selected theme: a built-in preset, the system-following `Auto`, or a
+/// user theme file `themes/<name>.kdl` referenced by name.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum ThemeSetting {
     Auto,
     #[default]
     Dark,
     Light,
+    Named(String),
+}
+
+impl ThemeSetting {
+    /// Interpret a `theme` config value: the reserved words `auto`/`dark`/`light`
+    /// are built-ins, anything else names a theme file in `themes/`.
+    pub fn from_value(value: &str) -> Self {
+        match value {
+            "auto" => Self::Auto,
+            "light" => Self::Light,
+            "dark" => Self::Dark,
+            other => Self::Named(other.to_string()),
+        }
+    }
+
+    /// The `theme` config value this selection serializes to.
+    pub fn as_value(&self) -> &str {
+        match self {
+            Self::Auto => "auto",
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::Named(name) => name,
+        }
+    }
 }
 
 // ========================================================================
@@ -290,6 +327,17 @@ struct KdlTheme {
     value: String,
 }
 
+/// A `themes/<name>.kdl` file: an optional `base` preset (`dark`/`light`) plus a
+/// `colors` block layered over it, reusing the same color schema as the main
+/// config.
+#[derive(knuffel::Decode)]
+struct KdlThemeFile {
+    #[knuffel(child, unwrap(argument))]
+    base: Option<String>,
+    #[knuffel(child)]
+    colors: Option<KdlColors>,
+}
+
 #[derive(knuffel::Decode)]
 struct KdlKeybindings {
     #[knuffel(children)]
@@ -375,11 +423,7 @@ impl Config {
         let theme = kdl
             .theme
             .as_ref()
-            .map(|t| match t.value.as_str() {
-                "auto" => ThemeSetting::Auto,
-                "light" => ThemeSetting::Light,
-                _ => ThemeSetting::Dark,
-            })
+            .map(|t| ThemeSetting::from_value(&t.value))
             .unwrap_or_default();
 
         let keybindings = kdl
@@ -443,6 +487,116 @@ impl Config {
             theme,
         }
     }
+
+    /// Serialize the appearance/behavior settings as `settings.kdl` text. The
+    /// output round-trips through [`Self::parse`]. Keybindings live in a separate
+    /// `keys.kdl` and are intentionally not written here.
+    pub fn to_kdl(&self) -> String {
+        let menu_style = match self.menu_style {
+            MenuStyle::Classic => "classic",
+            MenuStyle::Modern => "modern",
+        };
+
+        let mut out = String::new();
+        out.push_str(&format!("theme {}\n", kdl_string(self.theme.as_value())));
+        if let Some(font) = &self.font_family {
+            out.push_str(&format!("font {}\n", kdl_string(font)));
+        }
+        out.push_str(&format!(
+            "font-size {}\n",
+            kdl_string(&self.font_size.to_string())
+        ));
+        out.push_str(&format!(
+            "opacity {}\n",
+            kdl_string(&self.opacity.to_string())
+        ));
+        out.push_str(&format!("menu-style {}\n", kdl_string(menu_style)));
+        out.push_str(&self.status_bar_kdl());
+        if let Some(colors) = self.colors_kdl() {
+            out.push_str(&colors);
+        }
+        out
+    }
+
+    /// Write [`Self::to_kdl`] to `settings.kdl`, creating the config directory if
+    /// needed. Keybindings are left untouched.
+    pub fn save(&self) -> std::io::Result<()> {
+        let dir = config_dir();
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("settings.kdl"), self.to_kdl())
+    }
+
+    /// The `status-bar` block, always emitted so every flag and icon round-trips.
+    fn status_bar_kdl(&self) -> String {
+        let sb = &self.status_bar;
+        let mut out = String::from("status-bar {\n");
+        out.push_str(&format!("    show {}\n", kdl_bool(sb.enabled)));
+        out.push_str(&format!("    show-mode {}\n", kdl_bool(sb.show_mode)));
+        out.push_str(&format!("    show-title {}\n", kdl_bool(sb.show_title)));
+        out.push_str(&format!(
+            "    show-branding {}\n",
+            kdl_bool(sb.show_branding)
+        ));
+        out.push_str(&format!(
+            "    normal-icon {}\n",
+            kdl_string(&sb.icons.normal)
+        ));
+        out.push_str(&format!(
+            "    insert-icon {}\n",
+            kdl_string(&sb.icons.insert)
+        ));
+        out.push_str(&format!("    block-icon {}\n", kdl_string(&sb.icons.block)));
+        out.push_str(&format!(
+            "    branding-icon {}\n",
+            kdl_string(&sb.icons.branding)
+        ));
+        out.push_str("}\n");
+        out
+    }
+
+    /// The `colors` block, or `None` when no color override is set (so an
+    /// untouched config keeps the preset and writes no block).
+    fn colors_kdl(&self) -> Option<String> {
+        let c = &self.colors;
+        let scalars: [(&str, Option<ThemeRgb>); 8] = [
+            ("background", c.background),
+            ("foreground", c.foreground),
+            ("cursor-bg", c.cursor_bg),
+            ("cursor-fg", c.cursor_fg),
+            ("selection-bg", c.selection_bg),
+            ("selection-fg", c.selection_fg),
+            ("split", c.divider),
+            ("visual-bell", c.bell),
+        ];
+        let any = scalars.iter().any(|(_, v)| v.is_some())
+            || !c.ansi.is_empty()
+            || !c.brights.is_empty()
+            || !c.indexed.is_empty();
+        if !any {
+            return None;
+        }
+
+        let mut out = String::from("colors {\n");
+        for (name, value) in scalars {
+            if let Some(rgb) = value {
+                out.push_str(&format!("    {name} {}\n", kdl_string(&rgb.to_hex())));
+            }
+        }
+        if let Some(line) = color_list_kdl("ansi", &c.ansi) {
+            out.push_str(&line);
+        }
+        if let Some(line) = color_list_kdl("brights", &c.brights) {
+            out.push_str(&line);
+        }
+        for (index, rgb) in &c.indexed {
+            out.push_str(&format!(
+                "    indexed {index} {}\n",
+                kdl_string(&rgb.to_hex())
+            ));
+        }
+        out.push_str("}\n");
+        Some(out)
+    }
 }
 
 impl Default for Config {
@@ -460,12 +614,82 @@ impl Default for Config {
     }
 }
 
+/// Names (filename without `.kdl`) of the theme files in `themes/`, sorted. An
+/// absent or unreadable directory yields an empty list.
+pub fn available_themes() -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(themes_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension()?.to_str()? != "kdl" {
+                return None;
+            }
+            path.file_stem()?.to_str().map(str::to_string)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Load and resolve `themes/<name>.kdl` into a full [`Theme`] (its `base` preset
+/// with its `colors` layered on top), or `None` if the file is missing or
+/// unparseable.
+pub fn load_named_theme(name: &str) -> Option<Theme> {
+    let path = themes_dir().join(format!("{name}.kdl"));
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_theme_file(&text)
+}
+
+/// Resolve a theme file's text into a [`Theme`]: start from the named `base`
+/// preset (defaulting to dark) and apply its color overrides.
+fn parse_theme_file(text: &str) -> Option<Theme> {
+    let kdl: KdlThemeFile = knuffel::parse("theme.kdl", text).ok()?;
+    let mut theme = match kdl.base.as_deref() {
+        Some("light") => Theme::light(),
+        _ => Theme::dark(),
+    };
+    if let Some(colors) = kdl.colors {
+        color_overrides_from_kdl(colors).apply(&mut theme);
+    }
+    Some(theme)
+}
+
+/// The user theme directory: `<config_dir>/themes`.
+fn themes_dir() -> PathBuf {
+    config_dir().join("themes")
+}
+
 /// Parse a KDL boolean-ish string (`"true"`/`"false"`), falling back to `default`.
 fn parse_bool(value: Option<&str>, default: bool) -> bool {
     match value {
-        Some(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"),
+        Some(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "on"
+        ),
         None => default,
     }
+}
+
+/// Quote `s` as a KDL string argument, escaping backslashes and double quotes.
+fn kdl_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// A boolean as the `"true"`/`"false"` KDL string read back by [`parse_bool`].
+fn kdl_bool(value: bool) -> String {
+    kdl_string(if value { "true" } else { "false" })
+}
+
+/// A `colors` list node (`ansi`/`brights`) of hex string arguments, or `None`
+/// when the list is empty.
+fn color_list_kdl(name: &str, colors: &[ThemeRgb]) -> Option<String> {
+    if colors.is_empty() {
+        return None;
+    }
+    let args: Vec<String> = colors.iter().map(|c| kdl_string(&c.to_hex())).collect();
+    Some(format!("    {name} {}\n", args.join(" ")))
 }
 
 fn color_overrides_from_kdl(kdl: KdlColors) -> ColorOverrides {
@@ -719,9 +943,111 @@ status-bar {
     }
 
     #[test]
+    fn test_to_kdl_roundtrips_scalar_settings() {
+        let mut config = Config::default();
+        config.theme = ThemeSetting::Light;
+        config.menu_style = MenuStyle::Classic;
+        config.font_family = Some("Fira Code".to_string());
+        config.font_size = 18.0;
+        config.opacity = 0.8;
+        config.status_bar.enabled = false;
+        config.status_bar.show_branding = false;
+
+        let parsed = Config::parse(&config.to_kdl());
+        assert_eq!(parsed.theme, ThemeSetting::Light);
+        assert_eq!(parsed.menu_style, MenuStyle::Classic);
+        assert_eq!(parsed.font_family.as_deref(), Some("Fira Code"));
+        assert_eq!(parsed.font_size, 18.0);
+        assert_eq!(parsed.opacity, 0.8);
+        assert!(!parsed.status_bar.enabled);
+        assert!(!parsed.status_bar.show_branding);
+        assert!(parsed.status_bar.show_mode);
+    }
+
+    #[test]
+    fn test_theme_setting_from_and_to_value() {
+        assert_eq!(ThemeSetting::from_value("auto"), ThemeSetting::Auto);
+        assert_eq!(ThemeSetting::from_value("light"), ThemeSetting::Light);
+        assert_eq!(ThemeSetting::from_value("dark"), ThemeSetting::Dark);
+        assert_eq!(
+            ThemeSetting::from_value("dracula"),
+            ThemeSetting::Named("dracula".to_string())
+        );
+        assert_eq!(ThemeSetting::Named("nord".to_string()).as_value(), "nord");
+        assert_eq!(ThemeSetting::Auto.as_value(), "auto");
+    }
+
+    #[test]
+    fn test_parse_and_roundtrip_named_theme() {
+        let config = Config::parse("theme \"dracula\"");
+        assert_eq!(config.theme, ThemeSetting::Named("dracula".to_string()));
+        let parsed = Config::parse(&config.to_kdl());
+        assert_eq!(parsed.theme, ThemeSetting::Named("dracula".to_string()));
+    }
+
+    #[test]
+    fn test_parse_theme_file_applies_base_and_colors() {
+        let theme = parse_theme_file(
+            r##"
+base "light"
+colors {
+    background "#282a36"
+    foreground "#f8f8f2"
+}
+"##,
+        )
+        .expect("theme file parses");
+        // Base preset is light, then the two colors override it.
+        assert_eq!(theme.background, ThemeRgb::parse_hex("#282a36").unwrap());
+        assert_eq!(theme.foreground, ThemeRgb::parse_hex("#f8f8f2").unwrap());
+        // An unspecified color keeps the light base.
+        assert_eq!(theme.cursor_bg, Theme::light().cursor_bg);
+    }
+
+    #[test]
+    fn test_parse_theme_file_defaults_base_to_dark() {
+        let theme = parse_theme_file("colors {\n    background \"#000000\"\n}").unwrap();
+        assert_eq!(theme.cursor_bg, Theme::dark().cursor_bg);
+    }
+
+    #[test]
+    fn test_to_kdl_roundtrips_color_overrides() {
+        let mut config = Config::default();
+        config.colors.background = ThemeRgb::parse_hex("#1a1a2e");
+        config.colors.cursor_bg = ThemeRgb::parse_hex("#52ad70");
+        config.colors.ansi = vec![ThemeRgb::parse_hex("#000000").unwrap()];
+        config.colors.indexed = vec![(136, ThemeRgb::parse_hex("#af8700").unwrap())];
+
+        let parsed = Config::parse(&config.to_kdl());
+        assert_eq!(parsed.colors.background, ThemeRgb::parse_hex("#1a1a2e"));
+        assert_eq!(parsed.colors.cursor_bg, ThemeRgb::parse_hex("#52ad70"));
+        assert_eq!(
+            parsed.colors.ansi,
+            vec![ThemeRgb::parse_hex("#000000").unwrap()]
+        );
+        assert_eq!(
+            parsed.colors.indexed,
+            vec![(136, ThemeRgb::parse_hex("#af8700").unwrap())]
+        );
+    }
+
+    #[test]
+    fn test_to_kdl_without_overrides_writes_no_colors_block() {
+        let config = Config::default();
+        let kdl = config.to_kdl();
+        assert!(!kdl.contains("colors {"), "{kdl}");
+        // A pristine config still round-trips to its defaults.
+        let parsed = Config::parse(&kdl);
+        assert_eq!(parsed.theme, ThemeSetting::Dark);
+        assert_eq!(parsed.font_size, 15.0);
+    }
+
+    #[test]
     fn test_status_bar_visibility_defaults_on_and_parses_off() {
         let default = Config::default().status_bar;
-        assert!(default.enabled && default.show_mode && default.show_title && default.show_branding);
+        assert!(
+            default.enabled && default.show_mode && default.show_title && default.show_branding
+        );
 
         let config = Config::parse(
             r#"

@@ -73,6 +73,11 @@ impl Rgb {
         let b = u8::from_str_radix(&s[4..6], 16).ok()?;
         Some(Self { b, g, r })
     }
+
+    /// Format as a `#rrggbb` hex string, the inverse of [`Self::parse_hex`].
+    pub fn to_hex(self) -> String {
+        format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
+    }
 }
 
 // ========================================================================
@@ -198,6 +203,13 @@ mod tests {
         assert_eq!(Rgb::parse_hex("ff0000"), None);
         assert_eq!(Rgb::parse_hex("#fff"), None);
         assert_eq!(Rgb::parse_hex("#gggggg"), None);
+    }
+
+    #[test]
+    fn test_to_hex_roundtrips_parse_hex() {
+        for hex in ["#ff0000", "#00ff00", "#0000ff", "#2a2f31", "#000000"] {
+            assert_eq!(Rgb::parse_hex(hex).unwrap().to_hex(), hex);
+        }
     }
 
     #[test]

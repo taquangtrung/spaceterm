@@ -460,7 +460,14 @@ mod tests {
         );
         // The new-tab button sits just past the last tab.
         assert_eq!(
-            hit_test(&c, SURFACE_W, CW, CH, tabs_left + 2.0 * 18.0 * CW + 5.0, 5.0),
+            hit_test(
+                &c,
+                SURFACE_W,
+                CW,
+                CH,
+                tabs_left + 2.0 * 18.0 * CW + 5.0,
+                5.0
+            ),
             ChromeHit::NewTab
         );
     }
@@ -538,7 +545,14 @@ mod tests {
         // A click on a child resolves to the submenu, which overlays the parent.
         let child = dropdown_item_region(&submenu, 0);
         assert_eq!(
-            hit_test(&c, SURFACE_W, CW, CH, child.x + 2.0, child.y + child.h / 2.0),
+            hit_test(
+                &c,
+                SURFACE_W,
+                CW,
+                CH,
+                child.x + 2.0,
+                child.y + child.h / 2.0
+            ),
             ChromeHit::SubmenuItem(0)
         );
     }

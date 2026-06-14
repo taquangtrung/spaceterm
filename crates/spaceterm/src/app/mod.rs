@@ -37,9 +37,10 @@ use crate::model::mode::Mode;
 use crate::model::palette::Palette;
 use crate::session::Session;
 use crate::terminal::pane::Pane;
+use crate::terminal::settings_view::{SettingsMsg, SettingsView};
 use crate::terminal::webview::WebViewManager;
 use spaceterm_render::renderer::{GpuRenderer, PaneRect};
-use spaceterm_render::{StatusBar, Theme};
+use spaceterm_render::{MenuStyle, StatusBar, Theme};
 
 // ========================================================================
 // Constants
@@ -205,6 +206,8 @@ pub struct App {
     pub(crate) renderer: Option<GpuRenderer>,
     pub(crate) search_query: Option<String>,
     pub(crate) selection: Option<Selection>,
+    /// The open full-window settings page (a child WebView), or `None`.
+    pub(crate) settings_view: Option<SettingsView>,
     /// Which tab is shown; index into [`Self::tabs`].
     pub(crate) active_tab: usize,
     /// The open menu/dropdown (index into the chrome's menu list), or `None`.
@@ -320,6 +323,7 @@ impl App {
             renderer: None,
             search_query: None,
             selection: None,
+            settings_view: None,
             active_tab: 0,
             open_menu: None,
             open_submenu: None,
@@ -804,39 +808,184 @@ impl App {
             }
             "theme_dark" => {
                 self.config.theme = crate::config::ThemeSetting::Dark;
-                if let Some(renderer) = &mut self.renderer {
-                    let mut theme = Theme::dark();
-                    self.config.colors.apply(&mut theme);
-                    renderer.set_theme(theme);
-                }
-                self.dirty = true;
+                self.rebuild_theme();
             }
             "theme_light" => {
                 self.config.theme = crate::config::ThemeSetting::Light;
-                if let Some(renderer) = &mut self.renderer {
-                    let mut theme = Theme::light();
-                    self.config.colors.apply(&mut theme);
-                    renderer.set_theme(theme);
-                }
-                self.dirty = true;
+                self.rebuild_theme();
             }
             "theme_auto" => {
                 self.config.theme = crate::config::ThemeSetting::Auto;
-                if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
-                    let mut colors = window
-                        .theme()
-                        .map(|t| match t {
-                            winit::window::Theme::Dark => Theme::dark(),
-                            winit::window::Theme::Light => Theme::light(),
-                        })
-                        .unwrap_or_default();
-                    self.config.colors.apply(&mut colors);
-                    renderer.set_theme(colors);
-                }
-                self.dirty = true;
+                self.rebuild_theme();
+            }
+            "open_settings" => {
+                self.open_settings();
             }
             _ => {}
         }
+    }
+
+    /// Rebuild the renderer theme from the current `config.theme` selection plus
+    /// any color overrides, and request a redraw. Shared by the theme menu
+    /// commands and the live settings page.
+    pub(crate) fn rebuild_theme(&mut self) {
+        use crate::config::ThemeSetting;
+        let Some(renderer) = &mut self.renderer else {
+            return;
+        };
+        let mut theme = match &self.config.theme {
+            ThemeSetting::Dark => Theme::dark(),
+            ThemeSetting::Light => Theme::light(),
+            ThemeSetting::Auto => self
+                .window
+                .as_ref()
+                .and_then(|w| w.theme())
+                .map(|t| match t {
+                    winit::window::Theme::Dark => Theme::dark(),
+                    winit::window::Theme::Light => Theme::light(),
+                })
+                .unwrap_or_default(),
+            // A user theme file; fall back to the dark preset if it is missing.
+            ThemeSetting::Named(name) => {
+                crate::config::load_named_theme(name).unwrap_or_else(Theme::dark)
+            }
+        };
+        self.config.colors.apply(&mut theme);
+        renderer.set_theme(theme);
+        self.dirty = true;
+    }
+
+    /// Open the full-window settings page, dismissing any open menu or palette
+    /// first. A no-op if it is already open or the window/renderer are not ready.
+    pub(crate) fn open_settings(&mut self) {
+        if self.settings_view.is_some() {
+            return;
+        }
+        self.close_menu();
+        self.palette = None;
+        let opened = match (&self.window, &self.renderer) {
+            (Some(window), Some(renderer)) => {
+                Some(SettingsView::open(window, &self.config, renderer.theme()))
+            }
+            _ => None,
+        };
+        match opened {
+            Some(Ok(view)) => {
+                self.settings_view = Some(view);
+                self.dirty = true;
+            }
+            Some(Err(e)) => {
+                eprintln!("spaceterm: settings page error: {e}");
+                self.set_error("settings unavailable");
+            }
+            None => {}
+        }
+    }
+
+    /// Close the settings page (dropping its WebView) and restore the panes.
+    pub(crate) fn close_settings(&mut self) {
+        if self.settings_view.take().is_some() {
+            // The overlay is gone; force block tiles to re-show and re-position.
+            self.last_tile_layout = None;
+            self.dirty = true;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
+    /// Drain and apply edits queued by the settings page, persisting the config
+    /// when anything changed and closing the page on a close request.
+    pub(crate) fn apply_settings(&mut self) {
+        let Some(view) = &self.settings_view else {
+            return;
+        };
+        let messages = view.drain();
+        if messages.is_empty() {
+            return;
+        }
+
+        let mut should_close = false;
+        let mut changed = false;
+        for message in messages {
+            match message {
+                SettingsMsg::Close => should_close = true,
+                SettingsMsg::Set(set) => changed |= self.apply_setting(&set.key, &set.value),
+            }
+        }
+
+        if changed {
+            if let Err(e) = self.config.save() {
+                eprintln!("spaceterm: could not save settings: {e}");
+            }
+            self.dirty = true;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+        if should_close {
+            self.close_settings();
+        }
+    }
+
+    /// Apply one settings edit to the live config and perform any renderer or
+    /// layout refresh it implies. Returns whether the config changed (and so
+    /// should be persisted); an unparseable value leaves the config untouched.
+    fn apply_setting(&mut self, key: &str, value: &str) -> bool {
+        use crate::config::ThemeSetting;
+        match key {
+            "theme" => {
+                self.config.theme = ThemeSetting::from_value(value);
+                self.rebuild_theme();
+            }
+            "menu_style" => {
+                self.config.menu_style = match value {
+                    "classic" => MenuStyle::Classic,
+                    _ => MenuStyle::Modern,
+                };
+                self.relayout_chrome();
+            }
+            "font_family" => {
+                let trimmed = value.trim();
+                self.config.font_family = (!trimmed.is_empty()).then(|| trimmed.to_string());
+            }
+            "font_size" => match value.parse::<f32>() {
+                Ok(size) => self.config.font_size = size,
+                Err(_) => return false,
+            },
+            "opacity" => match value.parse::<f32>() {
+                Ok(opacity) => self.config.opacity = opacity.clamp(0.1, 1.0),
+                Err(_) => return false,
+            },
+            "status.enabled" => {
+                self.config.status_bar.enabled = value == "true";
+                self.relayout_chrome();
+            }
+            "status.show_mode" => {
+                self.config.status_bar.show_mode = value == "true";
+                self.dirty = true;
+            }
+            "status.show_title" => {
+                self.config.status_bar.show_title = value == "true";
+                self.dirty = true;
+            }
+            "status.show_branding" => {
+                self.config.status_bar.show_branding = value == "true";
+                self.dirty = true;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Re-lay-out panes after a change to the reserved top-chrome or status-bar
+    /// rows (menu style, status-bar visibility), and request a redraw.
+    fn relayout_chrome(&mut self) {
+        self.last_tile_layout = None;
+        if self.renderer.is_some() {
+            self.resize_all_panes();
+        }
+        self.dirty = true;
     }
 }
 
@@ -867,6 +1016,9 @@ impl ApplicationHandler for App {
                     if self.renderer.is_some() {
                         self.resize_all_panes();
                     }
+                    if let Some(view) = &self.settings_view {
+                        view.resize(size.width, size.height);
+                    }
                     self.dirty = true;
                     if let Some(window) = &self.window {
                         window.request_redraw();
@@ -894,6 +1046,16 @@ impl ApplicationHandler for App {
                     shift: mods_state.shift_key(),
                 };
 
+                // While the settings page is up it owns input via its WebView; the
+                // page closes itself on Esc, but if focus is elsewhere honor Esc
+                // here too and swallow other keys so they don't reach the PTY.
+                if self.settings_view.is_some() {
+                    if key.code == KeyCode::Escape {
+                        self.close_settings();
+                    }
+                    return;
+                }
+
                 // Esc dismisses an open menu before anything else acts on it.
                 if self.open_menu.is_some() && key.code == KeyCode::Escape {
                     self.close_menu();
@@ -901,6 +1063,20 @@ impl ApplicationHandler for App {
                         window.request_redraw();
                     }
                     return;
+                }
+
+                // Ctrl-, opens the settings page. Some keyboard layouts report the
+                // shifted comma as `<`, so accept either glyph.
+                if mods_state.control_key() && !mods_state.alt_key() {
+                    if let Key::Character(c) = event.logical_key.as_ref() {
+                        if c == "," || c == "<" {
+                            self.open_settings();
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                            return;
+                        }
+                    }
                 }
 
                 // Ctrl-Tab / Ctrl-Shift-Tab cycle tabs.
@@ -1179,6 +1355,11 @@ impl ApplicationHandler for App {
             gtk::main_iteration_do(false);
         }
 
+        // The settings page posts edits during the GTK pump above; apply them now.
+        if self.settings_view.is_some() {
+            self.apply_settings();
+        }
+
         self.reap_dead_panes();
         let any_output = self.drain_all_panes();
         if any_output {
@@ -1284,13 +1465,7 @@ mod tests {
             show_branding: false,
             ..StatusBarConfig::default()
         };
-        let bar = status_bar(
-            Mode::Normal,
-            &theme,
-            Some("title".to_string()),
-            None,
-            &cfg,
-        );
+        let bar = status_bar(Mode::Normal, &theme, Some("title".to_string()), None, &cfg);
         assert_eq!(bar.mode, "");
         assert_eq!(bar.pane_title, None);
         // An empty (Some) right label suppresses the default branding fallback.

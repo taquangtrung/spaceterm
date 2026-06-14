@@ -244,7 +244,12 @@ impl GpuRenderer {
         let format = caps
             .formats
             .iter()
-            .find(|f| matches!(f, TextureFormat::Bgra8UnormSrgb | TextureFormat::Rgba8UnormSrgb))
+            .find(|f| {
+                matches!(
+                    f,
+                    TextureFormat::Bgra8UnormSrgb | TextureFormat::Rgba8UnormSrgb
+                )
+            })
             .or_else(|| {
                 caps.formats
                     .iter()
@@ -1137,8 +1142,7 @@ impl GpuRenderer {
         // fill and accent already set it apart, so flanking separators just add
         // visual noise.
         for (i, tab) in layout.tabs.iter().enumerate() {
-            let touches_active =
-                i == chrome.active_tab || i + 1 == chrome.active_tab;
+            let touches_active = i == chrome.active_tab || i + 1 == chrome.active_tab;
             if touches_active {
                 continue;
             }
@@ -1285,8 +1289,14 @@ impl GpuRenderer {
         let mut placements = Vec::new();
         for (id, image) in [(DROPDOWN_TEXTURE_ID, parent), (SUBMENU_TEXTURE_ID, submenu)] {
             let Some(image) = image else { continue };
-            self.image_pass
-                .upload(&self.device, &self.queue, id, &image.rgba, image.width, image.height);
+            self.image_pass.upload(
+                &self.device,
+                &self.queue,
+                id,
+                &image.rgba,
+                image.width,
+                image.height,
+            );
             placements.push(ImagePlacement {
                 height: image.height as f32,
                 id,
@@ -1843,26 +1853,31 @@ fn composite_buffer(
 ) {
     let (canvas_w, canvas_h) = canvas;
     let (ox, oy) = offset;
-    buffer.draw(font_system, swash_cache, default_color, |x, y, w, h, color| {
-        let alpha = color.a() as f32 / 255.0;
-        if alpha <= 0.0 {
-            return;
-        }
-        let (cr, cg, cb) = (color.r() as f32, color.g() as f32, color.b() as f32);
-        for py in y..y + h as i32 {
-            for px in x..x + w as i32 {
-                let gx = px + ox;
-                let gy = py + oy;
-                if gx < 0 || gy < 0 || gx >= canvas_w as i32 || gy >= canvas_h as i32 {
-                    continue;
-                }
-                let idx = ((gy as u32 * canvas_w + gx as u32) * 4) as usize;
-                rgba[idx] = (cr * alpha + rgba[idx] as f32 * (1.0 - alpha)) as u8;
-                rgba[idx + 1] = (cg * alpha + rgba[idx + 1] as f32 * (1.0 - alpha)) as u8;
-                rgba[idx + 2] = (cb * alpha + rgba[idx + 2] as f32 * (1.0 - alpha)) as u8;
+    buffer.draw(
+        font_system,
+        swash_cache,
+        default_color,
+        |x, y, w, h, color| {
+            let alpha = color.a() as f32 / 255.0;
+            if alpha <= 0.0 {
+                return;
             }
-        }
-    });
+            let (cr, cg, cb) = (color.r() as f32, color.g() as f32, color.b() as f32);
+            for py in y..y + h as i32 {
+                for px in x..x + w as i32 {
+                    let gx = px + ox;
+                    let gy = py + oy;
+                    if gx < 0 || gy < 0 || gx >= canvas_w as i32 || gy >= canvas_h as i32 {
+                        continue;
+                    }
+                    let idx = ((gy as u32 * canvas_w + gx as u32) * 4) as usize;
+                    rgba[idx] = (cr * alpha + rgba[idx] as f32 * (1.0 - alpha)) as u8;
+                    rgba[idx + 1] = (cg * alpha + rgba[idx + 1] as f32 * (1.0 - alpha)) as u8;
+                    rgba[idx + 2] = (cb * alpha + rgba[idx + 2] as f32 * (1.0 - alpha)) as u8;
+                }
+            }
+        },
+    );
 }
 
 /// Rasterize the open dropdown overlay (soft shadow, elevated rounded panel,
@@ -1901,7 +1916,11 @@ fn submenu_rgba(
     surface_w: f32,
 ) -> Option<DropdownImage> {
     let layout = chrome_layout(chrome, surface_w, ctx.cell_w, ctx.cell_h);
-    let parent = chrome.menus.get(chrome.open_menu?)?.items.get(chrome.open_submenu?)?;
+    let parent = chrome
+        .menus
+        .get(chrome.open_menu?)?
+        .items
+        .get(chrome.open_submenu?)?;
     let panel = panel_rgba(
         font_system,
         swash_cache,
@@ -1945,19 +1964,36 @@ fn panel_rgba(
     // Soft drop shadow: opacity fades with distance outside the panel.
     for py in 0..height {
         for px in 0..width {
-            let sdf = rounded_rect_sdf(px as f32 + 0.5, py as f32 + 0.5, panel_rect, DROPDOWN_RADIUS);
+            let sdf = rounded_rect_sdf(
+                px as f32 + 0.5,
+                py as f32 + 0.5,
+                panel_rect,
+                DROPDOWN_RADIUS,
+            );
             let falloff = (1.0 - sdf / margin).clamp(0.0, 1.0);
             if sdf <= 0.0 || falloff <= 0.0 {
                 continue;
             }
             let idx = ((py * width + px) * 4) as usize;
-            blend_px(&mut rgba, idx, SHADOW_COLOR, falloff * falloff * DROPDOWN_SHADOW_ALPHA);
+            blend_px(
+                &mut rgba,
+                idx,
+                SHADOW_COLOR,
+                falloff * falloff * DROPDOWN_SHADOW_ALPHA,
+            );
         }
     }
 
     // Elevated rounded panel surface, then the rounded hover pill for the
     // selected row. The first row begins below the panel's top padding.
-    fill_rounded_rect(&mut rgba, canvas, panel_rect, DROPDOWN_RADIUS, theme.menu_bg, 1.0);
+    fill_rounded_rect(
+        &mut rgba,
+        canvas,
+        panel_rect,
+        DROPDOWN_RADIUS,
+        theme.menu_bg,
+        1.0,
+    );
     let row_top = margin + layout.pad;
     if let Some(sel) = selected {
         let hover_rect = (
@@ -1967,7 +2003,14 @@ fn panel_rgba(
             layout.item_h - 2.0 * MENU_HOVER_INSET,
         );
         let radius = (DROPDOWN_RADIUS - MENU_HOVER_INSET).max(0.0);
-        fill_rounded_rect(&mut rgba, canvas, hover_rect, radius, theme.menu_hover_bg, 1.0);
+        fill_rounded_rect(
+            &mut rgba,
+            canvas,
+            hover_rect,
+            radius,
+            theme.menu_hover_bg,
+            1.0,
+        );
     }
 
     let foreground = theme.foreground.to_glyphon();
@@ -1991,7 +2034,15 @@ fn panel_rgba(
         let text_y = row_y + text_dy;
         let label = shape_chrome_line(font_system, ctx, &item.label, foreground, false, true);
         let pos = (origin + pad, text_y);
-        composite_buffer(font_system, swash_cache, &mut rgba, canvas, &label, pos, foreground);
+        composite_buffer(
+            font_system,
+            swash_cache,
+            &mut rgba,
+            canvas,
+            &label,
+            pos,
+            foreground,
+        );
 
         // A submenu parent shows a chevron; a leaf shows its shortcut, if any.
         let trailing = if item.has_children() {
@@ -2005,7 +2056,15 @@ fn panel_rgba(
             let buf = shape_chrome_line(font_system, ctx, &text, muted, false, true);
             let buf_w = buffer_width(&buf).ceil() as i32;
             let pos = (origin + panel_w as i32 - buf_w - pad, text_y);
-            composite_buffer(font_system, swash_cache, &mut rgba, canvas, &buf, pos, muted);
+            composite_buffer(
+                font_system,
+                swash_cache,
+                &mut rgba,
+                canvas,
+                &buf,
+                pos,
+                muted,
+            );
         }
     }
 
@@ -2194,7 +2253,10 @@ mod tests {
         // ...while the top padding band is the opaque elevated surface color,
         // proving both the lighter menu_bg and the vertical padding are applied.
         let (r, g, b, a) = pixel(image.width / 2, margin + 2);
-        assert_eq!((r, g, b, a), (theme.menu_bg.r, theme.menu_bg.g, theme.menu_bg.b, 255));
+        assert_eq!(
+            (r, g, b, a),
+            (theme.menu_bg.r, theme.menu_bg.g, theme.menu_bg.b, 255)
+        );
     }
 
     #[test]
