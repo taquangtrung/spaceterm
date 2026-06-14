@@ -25,10 +25,18 @@ pub struct Theme {
     pub divider: Rgb,
     pub foreground: Rgb,
     pub indexed: Vec<(u8, Rgb)>,
+    /// Highlight behind a hovered dropdown menu item.
+    pub menu_hover_bg: Rgb,
     pub selection_bg: Rgb,
     pub selection_fg: Rgb,
     pub status_bar_bg: Rgb,
     pub status_bar_fg: Rgb,
+    /// Fill behind the active tab in the tabbar.
+    pub tab_active_bg: Rgb,
+    /// Text color of the active tab's title.
+    pub tab_active_fg: Rgb,
+    /// Background of the tabbar / menubar bands.
+    pub tabbar_bg: Rgb,
 }
 
 // ========================================================================
@@ -86,8 +94,12 @@ impl Theme {
             selection_fg: Rgb::parse_hex("#000000").unwrap(),
             divider: Rgb::parse_hex("#51554f").unwrap(),
             bell: Rgb::parse_hex("#202020").unwrap(),
+            menu_hover_bg: Rgb::parse_hex("#3a4042").unwrap(),
             status_bar_bg: Rgb::parse_hex("#1b1f20").unwrap(),
             status_bar_fg: Rgb::parse_hex("#15181a").unwrap(),
+            tab_active_bg: Rgb::parse_hex("#2a2f31").unwrap(),
+            tab_active_fg: Rgb::parse_hex("#d8d8d8").unwrap(),
+            tabbar_bg: Rgb::parse_hex("#1b1f20").unwrap(),
             ansi: [
                 Rgb::parse_hex("#000000").unwrap(), // black
                 Rgb::parse_hex("#c22727").unwrap(), // red
@@ -122,7 +134,11 @@ impl Theme {
             selection_fg: Rgb::parse_hex("#000000").unwrap(),
             divider: Rgb::parse_hex("#cccccc").unwrap(),
             bell: Rgb::parse_hex("#dddddd").unwrap(),
+            menu_hover_bg: Rgb::parse_hex("#dcdcdc").unwrap(),
             status_bar_bg: Rgb::parse_hex("#d0d0d0").unwrap(),
+            tab_active_bg: Rgb::parse_hex("#f2f2f2").unwrap(),
+            tab_active_fg: Rgb::parse_hex("#1e1e1e").unwrap(),
+            tabbar_bg: Rgb::parse_hex("#d0d0d0").unwrap(),
             ..Self::dark()
         }
     }

@@ -87,6 +87,27 @@ pub(super) fn first_non_blank(line: &[char]) -> usize {
         .unwrap_or(0)
 }
 
+/// The landing column for a Vim char-search (`f`/`F`/`t`/`T`) on `line` from
+/// `col`. `forward` searches right of the cursor, else left; `till` stops one
+/// cell short of the match. Returns `None` when there is no match, or when a
+/// `till` search would not move (target already adjacent).
+pub(super) fn find_char(line: &[char], col: usize, find: super::input::FindChar) -> Option<usize> {
+    let super::input::FindChar { ch, forward, till } = find;
+    let target = if forward {
+        (col + 1..line.len()).find(|&i| line[i] == ch)?
+    } else {
+        (0..col).rev().find(|&i| line[i] == ch)?
+    };
+    let landing = if !till {
+        target
+    } else if forward {
+        target.checked_sub(1)?
+    } else {
+        target + 1
+    };
+    (landing != col).then_some(landing)
+}
+
 // ========================================================================
 // Multi-line motion wrappers
 // ========================================================================
@@ -270,6 +291,32 @@ mod tests {
         grid.carriage_return();
         // Row 0 is no longer the cursor row, so its trailing space is padding.
         assert_eq!(nav_line_end(&grid, 0), 2); // last glyph 't'
+    }
+
+    #[test]
+    fn test_find_char_forward_backward_and_till() {
+        use crate::model::input::FindChar;
+        let line: Vec<char> = "abcabc".chars().collect();
+        let find = |forward, till| FindChar { ch: 'c', forward, till };
+
+        // `fc` from 0 lands on the first 'c' (index 2); repeating from there
+        // (`;`) advances to the next 'c' at 5.
+        assert_eq!(find_char(&line, 0, find(true, false)), Some(2));
+        assert_eq!(find_char(&line, 2, find(true, false)), Some(5));
+        // `tc` stops one cell short of the 'c'.
+        assert_eq!(find_char(&line, 0, find(true, true)), Some(1));
+        // `Fc` searches left; `Tc` stops one cell past it (to the right).
+        assert_eq!(find_char(&line, 5, find(false, false)), Some(2));
+        assert_eq!(find_char(&line, 5, find(false, true)), Some(3));
+        // A miss leaves the caller to keep the cursor put.
+        let miss = FindChar {
+            ch: 'z',
+            forward: true,
+            till: false,
+        };
+        assert_eq!(find_char(&line, 0, miss), None);
+        // A till search onto the adjacent cell would not move, so it reports None.
+        assert_eq!(find_char(&line, 1, find(true, true)), None);
     }
 
     #[test]

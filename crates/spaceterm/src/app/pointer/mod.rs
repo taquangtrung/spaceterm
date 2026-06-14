@@ -28,7 +28,7 @@ impl App {
     pub(crate) fn pane_at_pixel(&self, x: f32, y: f32) -> Option<(PaneId, PaneRect)> {
         let vp = self.viewport_rect();
         let layout_vp = Rect::new(vp.x, vp.y, vp.width, vp.height);
-        for (id, rect) in self.tab.rects(layout_vp) {
+        for (id, rect) in self.tab().rects(layout_vp) {
             let pr = Self::layout_rect_to_pane(rect);
             if x >= pr.x && x < pr.x + pr.width && y >= pr.y && y < pr.y + pr.height {
                 return Some((id, pr));

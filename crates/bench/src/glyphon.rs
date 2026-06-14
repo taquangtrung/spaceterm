@@ -77,7 +77,7 @@ fn run_once(renderer: &mut GpuRenderer, corpus: &[u8]) -> RunResult {
             selection: None,
         };
         let frame_start = Instant::now();
-        renderer.render(std::slice::from_ref(&view), None, false, &[]);
+        renderer.render(std::slice::from_ref(&view), None, None, false, &[]);
         frame_times.push(frame_start.elapsed().as_secs_f64() * 1000.0);
     }
     let elapsed = start.elapsed().as_secs_f64();

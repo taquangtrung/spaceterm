@@ -13,6 +13,7 @@
 
 pub mod actions;
 mod blocks;
+mod chrome;
 mod init;
 mod navigation;
 mod pointer;
@@ -29,8 +30,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::config::{Config, StatusBarIconsConfig};
-use crate::model::input::{self, KeyCode, PendingPrefix, WindowKeymap};
+use crate::config::{Config, StatusBarConfig};
+use crate::model::input::{self, Action, KeyCode, PendingPrefix, WindowKeymap};
 use crate::model::layout::{Direction, FocusDir, PaneId, Rect, Tab};
 use crate::model::mode::Mode;
 use crate::model::palette::Palette;
@@ -90,8 +91,9 @@ fn status_bar(
     theme: &Theme,
     pane_title: Option<String>,
     notice: Option<String>,
-    icons: &StatusBarIconsConfig,
+    config: &StatusBarConfig,
 ) -> StatusBar {
+    let icons = &config.icons;
     let (mode_name, accent) = match mode {
         Mode::Insert => ("Insert", theme.ansi[2]),
         Mode::Normal => ("Normal", theme.ansi[4]),
@@ -105,12 +107,19 @@ fn status_bar(
         Mode::Normal | Mode::Visual => &icons.normal,
         Mode::BlockFocus => &icons.block,
     };
-    let mode_label = if mode_icon.is_empty() {
+    let mode_label = if !config.show_mode {
+        String::new()
+    } else if mode_icon.is_empty() {
         mode_name.to_string()
     } else {
         format!("{} {}", mode_icon, mode_name)
     };
-    let right_label = if icons.branding.is_empty() {
+    let pane_title = if config.show_title { pane_title } else { None };
+    // An empty right label suppresses the branding entirely; `None` would let the
+    // renderer fall back to its default branding text.
+    let right_label = if !config.show_branding {
+        Some(String::new())
+    } else if icons.branding.is_empty() {
         None
     } else {
         Some(format!("{} spaceterm", icons.branding))
@@ -176,6 +185,8 @@ pub struct App {
     pub(crate) image_blocks: Vec<ImageBlock>,
     pub(crate) last_click: Option<(Instant, f32, f32)>,
     pub(crate) last_edit_key: Option<Instant>,
+    /// The last char-search (`f`/`F`/`t`/`T`), repeated by `;` and `,`.
+    pub(crate) last_find: Option<input::FindChar>,
     pub(crate) last_tile_layout: Option<(usize, usize, u32, u32)>,
     pub(crate) modifiers: winit::event::Modifiers,
     pub(crate) mouse_down: bool,
@@ -194,7 +205,16 @@ pub struct App {
     pub(crate) renderer: Option<GpuRenderer>,
     pub(crate) search_query: Option<String>,
     pub(crate) selection: Option<Selection>,
-    pub(crate) tab: Tab,
+    /// Which tab is shown; index into [`Self::tabs`].
+    pub(crate) active_tab: usize,
+    /// The open menu/dropdown (index into the chrome's menu list), or `None`.
+    pub(crate) open_menu: Option<usize>,
+    /// The hovered dropdown item while a menu is open.
+    pub(crate) selected_item: Option<usize>,
+    /// Next free globally-unique pane id; allocated by [`Self::alloc_pane_id`].
+    pub(crate) next_pane_id: u64,
+    /// All open tabs, each its own split-tree of panes.
+    pub(crate) tabs: Vec<Tab>,
     pub(crate) modes: HashMap<PaneId, Mode>,
     /// Visual-mode anchor (viewport `(row, col)`) where the selection began.
     /// `Some` only while the focused pane is in Visual mode.
@@ -280,6 +300,7 @@ impl App {
             folded_blocks: HashMap::new(),
             last_click: None,
             last_edit_key: None,
+            last_find: None,
             image_blocks: Vec::new(),
             last_tile_layout: None,
             modifiers: winit::event::Modifiers::default(),
@@ -295,7 +316,11 @@ impl App {
             renderer: None,
             search_query: None,
             selection: None,
-            tab: Tab::new(),
+            active_tab: 0,
+            open_menu: None,
+            selected_item: None,
+            next_pane_id: 1,
+            tabs: vec![Tab::new()],
             modes,
             visual_anchor: None,
             visual_line: false,
@@ -303,6 +328,38 @@ impl App {
             window: None,
             window_keymap,
             window_title: String::new(),
+        }
+    }
+
+    /// The currently visible tab.
+    pub(crate) fn tab(&self) -> &Tab {
+        &self.tabs[self.active_tab]
+    }
+
+    /// The currently visible tab, mutably.
+    pub(crate) fn tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active_tab]
+    }
+
+    /// Allocate the next globally-unique pane id.
+    pub(crate) fn alloc_pane_id(&mut self) -> PaneId {
+        let id = PaneId(self.next_pane_id);
+        self.next_pane_id += 1;
+        id
+    }
+
+    /// Number of top cell rows reserved for the tabbar/menubar chrome.
+    pub(crate) fn top_chrome_rows(&self) -> usize {
+        spaceterm_render::chrome_rows(self.config.menu_style)
+    }
+
+    /// Bottom cell rows reserved for the status bar: one when shown, zero when
+    /// the user has hidden it.
+    pub(crate) fn status_bar_rows(&self) -> usize {
+        if self.config.status_bar.enabled {
+            STATUS_BAR_ROWS
+        } else {
+            0
         }
     }
 
@@ -319,19 +376,28 @@ impl App {
             }
             (None, None) => (800.0, 600.0),
         };
-        // Exclude the status bar row so pane hit-testing and focus geometry match
-        // the area actually drawn to panes.
-        let status_h = self
+        // Reserve the status bar row at the bottom and the tabbar/menubar rows at
+        // the top, so pane hit-testing and focus geometry match the area actually
+        // drawn to panes.
+        let ch = self
             .renderer
             .as_ref()
-            .map(|r| r.cell_size().1 * STATUS_BAR_ROWS as f32)
+            .map(|r| r.cell_size().1)
             .unwrap_or(0.0);
+        let status_h = ch * self.status_bar_rows() as f32;
+        let top_h = ch * self.top_chrome_rows() as f32;
         PaneRect {
             x: 0.0,
-            y: 0.0,
+            y: top_h,
             width: w,
-            height: (h - status_h).max(1.0),
+            height: (h - status_h - top_h).max(1.0),
         }
+    }
+
+    /// The pane area as a layout `Rect` (same coordinates as [`PaneRect`]).
+    pub(crate) fn content_viewport(&self) -> Rect {
+        let vp = self.viewport_rect();
+        Rect::new(vp.x, vp.y, vp.width, vp.height)
     }
 
     pub(crate) fn layout_rect_to_pane(rect: Rect) -> PaneRect {
@@ -357,7 +423,7 @@ impl App {
         } else if self.quick_select.is_some() {
             "SpaceTerm - quick select".to_string()
         } else {
-            match self.pane_titles.get(&self.tab.focused()) {
+            match self.pane_titles.get(&self.tab().focused()) {
                 Some(t) if !t.is_empty() => format!("SpaceTerm - {t}"),
                 _ => "SpaceTerm".to_string(),
             }
@@ -395,7 +461,8 @@ impl App {
     }
 
     pub(crate) fn split_pane(&mut self, direction: Direction) {
-        let new_id = self.tab.split(direction, SPLIT_RATIO);
+        let new_id = self.alloc_pane_id();
+        self.tab_mut().split(direction, SPLIT_RATIO, new_id);
 
         let (cols, rows) = if let Some(renderer) = &self.renderer {
             renderer.grid_size()
@@ -411,15 +478,25 @@ impl App {
         self.panes.insert(new_id, pane);
         self.modes.insert(new_id, Mode::default());
 
-        if let Some(renderer) = &self.renderer {
-            let grid_size = renderer.grid_size();
-            self.resize_all_panes(grid_size);
+        if self.renderer.is_some() {
+            self.resize_all_panes();
         }
         self.dirty = true;
     }
 
     pub(crate) fn close_pane(&mut self, pane_id: PaneId) {
-        if self.tab.panes().len() <= 1 {
+        self.close_pane_in_any_tab(pane_id);
+    }
+
+    /// Close `pane_id` in whichever tab holds it, collapsing its split into the
+    /// sibling. The last pane of a tab is not closed here (tabs are closed via
+    /// [`Self::close_tab`]). Drops all per-pane state and re-lays-out if the
+    /// affected tab is the active one.
+    fn close_pane_in_any_tab(&mut self, pane_id: PaneId) {
+        let Some(tab_idx) = self.tabs.iter().position(|t| t.panes().contains(&pane_id)) else {
+            return;
+        };
+        if self.tabs[tab_idx].panes().len() <= 1 {
             return;
         }
         self.panes.remove(&pane_id);
@@ -428,10 +505,9 @@ impl App {
         self.webview_mgr.remove_tiles_for_pane(pane_id);
         self.image_blocks.retain(|img| img.pane_id != pane_id);
         self.last_tile_layout = None;
-        self.tab.close(pane_id);
-        if let Some(renderer) = &self.renderer {
-            let grid_size = renderer.grid_size();
-            self.resize_all_panes(grid_size);
+        self.tabs[tab_idx].close(pane_id);
+        if tab_idx == self.active_tab && self.renderer.is_some() {
+            self.resize_all_panes();
         }
         self.dirty = true;
     }
@@ -439,7 +515,7 @@ impl App {
     /// Close every pane in the tab except `focused` (Vim `Ctrl-w o`).
     pub(crate) fn close_other_panes(&mut self, focused: PaneId) {
         let others: Vec<PaneId> = self
-            .tab
+            .tab()
             .panes()
             .into_iter()
             .filter(|&id| id != focused)
@@ -449,6 +525,86 @@ impl App {
         }
     }
 
+    /// Open a new tab with a fresh shell pane and switch to it.
+    pub(crate) fn new_tab(&mut self) {
+        let id = self.alloc_pane_id();
+        let (cols, rows) = self
+            .renderer
+            .as_ref()
+            .map(|r| r.grid_size())
+            .unwrap_or((DEFAULT_COLS as usize, DEFAULT_ROWS as usize));
+        // Sized roughly now; resize_all_panes fixes the exact grid once placed.
+        let pane = Pane::new(cols.max(1), rows.max(1));
+        self.panes.insert(id, pane);
+        self.modes.insert(id, Mode::default());
+        self.tabs.push(Tab::with_root(id));
+        self.active_tab = self.tabs.len() - 1;
+        self.close_menu();
+        self.last_tile_layout = None;
+        if self.renderer.is_some() {
+            self.resize_all_panes();
+        }
+        self.dirty = true;
+        self.update_window_title();
+    }
+
+    /// Switch the visible tab to `index`.
+    pub(crate) fn switch_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() || index == self.active_tab {
+            return;
+        }
+        self.active_tab = index;
+        self.selection = None;
+        // Force a tile reposition so background-tab WebViews are hidden and the
+        // new tab's are shown (the layout key alone may not have changed).
+        self.last_tile_layout = None;
+        if self.renderer.is_some() {
+            self.resize_all_panes();
+        }
+        self.dirty = true;
+        self.update_window_title();
+    }
+
+    /// Cycle to the next (`forward`) or previous tab, wrapping around.
+    pub(crate) fn cycle_tab(&mut self, forward: bool) {
+        let count = self.tabs.len();
+        if count <= 1 {
+            return;
+        }
+        let next = if forward {
+            (self.active_tab + 1) % count
+        } else {
+            (self.active_tab + count - 1) % count
+        };
+        self.switch_tab(next);
+    }
+
+    /// Close tab `index`, dropping all its panes. The last tab is never closed.
+    pub(crate) fn close_tab(&mut self, index: usize) {
+        if self.tabs.len() <= 1 || index >= self.tabs.len() {
+            return;
+        }
+        for id in self.tabs[index].panes() {
+            self.panes.remove(&id);
+            self.modes.remove(&id);
+            self.pane_titles.remove(&id);
+            self.webview_mgr.remove_tiles_for_pane(id);
+            self.image_blocks.retain(|img| img.pane_id != id);
+        }
+        self.tabs.remove(index);
+        if index < self.active_tab {
+            self.active_tab -= 1;
+        }
+        self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+        self.close_menu();
+        self.last_tile_layout = None;
+        if self.renderer.is_some() {
+            self.resize_all_panes();
+        }
+        self.dirty = true;
+        self.update_window_title();
+    }
+
     pub(crate) fn reap_dead_panes(&mut self) {
         let dead: Vec<PaneId> = self
             .panes
@@ -456,8 +612,14 @@ impl App {
             .filter_map(|(id, pane)| if pane.is_alive() { None } else { Some(*id) })
             .collect();
         for id in dead {
-            if self.tab.panes().len() > 1 {
-                self.close_pane(id);
+            // Only reap when its tab still has another pane; the last pane of a
+            // tab is reaped by [`Self::close_tab`] logic instead.
+            if self
+                .tabs
+                .iter()
+                .any(|t| t.panes().contains(&id) && t.panes().len() > 1)
+            {
+                self.close_pane_in_any_tab(id);
             }
         }
     }
@@ -518,20 +680,15 @@ impl App {
         any
     }
 
-    pub(crate) fn resize_all_panes(&mut self, (full_cols, full_rows): (usize, usize)) {
+    pub(crate) fn resize_all_panes(&mut self) {
         let (cw, ch) = if let Some(renderer) = &self.renderer {
             renderer.cell_size()
         } else {
             (9.0, 20.0)
         };
 
-        let layout_vp = Rect::new(
-            0.0,
-            0.0,
-            full_cols as f32 * cw,
-            content_rows(full_rows) as f32 * ch,
-        );
-        let rects = self.tab.rects(layout_vp);
+        let layout_vp = self.content_viewport();
+        let rects = self.tab().rects(layout_vp);
 
         for (id, rect) in rects {
             let cols = (rect.width / cw).floor() as usize;
@@ -550,7 +707,7 @@ impl App {
             }
             Key::Named(NamedKey::Enter) => {
                 if let Some(action) = palette.selected_action() {
-                    self.execute_palette_action(action, focused);
+                    self.run_command(action, focused);
                 }
                 self.palette = None;
             }
@@ -572,8 +729,21 @@ impl App {
         }
     }
 
-    fn execute_palette_action(&mut self, action: &str, focused: PaneId) {
+    /// Run a named command, shared by the command palette and the menus.
+    pub(crate) fn run_command(&mut self, action: &str, focused: PaneId) {
         match action {
+            "new_tab" => {
+                self.new_tab();
+            }
+            "close_tab" => {
+                self.close_tab(self.active_tab);
+            }
+            "next_tab" => {
+                self.cycle_tab(true);
+            }
+            "prev_tab" => {
+                self.cycle_tab(false);
+            }
             "toggle_mode" => {
                 let mode = self.modes.get(&focused).copied().unwrap_or_default();
                 let new_mode = match mode {
@@ -600,7 +770,7 @@ impl App {
                 };
                 let viewport = self.viewport_rect();
                 let layout_vp = Rect::new(viewport.x, viewport.y, viewport.width, viewport.height);
-                self.tab.focus_in_direction(dir, layout_vp);
+                self.tab_mut().focus_in_direction(dir, layout_vp);
             }
             "search" => {
                 self.search_query = Some(String::new());
@@ -687,8 +857,9 @@ impl ApplicationHandler for App {
                 if size.width > 0 && size.height > 0 {
                     if let Some(renderer) = &mut self.renderer {
                         renderer.resize(size.width, size.height);
-                        let grid_size = renderer.grid_size();
-                        self.resize_all_panes(grid_size);
+                    }
+                    if self.renderer.is_some() {
+                        self.resize_all_panes();
                     }
                     self.dirty = true;
                     if let Some(window) = &self.window {
@@ -706,7 +877,7 @@ impl ApplicationHandler for App {
                     return;
                 }
 
-                let focused = self.tab.focused();
+                let focused = self.tab().focused();
                 let mode = self.modes.get(&focused).copied().unwrap_or_default();
 
                 let mods_state = self.modifiers.state();
@@ -716,6 +887,42 @@ impl ApplicationHandler for App {
                     ctrl: mods_state.control_key(),
                     shift: mods_state.shift_key(),
                 };
+
+                // Esc dismisses an open menu before anything else acts on it.
+                if self.open_menu.is_some() && key.code == KeyCode::Escape {
+                    self.close_menu();
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
+
+                // Ctrl-Tab / Ctrl-Shift-Tab cycle tabs.
+                if mods_state.control_key() && key.code == KeyCode::Tab {
+                    let action = if mods_state.shift_key() {
+                        Action::PrevTab
+                    } else {
+                        Action::NextTab
+                    };
+                    self.handle_action(action, focused);
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
+
+                // Alt-1..9 jumps straight to that tab, browser style.
+                if mods_state.alt_key() && !mods_state.control_key() {
+                    if let KeyCode::Char(c) = key.code {
+                        if let Some(n) = c.to_digit(10).filter(|d| (1..=9).contains(d)) {
+                            self.handle_action(Action::GotoTab(n as usize), focused);
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                            return;
+                        }
+                    }
+                }
 
                 if mods_state.control_key() && mods_state.shift_key() {
                     if let Key::Character(c) = event.logical_key.as_ref() {
@@ -728,6 +935,18 @@ impl ApplicationHandler for App {
                             return;
                         } else if lower == "c" {
                             self.copy_selection();
+                            return;
+                        } else if lower == "t" {
+                            self.handle_action(Action::NewTab, focused);
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                            return;
+                        } else if lower == "w" {
+                            self.handle_action(Action::CloseTab(None), focused);
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
                             return;
                         } else if lower == "p" {
                             if self.palette.is_some() {
@@ -776,7 +995,22 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
-                let focused = self.tab.focused();
+                let focused = self.tab().focused();
+
+                // Tabbar/menubar clicks take precedence over the panes (including
+                // mouse-tracking apps), and any click resolves an open menu.
+                if let (ElementState::Pressed, MouseButton::Left) = (state, button) {
+                    let (x, y) = self.cursor_pos;
+                    if (self.open_menu.is_some() || y < self.top_chrome_height())
+                        && self.handle_chrome_click(x, y)
+                    {
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                        return;
+                    }
+                }
+
                 let mouse_active = self.panes.get(&focused).is_some_and(|p| p.mouse_tracking());
 
                 if mouse_active {
@@ -791,7 +1025,7 @@ impl ApplicationHandler for App {
 
                         let (x, y) = self.cursor_pos;
                         if let Some((pane_id, pane_rect)) = self.pane_at_pixel(x, y) {
-                            self.tab.focus(pane_id);
+                            self.tab_mut().focus(pane_id);
                             let (row, col) = self.pixel_to_cell(x, y, pane_rect);
                             let now = Instant::now();
                             if let Some((prev_time, prev_x, prev_y)) = self.last_click {
@@ -823,7 +1057,11 @@ impl ApplicationHandler for App {
                 let y = position.y as f32;
                 self.cursor_pos = (x, y);
 
-                let focused = self.tab.focused();
+                if self.open_menu.is_some() {
+                    self.update_menu_hover(x, y);
+                }
+
+                let focused = self.tab().focused();
                 if self.mouse_down
                     && self
                         .panes
@@ -864,7 +1102,7 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::PixelDelta(pos) => (-pos.y / 20.0) as isize,
                 };
 
-                let focused = self.tab.focused();
+                let focused = self.tab().focused();
                 if self.panes.get(&focused).is_some_and(|p| p.mouse_tracking()) {
                     self.forward_mouse_scroll(scroll_lines, focused);
                     return;
@@ -891,13 +1129,13 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::CloseRequested => {
-                Session::save(&self.tab, &self.panes);
+                Session::save(self.tab(), &self.panes);
                 self.panes.clear();
                 event_loop.exit();
             }
 
             WindowEvent::Focused(focused) => {
-                let focused_pane = self.tab.focused();
+                let focused_pane = self.tab().focused();
                 if let Some(pane) = self.panes.get(&focused_pane) {
                     if pane.focus_event() {
                         let seq = if focused { "\x1b[I" } else { "\x1b[O" };
@@ -941,7 +1179,7 @@ impl ApplicationHandler for App {
             // A Vim prompt edit just echoed back: re-seed the nav cursor onto the
             // shell's new cursor position so it tracks the edited line.
             if self.nav_resync_pending {
-                let focused = self.tab.focused();
+                let focused = self.tab().focused();
                 if self.modes.get(&focused) == Some(&Mode::Normal) {
                     self.init_nav_cursor(focused);
                 }
@@ -991,8 +1229,15 @@ mod tests {
     #[test]
     fn test_app_default_has_one_pane() {
         let app = App::new();
-        assert_eq!(app.tab.panes(), vec![PaneId(0)]);
+        assert_eq!(app.tab().panes(), vec![PaneId(0)]);
         assert!(app.panes.is_empty());
+    }
+
+    #[test]
+    fn test_alloc_pane_id_is_monotonic() {
+        let mut app = App::new();
+        assert_eq!(app.alloc_pane_id(), PaneId(1));
+        assert_eq!(app.alloc_pane_id(), PaneId(2));
     }
 
     #[test]
@@ -1005,23 +1250,45 @@ mod tests {
     #[test]
     fn test_status_bar_labels_each_mode() {
         let theme = Theme::dark();
-        let icons = StatusBarIconsConfig::default();
+        let cfg = StatusBarConfig::default();
         assert_eq!(
-            status_bar(Mode::Insert, &theme, None, None, &icons).mode,
+            status_bar(Mode::Insert, &theme, None, None, &cfg).mode,
             "\u{f03eb} Insert"
         );
         assert_eq!(
-            status_bar(Mode::Normal, &theme, None, None, &icons).mode,
+            status_bar(Mode::Normal, &theme, None, None, &cfg).mode,
             "\u{e795} Normal"
         );
         assert_eq!(
-            status_bar(Mode::BlockFocus, &theme, None, None, &icons).mode,
+            status_bar(Mode::BlockFocus, &theme, None, None, &cfg).mode,
             "\u{f0485} Block"
         );
         assert_ne!(
-            status_bar(Mode::Insert, &theme, None, None, &icons).accent,
-            status_bar(Mode::Normal, &theme, None, None, &icons).accent
+            status_bar(Mode::Insert, &theme, None, None, &cfg).accent,
+            status_bar(Mode::Normal, &theme, None, None, &cfg).accent
         );
+    }
+
+    #[test]
+    fn test_status_bar_element_toggles_hide_content() {
+        let theme = Theme::dark();
+        let cfg = StatusBarConfig {
+            show_mode: false,
+            show_title: false,
+            show_branding: false,
+            ..StatusBarConfig::default()
+        };
+        let bar = status_bar(
+            Mode::Normal,
+            &theme,
+            Some("title".to_string()),
+            None,
+            &cfg,
+        );
+        assert_eq!(bar.mode, "");
+        assert_eq!(bar.pane_title, None);
+        // An empty (Some) right label suppresses the default branding fallback.
+        assert_eq!(bar.right_label.as_deref(), Some(""));
     }
 
     #[test]
@@ -1094,13 +1361,13 @@ mod tests {
     #[test]
     fn test_status_bar_notice_overrides_pane_title() {
         let theme = Theme::dark();
-        let icons = StatusBarIconsConfig::default();
+        let cfg = StatusBarConfig::default();
         let bar = status_bar(
             Mode::Normal,
             &theme,
             Some("title".to_string()),
             Some("oops".to_string()),
-            &icons,
+            &cfg,
         );
         assert_eq!(bar.notice.as_deref(), Some("oops"));
     }

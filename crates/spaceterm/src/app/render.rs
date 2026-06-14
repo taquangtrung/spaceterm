@@ -34,22 +34,38 @@ impl App {
     pub(crate) fn render_frame(&mut self) {
         let bell_active = self.is_bell_active();
         let notice = self.active_error_notice().map(str::to_string);
+        // Built before the renderer is borrowed, since it reads tab/menu state.
+        let chrome = self.build_top_chrome();
         let Some(renderer) = &mut self.renderer else {
             return;
         };
         let (full_cols, full_rows) = renderer.grid_size();
         let (cw, ch) = renderer.cell_size();
 
-        let content_rows = super::content_rows(full_rows);
-        let layout_vp = Rect::new(0.0, 0.0, full_cols as f32 * cw, content_rows as f32 * ch);
-        let rects = self.tab.rects(layout_vp);
+        // Panes sit below the top chrome (tabbar/menubar) and above the status
+        // bar; both bands are reserved cell rows the panes must not cover. The
+        // status bar can be disabled, in which case it reserves no row.
+        let top_rows = spaceterm_render::chrome_rows(self.config.menu_style);
+        let status_rows = if self.config.status_bar.enabled {
+            super::STATUS_BAR_ROWS
+        } else {
+            0
+        };
+        let content_rows = full_rows.saturating_sub(top_rows + status_rows).max(1);
+        let layout_vp = Rect::new(
+            0.0,
+            top_rows as f32 * ch,
+            full_cols as f32 * cw,
+            content_rows as f32 * ch,
+        );
+        let rects = self.tabs[self.active_tab].rects(layout_vp);
 
         let sel = self
             .selection
             .as_ref()
             .map(|s| (s.pane, s.start_row, s.start_col, s.end_row, s.end_col));
 
-        let focused = self.tab.focused();
+        let focused = self.tabs[self.active_tab].focused();
         let mode = self.modes.get(&focused).copied().unwrap_or_default();
         let qs_labels: Vec<(usize, usize, char)> = self
             .quick_select
@@ -177,11 +193,22 @@ impl App {
             renderer.theme(),
             pane_title,
             notice,
-            &self.config.status_bar_icons,
+            &self.config.status_bar,
         );
-        renderer.render(&views, Some(&status), bell_active, &placements);
+        let status = self.config.status_bar.enabled.then_some(&status);
+        renderer.render(
+            &views,
+            status,
+            Some(&chrome),
+            bell_active,
+            &placements,
+        );
 
-        let focused = self.tab.focused();
+        let focused = self.tabs[self.active_tab].focused();
+        // Tiles for panes outside the active tab are hidden so background tabs
+        // don't show through; the active tab's tiles are positioned by scroll.
+        let active_panes: std::collections::HashSet<PaneId> =
+            self.tabs[self.active_tab].panes().into_iter().collect();
         if let Some(pane) = self.panes.get(&focused) {
             let scroll_offset = pane.grid().scroll_offset();
             let (_, ch) = renderer.cell_size();
@@ -194,8 +221,13 @@ impl App {
             let layout = (scroll_offset, full_rows, ch.to_bits(), pane_y.to_bits());
             if self.last_tile_layout != Some(layout) {
                 self.last_tile_layout = Some(layout);
-                self.webview_mgr
-                    .reposition_tiles(scroll_offset, full_rows, ch, pane_y);
+                self.webview_mgr.reposition_tiles(
+                    scroll_offset,
+                    full_rows,
+                    ch,
+                    pane_y,
+                    &active_panes,
+                );
             }
         }
     }
@@ -214,7 +246,7 @@ impl App {
             self.viewport_rect().width,
             self.viewport_rect().height,
         );
-        let rects = self.tab.rects(layout_vp);
+        let rects = self.tabs[self.active_tab].rects(layout_vp);
         let font_family = self.config.font_family.clone();
         let font_size = self.config.font_size;
         let debug = std::env::var_os("SPACETERM_BLOCK_DEBUG").is_some();

@@ -125,16 +125,22 @@ impl WebViewManager {
         Ok(())
     }
 
-    /// Reposition all tiles based on scroll offset. Tiles that scroll offscreen
-    /// are hidden; tiles that come back are re-shown.
+    /// Reposition all tiles based on scroll offset. Tiles whose pane is not in
+    /// `active_panes` (i.e. belong to a background tab) are hidden, as are tiles
+    /// that scroll offscreen; tiles that come back are re-shown.
     pub fn reposition_tiles(
         &mut self,
         scroll_offset: usize,
         grid_rows: usize,
         cell_height: f32,
         pane_y_offset: f32,
+        active_panes: &std::collections::HashSet<crate::model::layout::PaneId>,
     ) {
-        for slot in self.tiles.values_mut() {
+        for (key, slot) in self.tiles.iter_mut() {
+            if !active_panes.contains(&key.pane_id) {
+                let _ = slot.webview.set_visible(false);
+                continue;
+            }
             let visible_row = slot.grid_row as isize - scroll_offset as isize;
             if visible_row < 0 || visible_row as usize >= grid_rows {
                 let _ = slot.webview.set_visible(false);

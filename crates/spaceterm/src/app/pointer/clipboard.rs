@@ -92,7 +92,7 @@ impl App {
             Err(_) => None,
         };
         let Some(text) = text else { return };
-        let focused = self.tab.focused();
+        let focused = self.tab().focused();
         let Some(pane) = self.panes.get_mut(&focused) else {
             return;
         };

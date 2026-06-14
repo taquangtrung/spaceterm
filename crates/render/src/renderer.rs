@@ -23,6 +23,7 @@ use wgpu::{
     VertexState, VertexStepMode,
 };
 
+use crate::chrome::{self, layout as chrome_layout, TopChrome};
 use crate::grid::{Color as GridColor, CursorShape, Grid, RgbColor};
 use crate::image::{ImagePass, ImagePlacement};
 use crate::theme::{Rgb, Theme};
@@ -38,6 +39,9 @@ const CURSOR_BAR_WIDTH_RATIO: f32 = 0.15;
 const CURSOR_UNDERLINE_HEIGHT_RATIO: f32 = 0.2;
 const BG_BUFFER_SIZE: u64 = 4 * 1024 * 1024;
 const MAX_SVG_DIM: u32 = 4096;
+/// Reserved image-pass texture id for the rasterized menu dropdown overlay. Set
+/// to the top of the id space so it never collides with block image ids.
+const DROPDOWN_TEXTURE_ID: u64 = u64::MAX;
 
 // ========================================================================
 // Data Structures
@@ -78,6 +82,17 @@ pub struct StatusBar {
     pub notice: Option<String>,
     pub pane_title: Option<String>,
     pub right_label: Option<String>,
+}
+
+/// One shaped text run of the top chrome (a tab title, a menu title, a glyph),
+/// plus where to place and clip it. Built fresh each frame and kept alive until
+/// after `glyphon` prepares the text pass.
+struct ChromeText {
+    bounds: TextBounds,
+    buffer: glyphon::Buffer,
+    color: Color,
+    left: f32,
+    top: f32,
 }
 
 /// Font selection for the renderer. `family` is the primary family name (e.g.
@@ -503,10 +518,14 @@ impl GpuRenderer {
     /// and its viewport rect. Pane dividers are drawn between adjacent panes.
     /// When `status` is set, a status bar is drawn across the bottom cell row;
     /// callers must leave that row free of panes (see [`Self::cell_size`]).
+    /// When `chrome` is set, the tabbar/menubar is drawn across the top cell
+    /// row(s) (likewise reserved by the caller) and any open dropdown is
+    /// composited over the content via the image pass.
     pub fn render(
         &mut self,
         panes: &[PaneView],
         status: Option<&StatusBar>,
+        chrome: Option<&TopChrome>,
         bell_active: bool,
         images: &[ImagePlacement],
     ) {
@@ -831,6 +850,13 @@ impl GpuRenderer {
             status_buffer.shape_until_scroll(&mut self.font_system, false);
         }
 
+        // Top chrome (tabbar/menubar) bands and text. The dropdown overlay is
+        // handled separately via the image pass so it sits above pane text.
+        let chrome_texts = match chrome {
+            Some(c) => self.draw_chrome(c, &mut all_bg_verts, surface_w, surface_h),
+            None => Vec::new(),
+        };
+
         if bell_active {
             let (r, g, b) = self.theme.bell.as_linear();
             let ndc_x0 = -1.0_f32;
@@ -885,8 +911,16 @@ impl GpuRenderer {
         let bg_bytes: Vec<u8> = all_bg_verts.iter().flat_map(|v| v.to_bytes()).collect();
         self.queue.write_buffer(&self.bg_buffer, 0, &bg_bytes);
 
+        // The open dropdown is rasterized to a texture and drawn by the image
+        // pass (which runs after the text pass) so it overlays pane glyphs.
+        let mut all_images: Vec<ImagePlacement> = images.to_vec();
+        if let Some(c) = chrome {
+            if let Some(placement) = self.rasterize_dropdown(c, surface_w) {
+                all_images.push(placement);
+            }
+        }
         self.image_pass
-            .prepare(&self.queue, images, surface_w, surface_h);
+            .prepare(&self.queue, &all_images, surface_w, surface_h);
 
         let mut text_areas: Vec<TextArea> = text_buffers
             .iter()
@@ -919,6 +953,18 @@ impl GpuRenderer {
                     bottom: surface_h as i32,
                 },
                 default_color: self.theme.status_bar_fg.to_glyphon(),
+                scale: 1.0,
+                custom_glyphs: &[],
+            });
+        }
+
+        for text in &chrome_texts {
+            text_areas.push(TextArea {
+                buffer: &text.buffer,
+                left: text.left,
+                top: text.top,
+                bounds: text.bounds,
+                default_color: text.color,
                 scale: 1.0,
                 custom_glyphs: &[],
             });
@@ -984,6 +1030,288 @@ impl GpuRenderer {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         surface_texture.present();
+    }
+
+    /// Append the top chrome's background quads to `verts` and return its text
+    /// runs (tab titles, close glyphs, the new-tab button, and either the modern
+    /// hamburger or the classic menu titles). The dropdown is drawn separately.
+    fn draw_chrome(
+        &mut self,
+        chrome: &TopChrome,
+        verts: &mut Vec<BgVertex>,
+        surface_w: f32,
+        surface_h: f32,
+    ) -> Vec<ChromeText> {
+        let cw = self.cell_width;
+        let ch = self.cell_height;
+        let layout = chrome_layout(chrome, surface_w, cw, ch);
+        let chrome_h = chrome::chrome_rows(chrome.menu_style) as f32 * ch;
+        let pad = cw * 0.4;
+        let muted = self.theme.ansi[8].to_glyphon();
+        let foreground = self.theme.foreground.to_glyphon();
+        let mut texts = Vec::new();
+
+        // Band background covering the menubar and tabbar rows.
+        verts.extend_from_slice(&quad_vertices(
+            0.0,
+            0.0,
+            surface_w,
+            chrome_h,
+            self.theme.tabbar_bg.as_linear(),
+            surface_w,
+            surface_h,
+        ));
+
+        // Active-tab fill.
+        if let Some(tab) = layout.tabs.get(chrome.active_tab) {
+            verts.extend_from_slice(&quad_vertices(
+                tab.x,
+                tab.y,
+                tab.x + tab.w,
+                tab.y + tab.h,
+                self.theme.tab_active_bg.as_linear(),
+                surface_w,
+                surface_h,
+            ));
+        }
+
+        // Thin separators on each tab's right edge.
+        for tab in &layout.tabs {
+            let x = tab.x + tab.w - 0.5;
+            verts.extend_from_slice(&quad_vertices(
+                x,
+                tab.y + 4.0,
+                x + 1.0,
+                tab.y + tab.h - 4.0,
+                self.theme.divider.as_linear(),
+                surface_w,
+                surface_h,
+            ));
+        }
+
+        // Divider under the whole chrome.
+        verts.extend_from_slice(&quad_vertices(
+            0.0,
+            chrome_h,
+            surface_w,
+            chrome_h + 1.0,
+            self.theme.divider.as_linear(),
+            surface_w,
+            surface_h,
+        ));
+
+        // In classic style, separate the menubar row from the tabbar row.
+        if layout.menubar_top.is_some() {
+            verts.extend_from_slice(&quad_vertices(
+                0.0,
+                layout.tab_row_top,
+                surface_w,
+                layout.tab_row_top + 1.0,
+                self.theme.divider.as_linear(),
+                surface_w,
+                surface_h,
+            ));
+        }
+
+        // Tab titles and their close glyphs.
+        for (i, tab) in layout.tabs.iter().enumerate() {
+            let close = layout.closes[i];
+            let avail = (close.x - (tab.x + pad)).max(cw);
+            let max_chars = (avail / cw).floor() as usize;
+            let title = truncate_label(&chrome.tabs[i].title, max_chars);
+            let active = i == chrome.active_tab;
+            let color = if active {
+                self.theme.tab_active_fg.to_glyphon()
+            } else {
+                muted
+            };
+            let buffer = self.chrome_line_buffer(&title, color, active);
+            texts.push(ChromeText {
+                bounds: text_bounds(tab.x, tab.y, close.x, tab.y + tab.h),
+                buffer,
+                color,
+                left: tab.x + pad,
+                top: tab.y,
+            });
+
+            let close_buf = self.chrome_line_buffer("\u{00d7}", muted, false);
+            texts.push(ChromeText {
+                bounds: text_bounds(close.x, close.y, close.x + close.w, close.y + close.h),
+                buffer: close_buf,
+                color: muted,
+                left: close.x + (close.w - cw) / 2.0,
+                top: close.y,
+            });
+        }
+
+        // New-tab button.
+        let new_tab = layout.new_tab;
+        let plus = self.chrome_line_buffer("+", muted, false);
+        texts.push(ChromeText {
+            bounds: text_bounds(
+                new_tab.x,
+                new_tab.y,
+                new_tab.x + new_tab.w,
+                new_tab.y + new_tab.h,
+            ),
+            buffer: plus,
+            color: muted,
+            left: new_tab.x + (new_tab.w - cw) / 2.0,
+            top: new_tab.y,
+        });
+
+        // Modern hamburger, or classic menu titles.
+        if let Some(hb) = layout.hamburger {
+            let glyph = self.chrome_line_buffer("\u{2630}", foreground, false);
+            texts.push(ChromeText {
+                bounds: text_bounds(hb.x, hb.y, hb.x + hb.w, hb.y + hb.h),
+                buffer: glyph,
+                color: foreground,
+                left: hb.x + (hb.w - cw) / 2.0,
+                top: hb.y,
+            });
+        }
+        for (i, region) in layout.menu_titles.iter().enumerate() {
+            let open = chrome.open_menu == Some(i);
+            let buffer = self.chrome_line_buffer(&chrome.menus[i].title, foreground, open);
+            texts.push(ChromeText {
+                bounds: text_bounds(region.x, region.y, region.x + region.w, region.y + region.h),
+                buffer,
+                color: foreground,
+                left: region.x + cw,
+                top: region.y,
+            });
+        }
+
+        texts
+    }
+
+    /// Rasterize the open dropdown (panel, hover row, item labels/shortcuts) to a
+    /// texture and return its placement, or `None` when no menu is open.
+    fn rasterize_dropdown(&mut self, chrome: &TopChrome, surface_w: f32) -> Option<ImagePlacement> {
+        let cw = self.cell_width;
+        let ch = self.cell_height;
+        let layout = chrome_layout(chrome, surface_w, cw, ch);
+        let dropdown = layout.dropdown?;
+        let menu = chrome.menus.get(chrome.open_menu?)?;
+        let width = dropdown.width.floor().max(1.0) as u32;
+        let height = (dropdown.items as f32 * dropdown.item_h).floor().max(1.0) as u32;
+
+        let panel = self.theme.tabbar_bg;
+        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[panel.r, panel.g, panel.b, 255]);
+        }
+        if let Some(sel) = chrome.selected_item {
+            let y0 = (sel as f32 * dropdown.item_h) as u32;
+            let h = dropdown.item_h as u32;
+            let rect = (1, y0, width.saturating_sub(2), h);
+            fill_rect(&mut rgba, (width, height), rect, self.theme.menu_hover_bg);
+        }
+        fill_border(&mut rgba, width, height, self.theme.divider);
+
+        let foreground = self.theme.foreground.to_glyphon();
+        let muted = self.theme.ansi[8].to_glyphon();
+        let pad = (cw * 0.8) as i32;
+        for (i, item) in menu.items.iter().enumerate() {
+            let oy = (i as f32 * dropdown.item_h) as i32;
+            let label_buf = self.chrome_line_buffer(&item.label, foreground, false);
+            self.blit_buffer(
+                &mut rgba,
+                (width, height),
+                &label_buf,
+                (pad, oy),
+                foreground,
+            );
+            if !item.shortcut.is_empty() {
+                let shortcut_buf = self.chrome_line_buffer(&item.shortcut, muted, false);
+                let shortcut_w = (item.shortcut.chars().count() as f32 * cw) as i32;
+                let ox = width as i32 - shortcut_w - pad;
+                self.blit_buffer(&mut rgba, (width, height), &shortcut_buf, (ox, oy), muted);
+            }
+        }
+
+        self.image_pass.upload(
+            &self.device,
+            &self.queue,
+            DROPDOWN_TEXTURE_ID,
+            &rgba,
+            width,
+            height,
+        );
+        Some(ImagePlacement {
+            height: height as f32,
+            id: DROPDOWN_TEXTURE_ID,
+            v_max: 1.0,
+            width: width as f32,
+            x: dropdown.origin_x,
+            y: dropdown.top,
+        })
+    }
+
+    /// Shape a single line of chrome text into a reusable buffer.
+    fn chrome_line_buffer(&mut self, text: &str, color: Color, bold: bool) -> glyphon::Buffer {
+        let fam = self.font_family.clone();
+        let mut buffer = glyphon::Buffer::new(
+            &mut self.font_system,
+            glyphon::Metrics::new(self.font_size, self.line_height),
+        );
+        buffer.set_size(
+            &mut self.font_system,
+            Some(f32::MAX),
+            Some(self.line_height),
+        );
+        let mut attrs = Attrs::new()
+            .family(base_family(fam.as_deref()))
+            .color(color);
+        if bold {
+            attrs = attrs.weight(glyphon::cosmic_text::Weight::BOLD);
+        }
+        buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced, None);
+        buffer.shape_until_scroll(&mut self.font_system, false);
+        buffer
+    }
+
+    /// Composite `buffer`'s glyph coverage onto a `(canvas_w, canvas_h)` `rgba`
+    /// buffer at pixel `offset`, clipping to the canvas. Used to bake dropdown
+    /// text into its texture.
+    fn blit_buffer(
+        &mut self,
+        rgba: &mut [u8],
+        canvas: (u32, u32),
+        buffer: &glyphon::Buffer,
+        offset: (i32, i32),
+        default_color: Color,
+    ) {
+        let (canvas_w, canvas_h) = canvas;
+        let (ox, oy) = offset;
+        let font_system = &mut self.font_system;
+        let swash_cache = &mut self.swash_cache;
+        buffer.draw(
+            font_system,
+            swash_cache,
+            default_color,
+            |x, y, w, h, color| {
+                let alpha = color.a() as f32 / 255.0;
+                if alpha <= 0.0 {
+                    return;
+                }
+                let (cr, cg, cb) = (color.r() as f32, color.g() as f32, color.b() as f32);
+                for py in y..y + h as i32 {
+                    for px in x..x + w as i32 {
+                        let gx = px + ox;
+                        let gy = py + oy;
+                        if gx < 0 || gy < 0 || gx >= canvas_w as i32 || gy >= canvas_h as i32 {
+                            continue;
+                        }
+                        let idx = ((gy as u32 * canvas_w + gx as u32) * 4) as usize;
+                        rgba[idx] = (cr * alpha + rgba[idx] as f32 * (1.0 - alpha)) as u8;
+                        rgba[idx + 1] = (cg * alpha + rgba[idx + 1] as f32 * (1.0 - alpha)) as u8;
+                        rgba[idx + 2] = (cb * alpha + rgba[idx + 2] as f32 * (1.0 - alpha)) as u8;
+                    }
+                }
+            },
+        );
     }
 }
 
@@ -1361,6 +1689,55 @@ fn quad_vertices(
             b,
         },
     ]
+}
+
+/// A glyphon clip rect from pixel edges.
+fn text_bounds(left: f32, top: f32, right: f32, bottom: f32) -> TextBounds {
+    TextBounds {
+        left: left as i32,
+        top: top as i32,
+        right: right as i32,
+        bottom: bottom as i32,
+    }
+}
+
+/// Shorten `s` to at most `max_chars`, appending an ellipsis when truncated.
+fn truncate_label(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    match max_chars {
+        0 => String::new(),
+        1 => "\u{2026}".to_string(),
+        _ => {
+            let mut out: String = s.chars().take(max_chars - 1).collect();
+            out.push('\u{2026}');
+            out
+        }
+    }
+}
+
+/// Fill an opaque `(x, y, w, h)` rectangle of `color` into a `(canvas_w,
+/// canvas_h)` `rgba` buffer, clipped to the canvas.
+fn fill_rect(rgba: &mut [u8], canvas: (u32, u32), rect: (u32, u32, u32, u32), color: Rgb) {
+    let (canvas_w, canvas_h) = canvas;
+    let (x, y, w, h) = rect;
+    for py in y..(y + h).min(canvas_h) {
+        for px in x..(x + w).min(canvas_w) {
+            let idx = ((py * canvas_w + px) * 4) as usize;
+            rgba[idx..idx + 4].copy_from_slice(&[color.r, color.g, color.b, 255]);
+        }
+    }
+}
+
+/// Draw a 1px border of `color` around the edges of a `(w, h)` `rgba` canvas.
+fn fill_border(rgba: &mut [u8], w: u32, h: u32, color: Rgb) {
+    let canvas = (w, h);
+    fill_rect(rgba, canvas, (0, 0, w, 1), color);
+    fill_rect(rgba, canvas, (0, h.saturating_sub(1), w, 1), color);
+    fill_rect(rgba, canvas, (0, 0, 1, h), color);
+    fill_rect(rgba, canvas, (w.saturating_sub(1), 0, 1, h), color);
 }
 
 /// The cosmic-text font family for a configured family name, defaulting to the

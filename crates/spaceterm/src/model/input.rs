@@ -49,8 +49,11 @@ pub enum KeyCode {
 /// What a key resolves to in the current mode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
-    CloseOtherPanes,
+    /// Close the focused pane (current pane).
     ClosePane,
+    CloseOtherPanes,
+    /// Close a tab: the active one (`None`) or the Nth tab, 1-based (`Some(n)`).
+    CloseTab(Option<usize>),
     DeleteCharForward,
     DeleteLine,
     DeleteToLineEnd,
@@ -58,12 +61,23 @@ pub enum Action {
     DeleteWordBack,
     DeleteWordForward,
     EnterVisual(VisualKind),
+    /// A char-search within the current line (`f`/`F`/`t`/`T`).
+    FindChar(FindChar),
+    /// Repeat the last char-search (`;`); `reverse` flips its direction (`,`).
+    FindRepeat {
+        reverse: bool,
+    },
     FocusBlock(BlockNav),
     FocusPane(FocusDir),
     ForwardToBlock(Vec<u8>),
+    /// Switch to tab number `n` (1-based).
+    GotoTab(usize),
     Ignore,
     MoveCursor(CursorMove),
+    NewTab,
+    NextTab,
     Paste,
+    PrevTab,
     QuickCancel,
     QuickJump(char),
     QuickSelect,
@@ -80,6 +94,26 @@ pub enum Action {
     ToggleFold,
     YankBlock,
     YankSelection,
+}
+
+/// A vim char-search within the current line. `forward` is `f`/`t`; `till`
+/// (`t`/`T`) stops one cell short of the target instead of on it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FindChar {
+    pub ch: char,
+    pub forward: bool,
+    pub till: bool,
+}
+
+impl FindChar {
+    /// The same search with its direction flipped, used to repeat `f`/`t` the
+    /// opposite way on `,`.
+    pub fn reversed(self) -> Self {
+        Self {
+            forward: !self.forward,
+            ..self
+        }
+    }
 }
 
 /// Whether a Visual selection spans characters or whole lines (vim `v` vs `V`).
@@ -129,10 +163,18 @@ pub enum PendingPrefix {
     BracketOpen,
     CtrlW,
     Delete,
+    /// Awaiting the target char of a backward find (`F`).
+    FindBackward,
+    /// Awaiting the target char of a forward find (`f`).
+    FindForward,
     G,
     None,
     QuickSelect,
     SearchInput,
+    /// Awaiting the target char of a backward till (`T`).
+    TillBackward,
+    /// Awaiting the target char of a forward till (`t`).
+    TillForward,
     Z,
 }
 
@@ -411,6 +453,15 @@ fn resolve_insert(key: &Key, fullscreen: bool) -> Action {
     Action::SendBytes(encode(key))
 }
 
+/// Build the char-search action for the key that follows `f`/`F`/`t`/`T`. A
+/// printable character is the search target; anything else cancels the search.
+fn find_char_action(key: &Key, forward: bool, till: bool) -> Action {
+    match key.code {
+        KeyCode::Char(ch) => Action::FindChar(FindChar { ch, forward, till }),
+        _ => Action::Ignore,
+    }
+}
+
 fn resolve_normal(key: &Key, pending: &mut PendingPrefix, window: &WindowKeymap) -> Action {
     // A window-command sequence is open: the follow key selects its action
     // (matched by code, so `Ctrl-w v` and `Ctrl-w Ctrl-v` both split).
@@ -465,8 +516,14 @@ fn resolve_normal(key: &Key, pending: &mut PendingPrefix, window: &WindowKeymap)
             KeyCode::Char('0') => Action::DeleteToLineStart,
             _ => Action::Ignore,
         },
+        PendingPrefix::FindForward => find_char_action(key, true, false),
+        PendingPrefix::FindBackward => find_char_action(key, false, false),
+        PendingPrefix::TillForward => find_char_action(key, true, true),
+        PendingPrefix::TillBackward => find_char_action(key, false, true),
         PendingPrefix::G => match key.code {
             KeyCode::Char('g') => Action::MoveCursor(CursorMove::Top),
+            KeyCode::Char('t') => Action::NextTab,
+            KeyCode::Char('T') => Action::PrevTab,
             _ => Action::Ignore,
         },
         PendingPrefix::Z => match key.code {
@@ -511,6 +568,24 @@ fn resolve_normal(key: &Key, pending: &mut PendingPrefix, window: &WindowKeymap)
             KeyCode::Char('G') => Action::MoveCursor(CursorMove::Bottom),
             KeyCode::PageDown => Action::MoveCursor(CursorMove::PageDown),
             KeyCode::PageUp => Action::MoveCursor(CursorMove::PageUp),
+            KeyCode::Char('f') => {
+                *pending = PendingPrefix::FindForward;
+                Action::Ignore
+            }
+            KeyCode::Char('F') => {
+                *pending = PendingPrefix::FindBackward;
+                Action::Ignore
+            }
+            KeyCode::Char('t') => {
+                *pending = PendingPrefix::TillForward;
+                Action::Ignore
+            }
+            KeyCode::Char('T') => {
+                *pending = PendingPrefix::TillBackward;
+                Action::Ignore
+            }
+            KeyCode::Char(';') => Action::FindRepeat { reverse: false },
+            KeyCode::Char(',') => Action::FindRepeat { reverse: true },
             KeyCode::Char('v') => Action::EnterVisual(VisualKind::Char),
             KeyCode::Char('V') => Action::EnterVisual(VisualKind::Line),
             KeyCode::Char('p') => Action::Paste,
@@ -567,11 +642,18 @@ fn resolve_visual(key: &Key, pending: &mut PendingPrefix) -> Action {
     let prev = *pending;
     *pending = PendingPrefix::None;
 
-    if prev == PendingPrefix::G {
-        return match key.code {
-            KeyCode::Char('g') => Action::MoveCursor(CursorMove::Top),
-            _ => Action::Ignore,
-        };
+    match prev {
+        PendingPrefix::G => {
+            return match key.code {
+                KeyCode::Char('g') => Action::MoveCursor(CursorMove::Top),
+                _ => Action::Ignore,
+            };
+        }
+        PendingPrefix::FindForward => return find_char_action(key, true, false),
+        PendingPrefix::FindBackward => return find_char_action(key, false, false),
+        PendingPrefix::TillForward => return find_char_action(key, true, true),
+        PendingPrefix::TillBackward => return find_char_action(key, false, true),
+        _ => {}
     }
 
     match key.code {
@@ -595,6 +677,24 @@ fn resolve_visual(key: &Key, pending: &mut PendingPrefix) -> Action {
             *pending = PendingPrefix::G;
             Action::Ignore
         }
+        KeyCode::Char('f') => {
+            *pending = PendingPrefix::FindForward;
+            Action::Ignore
+        }
+        KeyCode::Char('F') => {
+            *pending = PendingPrefix::FindBackward;
+            Action::Ignore
+        }
+        KeyCode::Char('t') => {
+            *pending = PendingPrefix::TillForward;
+            Action::Ignore
+        }
+        KeyCode::Char('T') => {
+            *pending = PendingPrefix::TillBackward;
+            Action::Ignore
+        }
+        KeyCode::Char(';') => Action::FindRepeat { reverse: false },
+        KeyCode::Char(',') => Action::FindRepeat { reverse: true },
         KeyCode::Char('y') => Action::YankSelection,
         KeyCode::Char('v') => Action::EnterVisual(VisualKind::Char),
         KeyCode::Char('V') => Action::EnterVisual(VisualKind::Line),
@@ -800,6 +900,56 @@ mod tests {
         let action = resolve(Mode::Normal, &key(KeyCode::Char('g')), &mut pending, false);
         assert_eq!(action, Action::MoveCursor(CursorMove::Top));
         assert_eq!(pending, PendingPrefix::None);
+    }
+
+    #[test]
+    fn test_char_search_sets_prefix_then_resolves_target() {
+        let mut pending = PendingPrefix::None;
+        // `t` opens a forward-till search rather than acting immediately.
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('t')), &mut pending, false);
+        assert_eq!(action, Action::Ignore);
+        assert_eq!(pending, PendingPrefix::TillForward);
+        // The next key is the search target.
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('x')), &mut pending, false);
+        assert_eq!(
+            action,
+            Action::FindChar(FindChar {
+                ch: 'x',
+                forward: true,
+                till: true,
+            })
+        );
+        assert_eq!(pending, PendingPrefix::None);
+    }
+
+    #[test]
+    fn test_find_repeat_keys() {
+        assert_eq!(
+            resolve_simple(Mode::Normal, &key(KeyCode::Char(';'))),
+            Action::FindRepeat { reverse: false }
+        );
+        assert_eq!(
+            resolve_simple(Mode::Normal, &key(KeyCode::Char(','))),
+            Action::FindRepeat { reverse: true }
+        );
+    }
+
+    #[test]
+    fn test_gt_switches_tabs() {
+        let mut pending = PendingPrefix::None;
+        assert_eq!(
+            resolve(Mode::Normal, &key(KeyCode::Char('g')), &mut pending, false),
+            Action::Ignore
+        );
+        assert_eq!(
+            resolve(Mode::Normal, &key(KeyCode::Char('t')), &mut pending, false),
+            Action::NextTab
+        );
+        resolve(Mode::Normal, &key(KeyCode::Char('g')), &mut pending, false);
+        assert_eq!(
+            resolve(Mode::Normal, &key(KeyCode::Char('T')), &mut pending, false),
+            Action::PrevTab
+        );
     }
 
     #[test]

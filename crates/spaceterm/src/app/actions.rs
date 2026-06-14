@@ -54,6 +54,16 @@ impl App {
             Action::EnterVisual(kind) => {
                 self.toggle_visual(kind, focused);
             }
+            Action::FindChar(find) => {
+                self.last_find = Some(find);
+                self.find_char_move(find, focused);
+            }
+            Action::FindRepeat { reverse } => {
+                if let Some(find) = self.last_find {
+                    let target = if reverse { find.reversed() } else { find };
+                    self.find_char_move(target, focused);
+                }
+            }
             Action::YankSelection => {
                 self.copy_selection();
                 self.modes
@@ -80,10 +90,26 @@ impl App {
             Action::CloseOtherPanes => {
                 self.close_other_panes(focused);
             }
+            Action::NewTab => {
+                self.new_tab();
+            }
+            Action::NextTab => {
+                self.cycle_tab(true);
+            }
+            Action::PrevTab => {
+                self.cycle_tab(false);
+            }
+            Action::GotoTab(n) => {
+                self.switch_tab(n.saturating_sub(1));
+            }
+            Action::CloseTab(which) => {
+                let index = which.map(|n| n.saturating_sub(1)).unwrap_or(self.active_tab);
+                self.close_tab(index);
+            }
             Action::FocusPane(dir) => {
                 let viewport = self.viewport_rect();
                 let layout_vp = Rect::new(viewport.x, viewport.y, viewport.width, viewport.height);
-                self.tab.focus_in_direction(dir, layout_vp);
+                self.tab_mut().focus_in_direction(dir, layout_vp);
             }
             Action::FocusBlock(nav) => {
                 self.focus_block(nav, focused);

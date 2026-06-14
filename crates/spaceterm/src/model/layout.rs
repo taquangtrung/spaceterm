@@ -6,10 +6,11 @@
 // ========================================================================
 
 /// One tab's pane layout: a binary split tree plus which leaf has focus.
+/// `PaneId`s are allocated by the owner (so they stay unique across tabs) and
+/// passed into [`Tab::with_root`] and [`Tab::split`].
 #[derive(Clone, Debug)]
 pub struct Tab {
     focused: PaneId,
-    next_id: u64,
     root: Node,
 }
 
@@ -65,12 +66,16 @@ pub struct PaneId(pub u64);
 // ========================================================================
 
 impl Tab {
-    /// A tab with a single full-area pane, focused.
+    /// A tab whose single full-area pane is `PaneId(0)`, focused.
     pub fn new() -> Self {
+        Self::with_root(PaneId(0))
+    }
+
+    /// A tab with a single full-area pane `root`, focused.
+    pub fn with_root(root: PaneId) -> Self {
         Self {
-            focused: PaneId(0),
-            next_id: 1,
-            root: Node::Leaf(PaneId(0)),
+            focused: root,
+            root: Node::Leaf(root),
         }
     }
 
@@ -93,10 +98,9 @@ impl Tab {
         out
     }
 
-    /// Split the focused pane, returning the new pane (which becomes focused).
-    pub fn split(&mut self, direction: Direction, ratio: f32) -> PaneId {
-        let new_id = PaneId(self.next_id);
-        self.next_id += 1;
+    /// Split the focused pane in two, placing the caller-allocated `new_id` as
+    /// the new leaf and focusing it.
+    pub fn split(&mut self, direction: Direction, ratio: f32, new_id: PaneId) {
         split_at(
             &mut self.root,
             self.focused,
@@ -105,7 +109,6 @@ impl Tab {
             new_id,
         );
         self.focused = new_id;
-        new_id
     }
 
     /// Close a pane, collapsing its parent split into its sibling. The last pane
@@ -317,7 +320,8 @@ mod tests {
     #[test]
     fn test_split_adds_a_focused_pane_and_divides_the_area() {
         let mut tab = Tab::new();
-        let right = tab.split(Direction::Vertical, 0.5);
+        let right = PaneId(1);
+        tab.split(Direction::Vertical, 0.5, right);
         assert_eq!(tab.focused(), right);
         assert_eq!(tab.panes(), vec![PaneId(0), right]);
 
@@ -329,7 +333,8 @@ mod tests {
     #[test]
     fn test_close_collapses_split_into_sibling() {
         let mut tab = Tab::new();
-        let right = tab.split(Direction::Vertical, 0.5);
+        let right = PaneId(1);
+        tab.split(Direction::Vertical, 0.5, right);
         assert!(tab.close(right));
         assert_eq!(tab.panes(), vec![PaneId(0)]);
         assert_eq!(tab.focused(), PaneId(0));
@@ -346,7 +351,8 @@ mod tests {
     #[test]
     fn test_focus_next_wraps_around() {
         let mut tab = Tab::new();
-        let right = tab.split(Direction::Vertical, 0.5);
+        let right = PaneId(1);
+        tab.split(Direction::Vertical, 0.5, right);
         tab.focus(PaneId(0));
         tab.focus_next();
         assert_eq!(tab.focused(), right);
@@ -357,7 +363,8 @@ mod tests {
     #[test]
     fn test_focus_in_direction_moves_to_the_adjacent_pane() {
         let mut tab = Tab::new();
-        let right = tab.split(Direction::Vertical, 0.5);
+        let right = PaneId(1);
+        tab.split(Direction::Vertical, 0.5, right);
         tab.focus(PaneId(0));
         assert!(tab.focus_in_direction(FocusDir::Right, VIEWPORT));
         assert_eq!(tab.focused(), right);

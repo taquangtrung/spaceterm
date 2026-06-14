@@ -122,11 +122,14 @@ impl App {
         }
         let (cell_w, cell_h) = renderer.cell_size();
         pane.set_cell_size(cell_w, cell_h);
-        let focused = self.tab.focused();
+        let focused = self.tab().focused();
         self.panes.insert(focused, pane);
 
         self.window = Some(window);
         self.renderer = Some(renderer);
+        // Re-size now that the renderer/window exist so the pane accounts for the
+        // reserved top-chrome and status-bar rows, not just the status bar.
+        self.resize_all_panes();
         self.dirty = true;
     }
 }

@@ -35,6 +35,7 @@ const VERTS_PER_QUAD: u32 = 6;
 /// top-left. `id` keys the uploaded texture. `v_max` is the bottom texture
 /// coordinate (1.0 = whole image); values below 1.0 clip the bottom, used to
 /// keep a tall block inside the content area without squashing it.
+#[derive(Clone, Copy, Debug)]
 pub struct ImagePlacement {
     pub height: f32,
     pub id: u64,

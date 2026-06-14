@@ -5,8 +5,9 @@ mod quick_select;
 mod search;
 mod vim;
 
-use crate::model::input;
+use crate::model::input::{self, FindChar};
 use crate::model::layout::PaneId;
+use crate::model::mode::Mode;
 
 use super::App;
 
@@ -96,6 +97,29 @@ impl App {
         // stays reachable.
         col = col.min(vim::nav_line_end(grid, row));
         self.nav_cursor = Some((row, col));
+        self.dirty = true;
+    }
+
+    /// Move the traversal cursor to a char-search (`f`/`F`/`t`/`T`) target on the
+    /// current line. A miss leaves the cursor put. Extends the Visual selection
+    /// when the focused pane is in Visual mode, mirroring [`Self::move_nav_cursor`].
+    pub(crate) fn find_char_move(&mut self, find: FindChar, focused: PaneId) {
+        let Some(pane) = self.panes.get(&focused) else {
+            return;
+        };
+        let grid = pane.grid();
+        let (row, col) = self.nav_cursor.unwrap_or_else(|| grid.cursor());
+        let row = row.min(grid.rows().saturating_sub(1));
+        let line = vim::line_chars(grid, row);
+        let Some(target) = vim::find_char(&line, col, find) else {
+            return;
+        };
+        let col = target.min(vim::nav_line_end(grid, row));
+
+        self.nav_cursor = Some((row, col));
+        if self.modes.get(&focused) == Some(&Mode::Visual) {
+            self.update_visual_selection(focused);
+        }
         self.dirty = true;
     }
 }

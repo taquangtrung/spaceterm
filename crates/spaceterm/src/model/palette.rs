@@ -88,6 +88,22 @@ impl Palette {
 fn builtin_commands() -> Vec<PaletteEntry> {
     vec![
         PaletteEntry {
+            label: "New Tab".into(),
+            action: "new_tab".into(),
+        },
+        PaletteEntry {
+            label: "Close Tab".into(),
+            action: "close_tab".into(),
+        },
+        PaletteEntry {
+            label: "Next Tab".into(),
+            action: "next_tab".into(),
+        },
+        PaletteEntry {
+            label: "Previous Tab".into(),
+            action: "prev_tab".into(),
+        },
+        PaletteEntry {
             label: "Toggle Mode (Insert/Normal)".into(),
             action: "toggle_mode".into(),
         },
@@ -210,7 +226,7 @@ mod tests {
     fn test_palette_selected_action() {
         let p = Palette::open();
         let action = p.selected_action().unwrap();
-        assert_eq!(action, "toggle_mode");
+        assert_eq!(action, "new_tab");
     }
 
     #[test]
