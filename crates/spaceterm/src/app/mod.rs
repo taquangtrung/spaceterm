@@ -209,8 +209,12 @@ pub struct App {
     pub(crate) active_tab: usize,
     /// The open menu/dropdown (index into the chrome's menu list), or `None`.
     pub(crate) open_menu: Option<usize>,
+    /// Index of the open submenu's parent within the open menu's items, or `None`.
+    pub(crate) open_submenu: Option<usize>,
     /// The hovered dropdown item while a menu is open.
     pub(crate) selected_item: Option<usize>,
+    /// The hovered submenu child while a submenu is open.
+    pub(crate) selected_subitem: Option<usize>,
     /// Next free globally-unique pane id; allocated by [`Self::alloc_pane_id`].
     pub(crate) next_pane_id: u64,
     /// All open tabs, each its own split-tree of panes.
@@ -318,7 +322,9 @@ impl App {
             selection: None,
             active_tab: 0,
             open_menu: None,
+            open_submenu: None,
             selected_item: None,
+            selected_subitem: None,
             next_pane_id: 1,
             tabs: vec![Tab::new()],
             modes,

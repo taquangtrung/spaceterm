@@ -25,6 +25,11 @@ const DROPDOWN_MIN_CELLS: f32 = 22.0;
 /// Padding added to the widest `label` + `shortcut` when sizing a dropdown, in
 /// cells (leading indent, gap between label and shortcut, trailing margin).
 const DROPDOWN_PAD_CELLS: f32 = 4.0;
+/// Height of one dropdown item row as a multiple of the cell height. Taller than
+/// a terminal row so the menu reads as an app menu, not a packed text grid.
+const DROPDOWN_ITEM_RATIO: f32 = 1.7;
+/// Padding above the first and below the last dropdown item, in cells.
+const DROPDOWN_PAD_Y_CELLS: f32 = 0.4;
 
 // ========================================================================
 // Data Structures
@@ -54,12 +59,21 @@ pub struct Menu {
     pub title: String,
 }
 
-/// One selectable command line in a dropdown. Purely presentational; the app
-/// maps the same index to a command name.
+/// One selectable line in a dropdown. Purely presentational; the app maps the
+/// same index to a command name. An item with `children` is a submenu parent:
+/// hovering it opens a child panel to the right instead of running a command.
 #[derive(Clone, Debug)]
 pub struct MenuItem {
+    pub children: Vec<MenuItem>,
     pub label: String,
     pub shortcut: String,
+}
+
+impl MenuItem {
+    /// Whether this item opens a submenu rather than dispatching a command.
+    pub fn has_children(&self) -> bool {
+        !self.children.is_empty()
+    }
 }
 
 /// The full top-chrome model the app hands the renderer each frame.
@@ -70,8 +84,13 @@ pub struct TopChrome {
     pub menus: Vec<Menu>,
     /// Index into `menus` of the open dropdown, or `None` when closed.
     pub open_menu: Option<usize>,
+    /// Index (into the open menu's `items`) of the parent whose submenu is shown,
+    /// or `None` when no submenu is open.
+    pub open_submenu: Option<usize>,
     /// The highlighted dropdown item (mouse hover), if any.
     pub selected_item: Option<usize>,
+    /// The highlighted submenu child (mouse hover), if any.
+    pub selected_subitem: Option<usize>,
     pub tabs: Vec<TabLabel>,
 }
 
@@ -90,6 +109,8 @@ pub(crate) struct DropdownLayout {
     pub item_h: f32,
     pub items: usize,
     pub origin_x: f32,
+    /// Vertical padding inside the panel, above the first and below the last row.
+    pub pad: f32,
     pub top: f32,
     pub width: f32,
 }
@@ -106,6 +127,8 @@ pub(crate) struct ChromeLayout {
     /// Classic menu-title targets, parallel to `menus`; empty in modern style.
     pub menu_titles: Vec<Region>,
     pub new_tab: Region,
+    /// The child panel of the open submenu parent, to the right of `dropdown`.
+    pub submenu: Option<DropdownLayout>,
     /// Top (`y`) of the tabbar row.
     pub tab_row_top: f32,
     pub tabs: Vec<Region>,
@@ -122,6 +145,9 @@ pub enum ChromeHit {
     MenuTitle(usize),
     NewTab,
     None,
+    /// A child of the open submenu, by index into that submenu's items. The
+    /// parent is the chrome's `open_submenu`.
+    SubmenuItem(usize),
     Tab(usize),
 }
 
@@ -148,9 +174,9 @@ pub fn chrome_rows(style: MenuStyle) -> usize {
     }
 }
 
-/// Map a click at `(x, y)` to the chrome element under it. Dropdown items take
-/// priority (they overlay everything below), then per-tab close buttons, tabs,
-/// the new-tab button, and finally the menu triggers.
+/// Map a click at `(x, y)` to the chrome element under it. The open submenu wins
+/// first (it overlays the parent), then the parent dropdown, then per-tab close
+/// buttons, tabs, the new-tab button, and finally the menu triggers.
 pub fn hit_test(
     chrome: &TopChrome,
     surface_w: f32,
@@ -161,6 +187,13 @@ pub fn hit_test(
 ) -> ChromeHit {
     let layout = layout(chrome, surface_w, cell_w, cell_h);
 
+    if let Some(submenu) = &layout.submenu {
+        for i in 0..submenu.items {
+            if dropdown_item_region(submenu, i).contains(x, y) {
+                return ChromeHit::SubmenuItem(i);
+            }
+        }
+    }
     if let Some(dropdown) = &layout.dropdown {
         for i in 0..dropdown.items {
             if dropdown_item_region(dropdown, i).contains(x, y) {
@@ -206,11 +239,21 @@ pub(crate) fn layout(chrome: &TopChrome, surface_w: f32, cw: f32, ch: f32) -> Ch
     let menubar_top = if classic { Some(0.0) } else { None };
     let tab_row_top = if classic { ch } else { 0.0 };
 
+    // The modern hamburger sits at the left of the tabbar; the tabs begin after
+    // it. Classic style has no hamburger and tabs start at the left edge.
+    let hamburger = (!classic).then_some(Region {
+        h: ch,
+        w: HAMBURGER_CELLS * cw,
+        x: 0.0,
+        y: tab_row_top,
+    });
+    let tabs_left = hamburger.map_or(0.0, |hb| hb.w);
+
     let tab_w = TAB_CELLS * cw;
     let mut tabs = Vec::with_capacity(chrome.tabs.len());
     let mut closes = Vec::with_capacity(chrome.tabs.len());
     for i in 0..chrome.tabs.len() {
-        let x = i as f32 * tab_w;
+        let x = tabs_left + i as f32 * tab_w;
         tabs.push(Region {
             h: ch,
             w: tab_w,
@@ -228,16 +271,9 @@ pub(crate) fn layout(chrome: &TopChrome, surface_w: f32, cw: f32, ch: f32) -> Ch
     let new_tab = Region {
         h: ch,
         w: NEW_TAB_CELLS * cw,
-        x: chrome.tabs.len() as f32 * tab_w,
+        x: tabs_left + chrome.tabs.len() as f32 * tab_w,
         y: tab_row_top,
     };
-
-    let hamburger = (!classic).then(|| Region {
-        h: ch,
-        w: HAMBURGER_CELLS * cw,
-        x: (surface_w - HAMBURGER_CELLS * cw).max(0.0),
-        y: tab_row_top,
-    });
 
     let menu_titles = if classic {
         let mut titles = Vec::with_capacity(chrome.menus.len());
@@ -259,20 +295,41 @@ pub(crate) fn layout(chrome: &TopChrome, surface_w: f32, cw: f32, ch: f32) -> Ch
 
     let dropdown = chrome.open_menu.and_then(|open| {
         let menu = chrome.menus.get(open)?;
-        let width = dropdown_width(menu, cw).min(surface_w);
+        let width = panel_width(&menu.items, cw).min(surface_w);
         let (origin_x, top) = if classic {
             let title = menu_titles.get(open)?;
             (title.x, ch)
         } else {
+            // Left-aligned with the hamburger, opening below the tabbar row.
             let hb = hamburger.as_ref()?;
-            ((hb.x + hb.w - width).max(0.0), tab_row_top + ch)
+            (hb.x, tab_row_top + ch)
         };
         Some(DropdownLayout {
-            item_h: ch,
+            item_h: ch * DROPDOWN_ITEM_RATIO,
             items: menu.items.len(),
             origin_x,
+            pad: ch * DROPDOWN_PAD_Y_CELLS,
             top,
             width,
+        })
+    });
+
+    // The submenu opens to the right of the parent panel, its first child row
+    // aligned with the hovered parent item; the parent panel stays put.
+    let submenu = dropdown.and_then(|parent| {
+        let open = chrome.open_menu?;
+        let parent_idx = chrome.open_submenu?;
+        let item = chrome.menus.get(open)?.items.get(parent_idx)?;
+        if item.children.is_empty() {
+            return None;
+        }
+        Some(DropdownLayout {
+            item_h: parent.item_h,
+            items: item.children.len(),
+            origin_x: parent.origin_x + parent.width,
+            pad: parent.pad,
+            top: parent.top + parent_idx as f32 * parent.item_h,
+            width: panel_width(&item.children, cw).min(surface_w),
         })
     });
 
@@ -283,6 +340,7 @@ pub(crate) fn layout(chrome: &TopChrome, surface_w: f32, cw: f32, ch: f32) -> Ch
         menubar_top,
         menu_titles,
         new_tab,
+        submenu,
         tab_row_top,
         tabs,
     }
@@ -294,14 +352,13 @@ pub(crate) fn dropdown_item_region(dropdown: &DropdownLayout, i: usize) -> Regio
         h: dropdown.item_h,
         w: dropdown.width,
         x: dropdown.origin_x,
-        y: dropdown.top + i as f32 * dropdown.item_h,
+        y: dropdown.top + dropdown.pad + i as f32 * dropdown.item_h,
     }
 }
 
 /// Panel width sized to the widest `label` + `shortcut`, floored at a minimum.
-fn dropdown_width(menu: &Menu, cw: f32) -> f32 {
-    let widest = menu
-        .items
+fn panel_width(items: &[MenuItem], cw: f32) -> f32 {
+    let widest = items
         .iter()
         .map(|item| item.label.chars().count() + item.shortcut.chars().count())
         .max()
@@ -321,16 +378,23 @@ mod tests {
     const CH: f32 = 20.0;
     const SURFACE_W: f32 = 1200.0;
 
+    fn leaf(label: &str, shortcut: &str) -> MenuItem {
+        MenuItem {
+            children: Vec::new(),
+            label: label.into(),
+            shortcut: shortcut.into(),
+        }
+    }
+
     fn chrome(style: MenuStyle, tabs: usize, open: Option<usize>) -> TopChrome {
         let menus = match style {
             MenuStyle::Modern => vec![Menu {
                 title: "Menu".into(),
                 items: vec![
+                    leaf("New Tab", "Ctrl-Shift-T"),
+                    // A submenu parent: hovering it opens its children.
                     MenuItem {
-                        label: "New Tab".into(),
-                        shortcut: "Ctrl-Shift-T".into(),
-                    },
-                    MenuItem {
+                        children: vec![leaf("Vertical", ""), leaf("Horizontal", "")],
                         label: "Split".into(),
                         shortcut: String::new(),
                     },
@@ -339,17 +403,11 @@ mod tests {
             MenuStyle::Classic => vec![
                 Menu {
                     title: "File".into(),
-                    items: vec![MenuItem {
-                        label: "New Tab".into(),
-                        shortcut: String::new(),
-                    }],
+                    items: vec![leaf("New Tab", "")],
                 },
                 Menu {
                     title: "View".into(),
-                    items: vec![MenuItem {
-                        label: "Theme".into(),
-                        shortcut: String::new(),
-                    }],
+                    items: vec![leaf("Theme", "")],
                 },
             ],
         };
@@ -358,7 +416,9 @@ mod tests {
             menu_style: style,
             menus,
             open_menu: open,
+            open_submenu: None,
             selected_item: None,
+            selected_subitem: None,
             tabs: (0..tabs)
                 .map(|i| TabLabel {
                     title: format!("Tab {i}"),
@@ -387,16 +447,20 @@ mod tests {
     #[test]
     fn test_hit_test_picks_tab_then_new_tab() {
         let c = chrome(MenuStyle::Modern, 2, None);
-        // First tab is at x in [0, 18*cw).
-        assert_eq!(hit_test(&c, SURFACE_W, CW, CH, 5.0, 5.0), ChromeHit::Tab(0));
+        // The modern hamburger occupies the first 3 cells; tabs follow it.
+        let tabs_left = 3.0 * CW;
+        assert_eq!(
+            hit_test(&c, SURFACE_W, CW, CH, tabs_left + 5.0, 5.0),
+            ChromeHit::Tab(0)
+        );
         // Second tab.
         assert_eq!(
-            hit_test(&c, SURFACE_W, CW, CH, 18.0 * CW + 5.0, 5.0),
+            hit_test(&c, SURFACE_W, CW, CH, tabs_left + 18.0 * CW + 5.0, 5.0),
             ChromeHit::Tab(1)
         );
         // The new-tab button sits just past the last tab.
         assert_eq!(
-            hit_test(&c, SURFACE_W, CW, CH, 2.0 * 18.0 * CW + 5.0, 5.0),
+            hit_test(&c, SURFACE_W, CW, CH, tabs_left + 2.0 * 18.0 * CW + 5.0, 5.0),
             ChromeHit::NewTab
         );
     }
@@ -404,8 +468,9 @@ mod tests {
     #[test]
     fn test_close_target_beats_tab_at_right_edge() {
         let c = chrome(MenuStyle::Modern, 1, None);
-        // Far right of the first tab is the close target, not the tab body.
-        let x = 18.0 * CW - 5.0;
+        // Far right of the first tab (past the hamburger offset) is the close
+        // target, not the tab body.
+        let x = 3.0 * CW + 18.0 * CW - 5.0;
         assert_eq!(
             hit_test(&c, SURFACE_W, CW, CH, x, 5.0),
             ChromeHit::CloseTab(0)
@@ -415,8 +480,9 @@ mod tests {
     #[test]
     fn test_hamburger_only_in_modern() {
         let modern = chrome(MenuStyle::Modern, 1, None);
+        // The hamburger now sits at the left edge.
         assert_eq!(
-            hit_test(&modern, SURFACE_W, CW, CH, SURFACE_W - 5.0, 5.0),
+            hit_test(&modern, SURFACE_W, CW, CH, 5.0, 5.0),
             ChromeHit::Hamburger
         );
         // Classic has menu titles on the top row instead.
@@ -457,6 +523,32 @@ mod tests {
             hit_test(&c, SURFACE_W, CW, CH, SURFACE_W / 2.0, 5.0),
             ChromeHit::None
         );
+    }
+
+    #[test]
+    fn test_submenu_opens_right_of_parent_and_is_hit_first() {
+        let mut c = chrome(MenuStyle::Modern, 1, Some(0));
+        c.open_submenu = Some(1); // "Split" carries children.
+        let layout = layout(&c, SURFACE_W, CW, CH);
+        let parent = layout.dropdown.expect("parent open");
+        let submenu = layout.submenu.expect("submenu open");
+        // The child panel sits immediately right of the parent panel.
+        assert_eq!(submenu.origin_x, parent.origin_x + parent.width);
+        assert_eq!(submenu.items, 2);
+        // A click on a child resolves to the submenu, which overlays the parent.
+        let child = dropdown_item_region(&submenu, 0);
+        assert_eq!(
+            hit_test(&c, SURFACE_W, CW, CH, child.x + 2.0, child.y + child.h / 2.0),
+            ChromeHit::SubmenuItem(0)
+        );
+    }
+
+    #[test]
+    fn test_no_submenu_without_an_open_parent() {
+        // open_submenu set but no menu open: no submenu geometry.
+        let mut c = chrome(MenuStyle::Modern, 1, None);
+        c.open_submenu = Some(1);
+        assert!(layout(&c, SURFACE_W, CW, CH).submenu.is_none());
     }
 
     #[test]

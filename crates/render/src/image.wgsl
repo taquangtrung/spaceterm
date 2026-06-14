@@ -19,7 +19,17 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 @group(0) @binding(0) var tex: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
 
+// The texture stores sRGB color; decode to linear so the sRGB surface re-encodes
+// it unchanged and the overlay's alpha blends gamma-correctly. Alpha is linear.
+fn srgb_to_linear(c: vec3f) -> vec3f {
+    let cutoff = c <= vec3f(0.04045);
+    let low = c / 12.92;
+    let high = pow((c + 0.055) / 1.055, vec3f(2.4));
+    return select(high, low, cutoff);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    return textureSample(tex, samp, in.uv);
+    let c = textureSample(tex, samp, in.uv);
+    return vec4f(srgb_to_linear(c.rgb), c.a);
 }

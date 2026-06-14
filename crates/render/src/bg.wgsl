@@ -16,7 +16,17 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     return out;
 }
 
+// Decode an sRGB color to linear. The surface is sRGB, so the GPU re-encodes
+// this on write; emitting linear keeps blending gamma-correct while the displayed
+// color stays the same.
+fn srgb_to_linear(c: vec3f) -> vec3f {
+    let cutoff = c <= vec3f(0.04045);
+    let low = c / 12.92;
+    let high = pow((c + 0.055) / 1.055, vec3f(2.4));
+    return select(high, low, cutoff);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    return vec4f(in.color, 1.0);
+    return vec4f(srgb_to_linear(in.color), 1.0);
 }

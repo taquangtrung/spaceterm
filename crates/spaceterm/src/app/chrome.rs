@@ -13,9 +13,11 @@ use super::App;
 // Data Structures
 // ========================================================================
 
-/// A dropdown command: its display `label`, an optional `shortcut` hint, and the
-/// `command` name dispatched by [`App::run_command`].
+/// A menu line: its display `label`, an optional `shortcut` hint, and the
+/// `command` dispatched by [`App::run_command`]. An item with `children` is a
+/// submenu parent that opens a child panel on hover instead of running a command.
 struct ItemDef {
+    children: &'static [ItemDef],
     command: &'static str,
     label: &'static str,
     shortcut: &'static str,
@@ -27,66 +29,58 @@ struct MenuDef {
     title: &'static str,
 }
 
+/// A command leaf: no children.
+const fn leaf(command: &'static str, label: &'static str, shortcut: &'static str) -> ItemDef {
+    ItemDef {
+        children: &[],
+        command,
+        label,
+        shortcut,
+    }
+}
+
+/// A submenu parent: a label and its children, with no command of its own.
+const fn parent(label: &'static str, children: &'static [ItemDef]) -> ItemDef {
+    ItemDef {
+        children,
+        command: "",
+        label,
+        shortcut: "",
+    }
+}
+
+/// A horizontal separator line.
+const SEPARATOR: ItemDef = leaf("-", "-", "");
+
 // ========================================================================
 // Menu definitions
 // ========================================================================
 
+const LAYOUT_ITEMS: &[ItemDef] = &[
+    leaf("split_vertical", "Split Vertical", ""),
+    leaf("split_horizontal", "Split Horizontal", ""),
+    leaf("close_pane", "Close Pane", ""),
+];
+
+const SEARCH_ITEMS: &[ItemDef] = &[
+    leaf("search", "Search Blocks", ""),
+    leaf("quick_select", "Quick Select", ""),
+    leaf("toggle_fold", "Toggle Fold", ""),
+];
+
+const THEME_ITEMS: &[ItemDef] = &[
+    leaf("theme_dark", "Dark", ""),
+    leaf("theme_light", "Light", ""),
+    leaf("theme_auto", "Auto", ""),
+];
+
 const MODERN_ITEMS: &[ItemDef] = &[
-    ItemDef {
-        command: "new_tab",
-        label: "New Tab",
-        shortcut: "Ctrl-Shift-T",
-    },
-    ItemDef {
-        command: "close_tab",
-        label: "Close Tab",
-        shortcut: "Ctrl-Shift-W",
-    },
-    ItemDef {
-        command: "split_vertical",
-        label: "Split Vertical",
-        shortcut: "",
-    },
-    ItemDef {
-        command: "split_horizontal",
-        label: "Split Horizontal",
-        shortcut: "",
-    },
-    ItemDef {
-        command: "close_pane",
-        label: "Close Pane",
-        shortcut: "",
-    },
-    ItemDef {
-        command: "search",
-        label: "Search Blocks",
-        shortcut: "",
-    },
-    ItemDef {
-        command: "quick_select",
-        label: "Quick Select",
-        shortcut: "",
-    },
-    ItemDef {
-        command: "toggle_fold",
-        label: "Toggle Fold",
-        shortcut: "",
-    },
-    ItemDef {
-        command: "theme_dark",
-        label: "Theme: Dark",
-        shortcut: "",
-    },
-    ItemDef {
-        command: "theme_light",
-        label: "Theme: Light",
-        shortcut: "",
-    },
-    ItemDef {
-        command: "theme_auto",
-        label: "Theme: Auto",
-        shortcut: "",
-    },
+    leaf("new_tab", "New Tab", "Ctrl-Shift-T"),
+    leaf("close_tab", "Close Tab", "Ctrl-Shift-W"),
+    SEPARATOR,
+    parent("Layout", LAYOUT_ITEMS),
+    parent("Search & Fold", SEARCH_ITEMS),
+    parent("Theme", THEME_ITEMS),
 ];
 
 const MODERN_MENUS: &[MenuDef] = &[MenuDef {
@@ -98,101 +92,38 @@ const CLASSIC_MENUS: &[MenuDef] = &[
     MenuDef {
         title: "File",
         items: &[
-            ItemDef {
-                command: "new_tab",
-                label: "New Tab",
-                shortcut: "Ctrl-Shift-T",
-            },
-            ItemDef {
-                command: "close_tab",
-                label: "Close Tab",
-                shortcut: "Ctrl-Shift-W",
-            },
-            ItemDef {
-                command: "close_pane",
-                label: "Close Pane",
-                shortcut: "",
-            },
+            leaf("new_tab", "New Tab", "Ctrl-Shift-T"),
+            leaf("close_tab", "Close Tab", "Ctrl-Shift-W"),
+            SEPARATOR,
+            leaf("close_pane", "Close Pane", ""),
         ],
     },
     MenuDef {
         title: "Edit",
         items: &[
-            ItemDef {
-                command: "search",
-                label: "Search Blocks",
-                shortcut: "",
-            },
-            ItemDef {
-                command: "quick_select",
-                label: "Quick Select",
-                shortcut: "",
-            },
-            ItemDef {
-                command: "yank_block",
-                label: "Yank Block Source",
-                shortcut: "",
-            },
+            leaf("search", "Search Blocks", ""),
+            leaf("quick_select", "Quick Select", ""),
+            SEPARATOR,
+            leaf("yank_block", "Yank Block Source", ""),
         ],
     },
     MenuDef {
         title: "View",
         items: &[
-            ItemDef {
-                command: "split_vertical",
-                label: "Split Vertical",
-                shortcut: "",
-            },
-            ItemDef {
-                command: "split_horizontal",
-                label: "Split Horizontal",
-                shortcut: "",
-            },
-            ItemDef {
-                command: "toggle_fold",
-                label: "Toggle Fold",
-                shortcut: "",
-            },
-            ItemDef {
-                command: "theme_dark",
-                label: "Theme: Dark",
-                shortcut: "",
-            },
-            ItemDef {
-                command: "theme_light",
-                label: "Theme: Light",
-                shortcut: "",
-            },
-            ItemDef {
-                command: "theme_auto",
-                label: "Theme: Auto",
-                shortcut: "",
-            },
+            leaf("split_vertical", "Split Vertical", ""),
+            leaf("split_horizontal", "Split Horizontal", ""),
+            SEPARATOR,
+            leaf("toggle_fold", "Toggle Fold", ""),
+            parent("Theme", THEME_ITEMS),
         ],
     },
     MenuDef {
         title: "Window",
         items: &[
-            ItemDef {
-                command: "focus_left",
-                label: "Focus Left",
-                shortcut: "",
-            },
-            ItemDef {
-                command: "focus_down",
-                label: "Focus Down",
-                shortcut: "",
-            },
-            ItemDef {
-                command: "focus_up",
-                label: "Focus Up",
-                shortcut: "",
-            },
-            ItemDef {
-                command: "focus_right",
-                label: "Focus Right",
-                shortcut: "",
-            },
+            leaf("focus_left", "Focus Left", ""),
+            leaf("focus_down", "Focus Down", ""),
+            leaf("focus_up", "Focus Up", ""),
+            leaf("focus_right", "Focus Right", ""),
         ],
     },
 ];
@@ -202,6 +133,15 @@ fn menu_defs(style: MenuStyle) -> &'static [MenuDef] {
     match style {
         MenuStyle::Classic => CLASSIC_MENUS,
         MenuStyle::Modern => MODERN_MENUS,
+    }
+}
+
+/// Recursively convert a static [`ItemDef`] into the renderer's [`MenuItem`].
+fn menu_item(item: &ItemDef) -> MenuItem {
+    MenuItem {
+        children: item.children.iter().map(menu_item).collect(),
+        label: item.label.to_string(),
+        shortcut: item.shortcut.to_string(),
     }
 }
 
@@ -219,6 +159,20 @@ impl App {
         }
     }
 
+    /// The static def of item `i` in the currently open menu, if any.
+    fn open_menu_item(&self, i: usize) -> Option<&'static ItemDef> {
+        let open = self.open_menu?;
+        menu_defs(self.config.menu_style).get(open)?.items.get(i)
+    }
+
+    /// The static def of submenu child `child` under the open submenu parent.
+    fn open_submenu_item(&self, child: usize) -> Option<&'static ItemDef> {
+        let open = self.open_menu?;
+        let parent = self.open_submenu?;
+        let item = menu_defs(self.config.menu_style).get(open)?.items.get(parent)?;
+        item.children.get(child)
+    }
+
     /// Build the chrome model for this frame from the current tab/menu state.
     pub(crate) fn build_top_chrome(&self) -> TopChrome {
         let tabs = (0..self.tabs.len())
@@ -229,14 +183,7 @@ impl App {
         let menus = menu_defs(self.config.menu_style)
             .iter()
             .map(|menu| Menu {
-                items: menu
-                    .items
-                    .iter()
-                    .map(|item| MenuItem {
-                        label: item.label.to_string(),
-                        shortcut: item.shortcut.to_string(),
-                    })
-                    .collect(),
+                items: menu.items.iter().map(menu_item).collect(),
                 title: menu.title.to_string(),
             })
             .collect();
@@ -245,7 +192,9 @@ impl App {
             menu_style: self.config.menu_style,
             menus,
             open_menu: self.open_menu,
+            open_submenu: self.open_submenu,
             selected_item: self.selected_item,
+            selected_subitem: self.selected_subitem,
             tabs,
         }
     }
@@ -286,15 +235,35 @@ impl App {
                 self.close_menu();
                 self.new_tab();
             }
-            ChromeHit::Hamburger => self.toggle_menu(0),
+            ChromeHit::Hamburger => {
+                if self.open_menu.is_some() {
+                    self.close_menu();
+                } else {
+                    self.toggle_menu(0);
+                }
+            }
             ChromeHit::MenuTitle(i) => self.toggle_menu(i),
             ChromeHit::DropdownItem(i) => {
-                if let Some(open) = self.open_menu {
-                    if let Some(command) = menu_defs(self.config.menu_style)
-                        .get(open)
-                        .and_then(|m| m.items.get(i))
-                        .map(|item| item.command)
-                    {
+                if let Some(item) = self.open_menu_item(i) {
+                    if item.label == "-" {
+                        return true;
+                    }
+                    if item.children.is_empty() {
+                        let command = item.command;
+                        self.close_menu();
+                        self.run_command(command, focused);
+                    } else {
+                        // A submenu parent: keep it open and expand its children.
+                        self.open_submenu = Some(i);
+                        self.selected_item = Some(i);
+                        self.selected_subitem = None;
+                    }
+                }
+            }
+            ChromeHit::SubmenuItem(child) => {
+                if let Some(item) = self.open_submenu_item(child) {
+                    if item.label != "-" {
+                        let command = item.command;
                         self.close_menu();
                         self.run_command(command, focused);
                     }
@@ -314,8 +283,9 @@ impl App {
         true
     }
 
-    /// Update the hovered dropdown item from the pointer position while a menu is
-    /// open, requesting a redraw when it changes.
+    /// Update the hovered menu/submenu rows from the pointer position while a menu
+    /// is open, requesting a redraw when the highlight changes. Hovering a submenu
+    /// parent opens its child panel; the parent stays open throughout.
     pub(crate) fn update_menu_hover(&mut self, x: f32, y: f32) {
         if self.open_menu.is_none() {
             return;
@@ -325,12 +295,25 @@ impl App {
         };
         let surface_w = self.viewport_rect().width;
         let chrome = self.build_top_chrome();
-        let hovered = match spaceterm_render::hit_test(&chrome, surface_w, cw, ch, x, y) {
-            ChromeHit::DropdownItem(i) => Some(i),
-            _ => None,
+        let hit = spaceterm_render::hit_test(&chrome, surface_w, cw, ch, x, y);
+
+        // (selected_item, open_submenu, selected_subitem) for this hover.
+        let next = match hit {
+            ChromeHit::DropdownItem(i) => match self.open_menu_item(i) {
+                Some(item) if item.label == "-" => (None, self.open_submenu, None),
+                Some(item) if !item.children.is_empty() => (Some(i), Some(i), None),
+                Some(_) => (Some(i), None, None),
+                None => (None, self.open_submenu, None),
+            },
+            // Keep the parent highlighted and its submenu open over its children.
+            ChromeHit::SubmenuItem(child) => (self.open_submenu, self.open_submenu, Some(child)),
+            // Off the items: leave the submenu open so the cursor can reach it.
+            _ => (None, self.open_submenu, None),
         };
-        if hovered != self.selected_item {
-            self.selected_item = hovered;
+
+        let current = (self.selected_item, self.open_submenu, self.selected_subitem);
+        if next != current {
+            (self.selected_item, self.open_submenu, self.selected_subitem) = next;
             self.dirty = true;
             if let Some(window) = &self.window {
                 window.request_redraw();
@@ -345,15 +328,19 @@ impl App {
         } else {
             Some(index)
         };
+        self.open_submenu = None;
         self.selected_item = None;
+        self.selected_subitem = None;
         self.dirty = true;
     }
 
-    /// Close any open dropdown.
+    /// Close any open dropdown (and its submenu).
     pub(crate) fn close_menu(&mut self) {
         if self.open_menu.is_some() {
             self.open_menu = None;
+            self.open_submenu = None;
             self.selected_item = None;
+            self.selected_subitem = None;
             self.dirty = true;
         }
     }
@@ -374,15 +361,59 @@ mod tests {
     }
 
     #[test]
-    fn test_every_menu_item_maps_to_a_nonempty_command() {
-        for style in [MenuStyle::Modern, MenuStyle::Classic] {
-            for menu in menu_defs(style) {
-                assert!(!menu.items.is_empty(), "{} has no items", menu.title);
-                for item in menu.items {
-                    assert!(!item.command.is_empty(), "{} has empty command", item.label);
+    fn test_leaves_dispatch_a_command_and_parents_open_submenus() {
+        fn check(items: &[ItemDef]) {
+            for item in items {
+                if item.children.is_empty() {
+                    if item.label != "-" {
+                        assert!(!item.command.is_empty(), "{} has empty command", item.label);
+                    }
+                } else {
+                    // A submenu parent opens a child panel; it has no command.
+                    assert!(item.command.is_empty(), "parent {} should not dispatch", item.label);
+                    check(item.children);
                 }
             }
         }
+        for style in [MenuStyle::Modern, MenuStyle::Classic] {
+            for menu in menu_defs(style) {
+                assert!(!menu.items.is_empty(), "{} has no items", menu.title);
+                check(menu.items);
+            }
+        }
+    }
+
+    #[test]
+    fn test_modern_menu_has_a_theme_submenu() {
+        let theme = MODERN_ITEMS
+            .iter()
+            .find(|it| it.label == "Theme")
+            .expect("Theme parent");
+        assert_eq!(theme.children.len(), 3);
+        assert_eq!(theme.children[0].command, "theme_dark");
+    }
+
+    #[test]
+    fn test_open_submenu_item_resolves_the_child_command() {
+        let mut app = App::new();
+        app.open_menu = Some(0);
+        app.open_submenu = MODERN_ITEMS.iter().position(|it| it.label == "Theme");
+        assert_eq!(app.open_submenu_item(0).map(|it| it.command), Some("theme_dark"));
+        assert!(app.open_submenu_item(99).is_none());
+    }
+
+    #[test]
+    fn test_build_top_chrome_carries_submenu_children_and_state() {
+        let mut app = App::new();
+        app.open_menu = Some(0);
+        let theme_idx = MODERN_ITEMS.iter().position(|it| it.label == "Theme").unwrap();
+        app.open_submenu = Some(theme_idx);
+        app.selected_subitem = Some(1);
+        let chrome = app.build_top_chrome();
+        assert_eq!(chrome.open_submenu, Some(theme_idx));
+        assert_eq!(chrome.selected_subitem, Some(1));
+        assert!(chrome.menus[0].items[theme_idx].has_children());
+        assert_eq!(chrome.menus[0].items[theme_idx].children.len(), 3);
     }
 
     #[test]

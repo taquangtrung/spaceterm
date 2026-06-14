@@ -23,7 +23,7 @@ use wgpu::{
     VertexState, VertexStepMode,
 };
 
-use crate::chrome::{self, layout as chrome_layout, TopChrome};
+use crate::chrome::{self, layout as chrome_layout, DropdownLayout, MenuItem, TopChrome};
 use crate::grid::{Color as GridColor, CursorShape, Grid, RgbColor};
 use crate::image::{ImagePass, ImagePlacement};
 use crate::theme::{Rgb, Theme};
@@ -39,9 +39,22 @@ const CURSOR_BAR_WIDTH_RATIO: f32 = 0.15;
 const CURSOR_UNDERLINE_HEIGHT_RATIO: f32 = 0.2;
 const BG_BUFFER_SIZE: u64 = 4 * 1024 * 1024;
 const MAX_SVG_DIM: u32 = 4096;
-/// Reserved image-pass texture id for the rasterized menu dropdown overlay. Set
-/// to the top of the id space so it never collides with block image ids.
+/// Reserved image-pass texture ids for the rasterized menu overlays. Set to the
+/// top of the id space so they never collide with block image ids.
 const DROPDOWN_TEXTURE_ID: u64 = u64::MAX;
+const SUBMENU_TEXTURE_ID: u64 = u64::MAX - 1;
+/// Corner radius of the dropdown menu panel and its hover highlight, in pixels.
+const DROPDOWN_RADIUS: f32 = 8.0;
+/// Width of the soft drop shadow cast around the dropdown panel, in pixels.
+const DROPDOWN_SHADOW: f32 = 12.0;
+/// Peak opacity of the dropdown drop shadow, fading to zero at its outer edge.
+const DROPDOWN_SHADOW_ALPHA: f32 = 0.4;
+/// Inset of the hover-highlight pill from the dropdown item-row edges, in pixels.
+const MENU_HOVER_INSET: f32 = 4.0;
+/// Thickness of the accent bar under the active tab, in pixels.
+const TAB_ACCENT_THICKNESS: f32 = 2.0;
+/// Color of the dropdown drop shadow (alpha is applied per pixel).
+const SHADOW_COLOR: Rgb = Rgb::new(0, 0, 0);
 
 // ========================================================================
 // Data Structures
@@ -93,6 +106,27 @@ struct ChromeText {
     color: Color,
     left: f32,
     top: f32,
+}
+
+/// Scalar font metrics needed to shape and lay out chrome text offscreen,
+/// independent of the GPU. Bundled so the dropdown rasterizer (and its tests)
+/// can run without a `Renderer`.
+struct FontCtx<'a> {
+    cell_h: f32,
+    cell_w: f32,
+    family: Option<&'a str>,
+    font_size: f32,
+    line_height: f32,
+}
+
+/// A rasterized dropdown overlay: its pixels and the surface position to place
+/// them at (top-left, already offset to include the shadow margin).
+struct DropdownImage {
+    height: u32,
+    rgba: Vec<u8>,
+    width: u32,
+    x: f32,
+    y: f32,
 }
 
 /// Font selection for the renderer. `family` is the primary family name (e.g.
@@ -203,10 +237,19 @@ impl GpuRenderer {
                 .expect("request wgpu device");
 
         let caps = surface.get_capabilities(&adapter);
+        // Prefer an sRGB surface so the GPU encodes linear shader output to sRGB
+        // on write: glyph and overlay antialiasing then blends in linear space
+        // (gamma-correct), which keeps light-on-dark text crisp instead of thin
+        // and fuzzy. The bg/image shaders output linear to match.
         let format = caps
             .formats
             .iter()
-            .find(|f| matches!(f, TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm))
+            .find(|f| matches!(f, TextureFormat::Bgra8UnormSrgb | TextureFormat::Rgba8UnormSrgb))
+            .or_else(|| {
+                caps.formats
+                    .iter()
+                    .find(|f| matches!(f, TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm))
+            })
             .copied()
             .unwrap_or(caps.formats[0]);
 
@@ -227,11 +270,17 @@ impl GpuRenderer {
         let font_family = font.family;
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
-        // The surface is a non-sRGB Unorm format and the background/cell quads
-        // write sRGB values directly. ColorMode::Web makes glyphon do the same
-        // (no sRGB->linear conversion) so text isn't rendered too dark.
+        // ColorMode::Accurate makes glyphon convert text colors to linear and
+        // blend glyph coverage in linear space, which the sRGB surface encodes
+        // back on write: gamma-correct antialiasing, so text stays crisp rather
+        // than thin and fuzzy on dark backgrounds.
+        let color_mode = if format.is_srgb() {
+            ColorMode::Accurate
+        } else {
+            ColorMode::Web
+        };
         let mut text_atlas =
-            TextAtlas::with_color_mode(&device, &queue, &cache, format, ColorMode::Web);
+            TextAtlas::with_color_mode(&device, &queue, &cache, format, color_mode);
         let text_renderer =
             TextRenderer::new(&mut text_atlas, &device, MultisampleState::default(), None);
         let viewport = Viewport::new(&device, &cache);
@@ -915,9 +964,7 @@ impl GpuRenderer {
         // pass (which runs after the text pass) so it overlays pane glyphs.
         let mut all_images: Vec<ImagePlacement> = images.to_vec();
         if let Some(c) = chrome {
-            if let Some(placement) = self.rasterize_dropdown(c, surface_w) {
-                all_images.push(placement);
-            }
+            all_images.extend(self.rasterize_dropdown(c, surface_w));
         }
         self.image_pass
             .prepare(&self.queue, &all_images, surface_w, surface_h);
@@ -1000,10 +1047,12 @@ impl GpuRenderer {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
+                        // The sRGB surface expects a linear clear value, so decode
+                        // the (sRGB) background to keep the displayed color exact.
                         load: LoadOp::Clear(wgpu::Color {
-                            r: self.theme.background.r as f64 / 255.0,
-                            g: self.theme.background.g as f64 / 255.0,
-                            b: self.theme.background.b as f64 / 255.0,
+                            r: srgb_to_linear_f64(self.theme.background.r),
+                            g: srgb_to_linear_f64(self.theme.background.g),
+                            b: srgb_to_linear_f64(self.theme.background.b),
                             a: 1.0,
                         }),
                         store: StoreOp::Store,
@@ -1062,7 +1111,7 @@ impl GpuRenderer {
             surface_h,
         ));
 
-        // Active-tab fill.
+        // Active-tab fill, topped with an accent bar for a modern, flat look.
         if let Some(tab) = layout.tabs.get(chrome.active_tab) {
             verts.extend_from_slice(&quad_vertices(
                 tab.x,
@@ -1073,10 +1122,26 @@ impl GpuRenderer {
                 surface_w,
                 surface_h,
             ));
+            verts.extend_from_slice(&quad_vertices(
+                tab.x,
+                tab.y,
+                tab.x + tab.w,
+                tab.y + TAB_ACCENT_THICKNESS,
+                self.theme.ansi[4].as_linear(),
+                surface_w,
+                surface_h,
+            ));
         }
 
-        // Thin separators on each tab's right edge.
-        for tab in &layout.tabs {
+        // Thin separators between adjacent inactive tabs only; the active tab's
+        // fill and accent already set it apart, so flanking separators just add
+        // visual noise.
+        for (i, tab) in layout.tabs.iter().enumerate() {
+            let touches_active =
+                i == chrome.active_tab || i + 1 == chrome.active_tab;
+            if touches_active {
+                continue;
+            }
             let x = tab.x + tab.w - 0.5;
             verts.extend_from_slice(&quad_vertices(
                 x,
@@ -1125,7 +1190,7 @@ impl GpuRenderer {
             } else {
                 muted
             };
-            let buffer = self.chrome_line_buffer(&title, color, active);
+            let buffer = self.chrome_line_buffer(&title, color, active, false);
             texts.push(ChromeText {
                 bounds: text_bounds(tab.x, tab.y, close.x, tab.y + tab.h),
                 buffer,
@@ -1134,7 +1199,7 @@ impl GpuRenderer {
                 top: tab.y,
             });
 
-            let close_buf = self.chrome_line_buffer("\u{00d7}", muted, false);
+            let close_buf = self.chrome_line_buffer("\u{00d7}", muted, false, false);
             texts.push(ChromeText {
                 bounds: text_bounds(close.x, close.y, close.x + close.w, close.y + close.h),
                 buffer: close_buf,
@@ -1146,7 +1211,7 @@ impl GpuRenderer {
 
         // New-tab button.
         let new_tab = layout.new_tab;
-        let plus = self.chrome_line_buffer("+", muted, false);
+        let plus = self.chrome_line_buffer("+", muted, false, false);
         texts.push(ChromeText {
             bounds: text_bounds(
                 new_tab.x,
@@ -1162,7 +1227,7 @@ impl GpuRenderer {
 
         // Modern hamburger, or classic menu titles.
         if let Some(hb) = layout.hamburger {
-            let glyph = self.chrome_line_buffer("\u{2630}", foreground, false);
+            let glyph = self.chrome_line_buffer("\u{2630}", foreground, false, false);
             texts.push(ChromeText {
                 bounds: text_bounds(hb.x, hb.y, hb.x + hb.w, hb.y + hb.h),
                 buffer: glyph,
@@ -1173,7 +1238,7 @@ impl GpuRenderer {
         }
         for (i, region) in layout.menu_titles.iter().enumerate() {
             let open = chrome.open_menu == Some(i);
-            let buffer = self.chrome_line_buffer(&chrome.menus[i].title, foreground, open);
+            let buffer = self.chrome_line_buffer(&chrome.menus[i].title, foreground, open, false);
             texts.push(ChromeText {
                 bounds: text_bounds(region.x, region.y, region.x + region.w, region.y + region.h),
                 buffer,
@@ -1186,132 +1251,72 @@ impl GpuRenderer {
         texts
     }
 
-    /// Rasterize the open dropdown (panel, hover row, item labels/shortcuts) to a
-    /// texture and return its placement, or `None` when no menu is open.
-    fn rasterize_dropdown(&mut self, chrome: &TopChrome, surface_w: f32) -> Option<ImagePlacement> {
-        let cw = self.cell_width;
-        let ch = self.cell_height;
-        let layout = chrome_layout(chrome, surface_w, cw, ch);
-        let dropdown = layout.dropdown?;
-        let menu = chrome.menus.get(chrome.open_menu?)?;
-        let width = dropdown.width.floor().max(1.0) as u32;
-        let height = (dropdown.items as f32 * dropdown.item_h).floor().max(1.0) as u32;
-
-        let panel = self.theme.tabbar_bg;
-        let mut rgba = vec![0u8; (width * height * 4) as usize];
-        for pixel in rgba.chunks_exact_mut(4) {
-            pixel.copy_from_slice(&[panel.r, panel.g, panel.b, 255]);
-        }
-        if let Some(sel) = chrome.selected_item {
-            let y0 = (sel as f32 * dropdown.item_h) as u32;
-            let h = dropdown.item_h as u32;
-            let rect = (1, y0, width.saturating_sub(2), h);
-            fill_rect(&mut rgba, (width, height), rect, self.theme.menu_hover_bg);
-        }
-        fill_border(&mut rgba, width, height, self.theme.divider);
-
-        let foreground = self.theme.foreground.to_glyphon();
-        let muted = self.theme.ansi[8].to_glyphon();
-        let pad = (cw * 0.8) as i32;
-        for (i, item) in menu.items.iter().enumerate() {
-            let oy = (i as f32 * dropdown.item_h) as i32;
-            let label_buf = self.chrome_line_buffer(&item.label, foreground, false);
-            self.blit_buffer(
-                &mut rgba,
-                (width, height),
-                &label_buf,
-                (pad, oy),
-                foreground,
-            );
-            if !item.shortcut.is_empty() {
-                let shortcut_buf = self.chrome_line_buffer(&item.shortcut, muted, false);
-                let shortcut_w = (item.shortcut.chars().count() as f32 * cw) as i32;
-                let ox = width as i32 - shortcut_w - pad;
-                self.blit_buffer(&mut rgba, (width, height), &shortcut_buf, (ox, oy), muted);
-            }
-        }
-
-        self.image_pass.upload(
-            &self.device,
-            &self.queue,
-            DROPDOWN_TEXTURE_ID,
-            &rgba,
-            width,
-            height,
+    /// Rasterize the open dropdown to a texture and return its placement, or
+    /// `None` when no menu is open. The pixel work lives in [`dropdown_rgba`] so
+    /// it can run (and be tested) without the GPU; this only uploads the result.
+    /// Rasterize and place the open menu's overlays: the parent dropdown, and the
+    /// open submenu (drawn after, so it overlays the parent). Returns one
+    /// placement per visible panel, or empty when no menu is open.
+    fn rasterize_dropdown(&mut self, chrome: &TopChrome, surface_w: f32) -> Vec<ImagePlacement> {
+        let ctx = FontCtx {
+            cell_h: self.cell_height,
+            cell_w: self.cell_width,
+            family: self.font_family.as_deref(),
+            font_size: self.font_size,
+            line_height: self.line_height,
+        };
+        // Computed sequentially: each borrows the shared font system in turn.
+        let parent = dropdown_rgba(
+            &mut self.font_system,
+            &mut self.swash_cache,
+            &ctx,
+            &self.theme,
+            chrome,
+            surface_w,
         );
-        Some(ImagePlacement {
-            height: height as f32,
-            id: DROPDOWN_TEXTURE_ID,
-            v_max: 1.0,
-            width: width as f32,
-            x: dropdown.origin_x,
-            y: dropdown.top,
-        })
+        let submenu = submenu_rgba(
+            &mut self.font_system,
+            &mut self.swash_cache,
+            &ctx,
+            &self.theme,
+            chrome,
+            surface_w,
+        );
+        let mut placements = Vec::new();
+        for (id, image) in [(DROPDOWN_TEXTURE_ID, parent), (SUBMENU_TEXTURE_ID, submenu)] {
+            let Some(image) = image else { continue };
+            self.image_pass
+                .upload(&self.device, &self.queue, id, &image.rgba, image.width, image.height);
+            placements.push(ImagePlacement {
+                height: image.height as f32,
+                id,
+                v_max: 1.0,
+                width: image.width as f32,
+                x: image.x,
+                y: image.y,
+            });
+        }
+        placements
     }
 
-    /// Shape a single line of chrome text into a reusable buffer.
-    fn chrome_line_buffer(&mut self, text: &str, color: Color, bold: bool) -> glyphon::Buffer {
-        let fam = self.font_family.clone();
-        let mut buffer = glyphon::Buffer::new(
-            &mut self.font_system,
-            glyphon::Metrics::new(self.font_size, self.line_height),
-        );
-        buffer.set_size(
-            &mut self.font_system,
-            Some(f32::MAX),
-            Some(self.line_height),
-        );
-        let mut attrs = Attrs::new()
-            .family(base_family(fam.as_deref()))
-            .color(color);
-        if bold {
-            attrs = attrs.weight(glyphon::cosmic_text::Weight::BOLD);
-        }
-        buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced, None);
-        buffer.shape_until_scroll(&mut self.font_system, false);
-        buffer
-    }
-
-    /// Composite `buffer`'s glyph coverage onto a `(canvas_w, canvas_h)` `rgba`
-    /// buffer at pixel `offset`, clipping to the canvas. Used to bake dropdown
-    /// text into its texture.
-    fn blit_buffer(
+    /// Shape a single line of chrome text into a reusable buffer. With
+    /// `proportional` set, it uses a sans-serif UI font (for the dropdown menu)
+    /// rather than the terminal's monospace family.
+    fn chrome_line_buffer(
         &mut self,
-        rgba: &mut [u8],
-        canvas: (u32, u32),
-        buffer: &glyphon::Buffer,
-        offset: (i32, i32),
-        default_color: Color,
-    ) {
-        let (canvas_w, canvas_h) = canvas;
-        let (ox, oy) = offset;
-        let font_system = &mut self.font_system;
-        let swash_cache = &mut self.swash_cache;
-        buffer.draw(
-            font_system,
-            swash_cache,
-            default_color,
-            |x, y, w, h, color| {
-                let alpha = color.a() as f32 / 255.0;
-                if alpha <= 0.0 {
-                    return;
-                }
-                let (cr, cg, cb) = (color.r() as f32, color.g() as f32, color.b() as f32);
-                for py in y..y + h as i32 {
-                    for px in x..x + w as i32 {
-                        let gx = px + ox;
-                        let gy = py + oy;
-                        if gx < 0 || gy < 0 || gx >= canvas_w as i32 || gy >= canvas_h as i32 {
-                            continue;
-                        }
-                        let idx = ((gy as u32 * canvas_w + gx as u32) * 4) as usize;
-                        rgba[idx] = (cr * alpha + rgba[idx] as f32 * (1.0 - alpha)) as u8;
-                        rgba[idx + 1] = (cg * alpha + rgba[idx + 1] as f32 * (1.0 - alpha)) as u8;
-                        rgba[idx + 2] = (cb * alpha + rgba[idx + 2] as f32 * (1.0 - alpha)) as u8;
-                    }
-                }
-            },
-        );
+        text: &str,
+        color: Color,
+        bold: bool,
+        proportional: bool,
+    ) -> glyphon::Buffer {
+        let ctx = FontCtx {
+            cell_h: self.cell_height,
+            cell_w: self.cell_width,
+            family: self.font_family.as_deref(),
+            font_size: self.font_size,
+            line_height: self.line_height,
+        };
+        shape_chrome_line(&mut self.font_system, &ctx, text, color, bold, proportional)
     }
 }
 
@@ -1720,24 +1725,300 @@ fn truncate_label(s: &str, max_chars: usize) -> String {
 
 /// Fill an opaque `(x, y, w, h)` rectangle of `color` into a `(canvas_w,
 /// canvas_h)` `rgba` buffer, clipped to the canvas.
-fn fill_rect(rgba: &mut [u8], canvas: (u32, u32), rect: (u32, u32, u32, u32), color: Rgb) {
+/// Alpha-composite `color` over the pixel at byte `idx` of an RGBA buffer.
+fn blend_px(rgba: &mut [u8], idx: usize, color: Rgb, alpha: f32) {
+    let a = alpha.clamp(0.0, 1.0);
+    if a <= 0.0 {
+        return;
+    }
+    let inv = 1.0 - a;
+    rgba[idx] = (color.r as f32 * a + rgba[idx] as f32 * inv) as u8;
+    rgba[idx + 1] = (color.g as f32 * a + rgba[idx + 1] as f32 * inv) as u8;
+    rgba[idx + 2] = (color.b as f32 * a + rgba[idx + 2] as f32 * inv) as u8;
+    let out_a = a + (rgba[idx + 3] as f32 / 255.0) * inv;
+    rgba[idx + 3] = (out_a * 255.0) as u8;
+}
+
+/// Signed distance from `(px, py)` to the rounded rectangle `(x, y, w, h)` with
+/// corner `radius`: negative inside, zero on the edge, positive outside.
+fn rounded_rect_sdf(px: f32, py: f32, rect: (f32, f32, f32, f32), radius: f32) -> f32 {
+    let (rx, ry, rw, rh) = rect;
+    let half_w = rw / 2.0;
+    let half_h = rh / 2.0;
+    let r = radius.min(half_w).min(half_h);
+    let qx = (px - (rx + half_w)).abs() - (half_w - r);
+    let qy = (py - (ry + half_h)).abs() - (half_h - r);
+    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+    outside + qx.max(qy).min(0.0) - r
+}
+
+/// Fill a rounded rectangle into `rgba`, anti-aliasing the edge over a 1px band
+/// and compositing at up to `max_alpha` opacity.
+fn fill_rounded_rect(
+    rgba: &mut [u8],
+    canvas: (u32, u32),
+    rect: (f32, f32, f32, f32),
+    radius: f32,
+    color: Rgb,
+    max_alpha: f32,
+) {
     let (canvas_w, canvas_h) = canvas;
-    let (x, y, w, h) = rect;
-    for py in y..(y + h).min(canvas_h) {
-        for px in x..(x + w).min(canvas_w) {
+    let (rx, ry, rw, rh) = rect;
+    let x0 = rx.floor().max(0.0) as u32;
+    let y0 = ry.floor().max(0.0) as u32;
+    let x1 = ((rx + rw).ceil() as i64).clamp(0, canvas_w as i64) as u32;
+    let y1 = ((ry + rh).ceil() as i64).clamp(0, canvas_h as i64) as u32;
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let sdf = rounded_rect_sdf(px as f32 + 0.5, py as f32 + 0.5, rect, radius);
+            let coverage = (0.5 - sdf).clamp(0.0, 1.0);
+            if coverage <= 0.0 {
+                continue;
+            }
             let idx = ((py * canvas_w + px) * 4) as usize;
-            rgba[idx..idx + 4].copy_from_slice(&[color.r, color.g, color.b, 255]);
+            blend_px(rgba, idx, color, coverage * max_alpha);
         }
     }
 }
 
-/// Draw a 1px border of `color` around the edges of a `(w, h)` `rgba` canvas.
-fn fill_border(rgba: &mut [u8], w: u32, h: u32, color: Rgb) {
-    let canvas = (w, h);
-    fill_rect(rgba, canvas, (0, 0, w, 1), color);
-    fill_rect(rgba, canvas, (0, h.saturating_sub(1), w, 1), color);
-    fill_rect(rgba, canvas, (0, 0, 1, h), color);
-    fill_rect(rgba, canvas, (w.saturating_sub(1), 0, 1, h), color);
+/// Decode one 8-bit sRGB channel to a linear `0.0..=1.0` value. Used for the
+/// surface clear, which an sRGB target interprets as linear.
+fn srgb_to_linear_f64(channel: u8) -> f64 {
+    let c = channel as f64 / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// The shaped pixel width of a single-line text buffer, used to right-align the
+/// dropdown shortcuts under a proportional font.
+fn buffer_width(buffer: &glyphon::Buffer) -> f32 {
+    buffer
+        .layout_runs()
+        .map(|run| run.line_w)
+        .fold(0.0, f32::max)
+}
+
+/// Shape one line of chrome text into a buffer without touching the GPU. With
+/// `proportional`, it uses a sans-serif UI font instead of the terminal family.
+fn shape_chrome_line(
+    font_system: &mut FontSystem,
+    ctx: &FontCtx,
+    text: &str,
+    color: Color,
+    bold: bool,
+    proportional: bool,
+) -> glyphon::Buffer {
+    let mut buffer = glyphon::Buffer::new(
+        font_system,
+        glyphon::Metrics::new(ctx.font_size, ctx.line_height),
+    );
+    buffer.set_size(font_system, Some(f32::MAX), Some(ctx.line_height));
+    let family = if proportional {
+        Family::SansSerif
+    } else {
+        base_family(ctx.family)
+    };
+    let mut attrs = Attrs::new().family(family).color(color);
+    if bold {
+        attrs = attrs.weight(glyphon::cosmic_text::Weight::BOLD);
+    }
+    buffer.set_text(font_system, text, &attrs, Shaping::Advanced, None);
+    buffer.shape_until_scroll(font_system, false);
+    buffer
+}
+
+/// Composite `buffer`'s glyph coverage onto a `(canvas_w, canvas_h)` RGBA buffer
+/// at pixel `offset`, clipping to the canvas. Bakes dropdown text into its texture.
+fn composite_buffer(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    rgba: &mut [u8],
+    canvas: (u32, u32),
+    buffer: &glyphon::Buffer,
+    offset: (i32, i32),
+    default_color: Color,
+) {
+    let (canvas_w, canvas_h) = canvas;
+    let (ox, oy) = offset;
+    buffer.draw(font_system, swash_cache, default_color, |x, y, w, h, color| {
+        let alpha = color.a() as f32 / 255.0;
+        if alpha <= 0.0 {
+            return;
+        }
+        let (cr, cg, cb) = (color.r() as f32, color.g() as f32, color.b() as f32);
+        for py in y..y + h as i32 {
+            for px in x..x + w as i32 {
+                let gx = px + ox;
+                let gy = py + oy;
+                if gx < 0 || gy < 0 || gx >= canvas_w as i32 || gy >= canvas_h as i32 {
+                    continue;
+                }
+                let idx = ((gy as u32 * canvas_w + gx as u32) * 4) as usize;
+                rgba[idx] = (cr * alpha + rgba[idx] as f32 * (1.0 - alpha)) as u8;
+                rgba[idx + 1] = (cg * alpha + rgba[idx + 1] as f32 * (1.0 - alpha)) as u8;
+                rgba[idx + 2] = (cb * alpha + rgba[idx + 2] as f32 * (1.0 - alpha)) as u8;
+            }
+        }
+    });
+}
+
+/// Rasterize the open dropdown overlay (soft shadow, elevated rounded panel,
+/// rounded hover pill, and sans-serif item text) to an RGBA image without the
+/// GPU. Returns `None` when no menu is open.
+/// The parent dropdown panel for the open menu, or `None` when none is open.
+fn dropdown_rgba(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    ctx: &FontCtx,
+    theme: &Theme,
+    chrome: &TopChrome,
+    surface_w: f32,
+) -> Option<DropdownImage> {
+    let layout = chrome_layout(chrome, surface_w, ctx.cell_w, ctx.cell_h);
+    let menu = chrome.menus.get(chrome.open_menu?)?;
+    let panel = panel_rgba(
+        font_system,
+        swash_cache,
+        ctx,
+        theme,
+        &menu.items,
+        &layout.dropdown?,
+        chrome.selected_item,
+    );
+    Some(panel)
+}
+
+/// The open submenu's child panel, or `None` when no submenu is open.
+fn submenu_rgba(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    ctx: &FontCtx,
+    theme: &Theme,
+    chrome: &TopChrome,
+    surface_w: f32,
+) -> Option<DropdownImage> {
+    let layout = chrome_layout(chrome, surface_w, ctx.cell_w, ctx.cell_h);
+    let parent = chrome.menus.get(chrome.open_menu?)?.items.get(chrome.open_submenu?)?;
+    let panel = panel_rgba(
+        font_system,
+        swash_cache,
+        ctx,
+        theme,
+        &parent.children,
+        &layout.submenu?,
+        chrome.selected_subitem,
+    );
+    Some(panel)
+}
+
+/// Rasterize one menu panel (`items` at `layout`) into an elevated, rounded,
+/// shadowed card. `selected` is the hover-highlighted row. A submenu parent
+/// (an item with children) gets a `›` chevron instead of a shortcut.
+fn panel_rgba(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    ctx: &FontCtx,
+    theme: &Theme,
+    items: &[MenuItem],
+    layout: &DropdownLayout,
+    selected: Option<usize>,
+) -> DropdownImage {
+    // The panel sits inside a margin that holds its soft drop shadow, so the
+    // texture is larger than the panel and is placed offset by the margin. The
+    // panel interior still lands exactly at origin_x/top, keeping the app's
+    // hit-testing geometry valid.
+    let margin = DROPDOWN_SHADOW;
+    let panel_w = layout.width.floor().max(1.0);
+    let panel_h = (layout.items as f32 * layout.item_h + 2.0 * layout.pad)
+        .floor()
+        .max(1.0);
+    let width = (panel_w + 2.0 * margin) as u32;
+    let height = (panel_h + 2.0 * margin) as u32;
+    let canvas = (width, height);
+    let panel_rect = (margin, margin, panel_w, panel_h);
+
+    let mut rgba = vec![0u8; (width * height * 4) as usize];
+
+    // Soft drop shadow: opacity fades with distance outside the panel.
+    for py in 0..height {
+        for px in 0..width {
+            let sdf = rounded_rect_sdf(px as f32 + 0.5, py as f32 + 0.5, panel_rect, DROPDOWN_RADIUS);
+            let falloff = (1.0 - sdf / margin).clamp(0.0, 1.0);
+            if sdf <= 0.0 || falloff <= 0.0 {
+                continue;
+            }
+            let idx = ((py * width + px) * 4) as usize;
+            blend_px(&mut rgba, idx, SHADOW_COLOR, falloff * falloff * DROPDOWN_SHADOW_ALPHA);
+        }
+    }
+
+    // Elevated rounded panel surface, then the rounded hover pill for the
+    // selected row. The first row begins below the panel's top padding.
+    fill_rounded_rect(&mut rgba, canvas, panel_rect, DROPDOWN_RADIUS, theme.menu_bg, 1.0);
+    let row_top = margin + layout.pad;
+    if let Some(sel) = selected {
+        let hover_rect = (
+            margin + MENU_HOVER_INSET,
+            row_top + sel as f32 * layout.item_h + MENU_HOVER_INSET,
+            panel_w - 2.0 * MENU_HOVER_INSET,
+            layout.item_h - 2.0 * MENU_HOVER_INSET,
+        );
+        let radius = (DROPDOWN_RADIUS - MENU_HOVER_INSET).max(0.0);
+        fill_rounded_rect(&mut rgba, canvas, hover_rect, radius, theme.menu_hover_bg, 1.0);
+    }
+
+    let foreground = theme.foreground.to_glyphon();
+    let muted = theme.ansi[8].to_glyphon();
+    let pad = (ctx.cell_w * 0.9) as i32;
+    let origin = margin as i32;
+    // Center each label vertically within its taller row.
+    let text_dy = ((layout.item_h - ctx.line_height) / 2.0).max(0.0) as i32;
+    for (i, item) in items.iter().enumerate() {
+        let row_y = (row_top + i as f32 * layout.item_h) as i32;
+        if item.label == "-" {
+            let line_y = row_y + (layout.item_h / 2.0) as i32;
+            for x in (origin + pad)..(origin + panel_w as i32 - pad) {
+                if (0..width as i32).contains(&x) && (0..height as i32).contains(&line_y) {
+                    let idx = ((line_y * width as i32 + x) * 4) as usize;
+                    blend_px(&mut rgba, idx, theme.divider, 1.0);
+                }
+            }
+            continue;
+        }
+        let text_y = row_y + text_dy;
+        let label = shape_chrome_line(font_system, ctx, &item.label, foreground, false, true);
+        let pos = (origin + pad, text_y);
+        composite_buffer(font_system, swash_cache, &mut rgba, canvas, &label, pos, foreground);
+
+        // A submenu parent shows a chevron; a leaf shows its shortcut, if any.
+        let trailing = if item.has_children() {
+            Some("\u{203a}".to_string())
+        } else if !item.shortcut.is_empty() {
+            Some(item.shortcut.clone())
+        } else {
+            None
+        };
+        if let Some(text) = trailing {
+            let buf = shape_chrome_line(font_system, ctx, &text, muted, false, true);
+            let buf_w = buffer_width(&buf).ceil() as i32;
+            let pos = (origin + panel_w as i32 - buf_w - pad, text_y);
+            composite_buffer(font_system, swash_cache, &mut rgba, canvas, &buf, pos, muted);
+        }
+    }
+
+    // Snap the overlay to whole pixels. The texture is 1:1 texel-to-pixel, so a
+    // fractional placement (origin_x/top derive from fractional cell sizes) would
+    // make the shared linear sampler smear every baked glyph, blurring the menu.
+    DropdownImage {
+        height,
+        rgba,
+        width,
+        x: (layout.origin_x - margin).round(),
+        y: (layout.top - margin).round(),
+    }
 }
 
 /// The cosmic-text font family for a configured family name, defaulting to the
@@ -1841,6 +2122,115 @@ const ANSI_COLORS: [(u8, u8, u8); 16] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_menu_chrome(selected: Option<usize>) -> crate::chrome::TopChrome {
+        use crate::chrome::{Menu, MenuItem, MenuStyle, TabLabel, TopChrome};
+        let leaf = |label: &str, shortcut: &str| MenuItem {
+            children: Vec::new(),
+            label: label.into(),
+            shortcut: shortcut.into(),
+        };
+        TopChrome {
+            active_tab: 0,
+            menu_style: MenuStyle::Modern,
+            menus: vec![Menu {
+                title: "Menu".into(),
+                items: vec![
+                    leaf("New Tab", "Ctrl-Shift-T"),
+                    leaf("Split Vertical", ""),
+                    MenuItem {
+                        children: vec![leaf("Dark", ""), leaf("Light", "")],
+                        label: "Theme".into(),
+                        shortcut: String::new(),
+                    },
+                ],
+            }],
+            open_menu: Some(0),
+            open_submenu: None,
+            selected_item: selected,
+            selected_subitem: None,
+            tabs: vec![TabLabel {
+                title: "Terminal 1".into(),
+            }],
+        }
+    }
+
+    fn sample_font_ctx() -> FontCtx<'static> {
+        FontCtx {
+            cell_h: 18.0,
+            cell_w: 9.0,
+            family: None,
+            font_size: 14.0,
+            line_height: 18.0,
+        }
+    }
+
+    #[test]
+    fn test_dropdown_rgba_is_an_elevated_rounded_card() {
+        let mut font_system = FontSystem::new();
+        let mut swash = SwashCache::new();
+        let theme = Theme::dark();
+        let ctx = sample_font_ctx();
+        let chrome = sample_menu_chrome(None);
+
+        let image = dropdown_rgba(&mut font_system, &mut swash, &ctx, &theme, &chrome, 1000.0)
+            .expect("menu is open");
+        let pixel = |x: u32, y: u32| {
+            let i = ((y * image.width + x) * 4) as usize;
+            (
+                image.rgba[i],
+                image.rgba[i + 1],
+                image.rgba[i + 2],
+                image.rgba[i + 3],
+            )
+        };
+        let margin = DROPDOWN_SHADOW as u32;
+
+        // The outer corner is fully transparent: the panel does not fill the
+        // shadow margin (this is a floating card, not a full-bleed rectangle).
+        assert_eq!(pixel(0, 0).3, 0);
+        // The panel's own top-left corner is rounded away (not fully opaque)...
+        assert!(pixel(margin, margin).3 < 255);
+        // ...while the top padding band is the opaque elevated surface color,
+        // proving both the lighter menu_bg and the vertical padding are applied.
+        let (r, g, b, a) = pixel(image.width / 2, margin + 2);
+        assert_eq!((r, g, b, a), (theme.menu_bg.r, theme.menu_bg.g, theme.menu_bg.b, 255));
+    }
+
+    #[test]
+    fn test_dropdown_overlay_is_pixel_snapped() {
+        // Real displays have fractional cell metrics; without snapping, the
+        // overlay lands on sub-pixel boundaries and the linear sampler blurs it.
+        let mut font_system = FontSystem::new();
+        let mut swash = SwashCache::new();
+        let theme = Theme::dark();
+        let ctx = FontCtx {
+            cell_h: 19.4,
+            cell_w: 9.6,
+            family: None,
+            font_size: 14.0,
+            line_height: 19.4,
+        };
+        let chrome = sample_menu_chrome(None);
+        let image = dropdown_rgba(&mut font_system, &mut swash, &ctx, &theme, &chrome, 1003.0)
+            .expect("menu is open");
+        assert_eq!(image.x.fract(), 0.0, "overlay x must be whole pixels");
+        assert_eq!(image.y.fract(), 0.0, "overlay y must be whole pixels");
+    }
+
+    #[test]
+    fn test_rounded_rect_sdf_signs() {
+        let rect = (0.0, 0.0, 100.0, 100.0);
+        let radius = 20.0;
+        // The center is well inside (negative distance).
+        assert!(rounded_rect_sdf(50.0, 50.0, rect, radius) < 0.0);
+        // A point far outside is positive.
+        assert!(rounded_rect_sdf(150.0, 50.0, rect, radius) > 0.0);
+        // The very corner of the bounding box lies outside the rounded shape...
+        assert!(rounded_rect_sdf(1.0, 1.0, rect, radius) > 0.0);
+        // ...while the middle of an edge, the same depth in, is inside.
+        assert!(rounded_rect_sdf(1.0, 50.0, rect, radius) < 0.0);
+    }
 
     #[test]
     fn test_xterm_256_first_16_are_ansi() {

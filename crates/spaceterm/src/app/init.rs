@@ -45,12 +45,16 @@ impl App {
             let _ = gtk::init();
         }
 
+        // Only request a transparent (alpha-channel) window when the user actually
+        // wants translucency. A needlessly transparent window is recomposited (and
+        // often blurred) by many compositors even when its content is fully opaque.
+        let want_transparency = self.config.opacity < 1.0;
         let window = Arc::new(
             event_loop
                 .create_window(
                     WindowAttributes::default()
                         .with_title("SpaceTerm")
-                        .with_transparent(true)
+                        .with_transparent(want_transparency)
                         .with_inner_size(winit::dpi::LogicalSize::new(
                             DEFAULT_COLS * APPROX_CELL_WIDTH,
                             DEFAULT_ROWS * APPROX_CELL_HEIGHT,

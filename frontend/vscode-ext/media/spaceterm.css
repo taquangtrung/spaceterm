@@ -1,0 +1,250 @@
+/* SpaceTerm — Modern Minimal Stylesheet */
+
+:root {
+  --border-radius-lg: 12px;
+  --border-radius-md: 8px;
+  --border-radius-sm: 4px;
+  --transition-smooth: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 20px rgba(0, 0, 0, 0.12);
+  --shadow-lg: 0 8px 30px rgba(0, 0, 0, 0.24);
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: row;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background-color: var(--vscode-editor-background);
+  color: var(--vscode-editor-foreground);
+  font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif);
+}
+
+/* 1. Terminal Layout and Container */
+#terminal-container {
+  flex: 1;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  background-color: var(--vscode-terminal-background, var(--vscode-editor-background));
+  padding: 12px;
+  box-sizing: border-box;
+}
+
+#terminal {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* 2. Blocks Container (Rich Output panel) */
+#blocks-container {
+  width: 450px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--vscode-panel-border, var(--vscode-widget-border, rgba(128, 128, 128, 0.2)));
+  background-color: var(--vscode-sideBar-background, var(--vscode-editor-background));
+  box-sizing: border-box;
+}
+
+/* Elegant Blocks Header */
+.blocks-header {
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-widget-border, rgba(128, 128, 128, 0.15)));
+  background-color: var(--vscode-sideBarSectionHeader-background, rgba(128, 128, 128, 0.03));
+}
+
+.blocks-title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--vscode-sideBarTitle-foreground, var(--vscode-descriptionForeground, rgba(255, 255, 255, 0.7)));
+}
+
+.blocks-subtitle {
+  font-size: 10px;
+  color: var(--vscode-descriptionForeground, rgba(128, 128, 128, 0.6));
+}
+
+#blocks {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  scroll-behavior: smooth;
+}
+
+/* Responsive side-by-side or stacked layout */
+@media (max-width: 900px) {
+  body {
+    flex-direction: column;
+  }
+  #terminal-container {
+    height: 55%;
+    flex: none;
+  }
+  #blocks-container {
+    width: 100%;
+    height: 45%;
+    border-left: none;
+    border-top: 1px solid var(--vscode-panel-border, var(--vscode-widget-border, rgba(128, 128, 128, 0.2)));
+  }
+}
+
+/* 3. Modern Minimal Scrollbars */
+#blocks::-webkit-scrollbar {
+  width: 10px;
+}
+
+#blocks::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+#blocks::-webkit-scrollbar-thumb {
+  background: var(--vscode-scrollbarSlider-background, rgba(128, 128, 128, 0.25));
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+#blocks::-webkit-scrollbar-thumb:hover {
+  background: var(--vscode-scrollbarSlider-hoverBackground, rgba(128, 128, 128, 0.45));
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+#blocks::-webkit-scrollbar-thumb:active {
+  background: var(--vscode-scrollbarSlider-activeBackground, rgba(128, 128, 128, 0.6));
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+/* 4. Beautiful Cards for Rich Output Blocks */
+.spaceterm-text,
+.spaceterm-html,
+.spaceterm-sandbox,
+.spaceterm-image,
+.spaceterm-latex,
+.spaceterm-link {
+  display: block;
+  background-color: var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.06));
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.18));
+  border-radius: var(--border-radius-md);
+  padding: 14px;
+  margin: 0;
+  box-sizing: border-box;
+  max-width: 100%;
+  box-shadow: var(--shadow-sm);
+  transition: var(--transition-smooth);
+}
+
+/* Modern Card Hover/Focus FX */
+.spaceterm-text:hover,
+.spaceterm-html:hover,
+.spaceterm-sandbox:hover,
+.spaceterm-image:hover,
+.spaceterm-latex:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+  border-color: var(--vscode-focusBorder, rgba(0, 122, 204, 0.45));
+  background-color: var(--vscode-editor-hoverHighlightBackground, rgba(128, 128, 128, 0.08));
+}
+
+/* 5. Typography and Elements styling */
+
+/* Plain text fallback block */
+.spaceterm-text {
+  font-family: var(--vscode-editor-font-family, "JetBrains Mono", "Fira Code", Monaco, monospace);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--vscode-editor-foreground);
+}
+
+/* Link block styling */
+.spaceterm-link {
+  display: inline-block;
+  color: var(--vscode-textLink-foreground, #3794ff);
+  text-decoration: none;
+  font-weight: 500;
+  padding: 6px 12px;
+  border-radius: var(--border-radius-sm);
+  background-color: rgba(55, 148, 255, 0.08);
+  font-size: 13px;
+  width: fit-content;
+}
+
+.spaceterm-link:hover {
+  background-color: rgba(55, 148, 255, 0.16);
+  color: var(--vscode-textLink-activeForeground, #3794ff);
+  text-decoration: none;
+}
+
+/* Image styling */
+.spaceterm-image {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  border-radius: var(--border-radius-sm);
+  margin: 0 auto;
+}
+
+/* HTML block styling */
+.spaceterm-html {
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* Sandbox IFrame styling */
+.spaceterm-sandbox {
+  width: 100%;
+  min-height: 220px;
+  border: none;
+  background-color: #ffffff; /* fallback */
+  color: #000000;
+  border-radius: var(--border-radius-sm);
+  color-scheme: dark light;
+}
+
+/* Latex block styling */
+.spaceterm-latex {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 16px;
+  overflow-x: auto;
+}
+
+/* xterm terminal styling tweaks */
+.xterm-viewport::-webkit-scrollbar {
+  width: 10px;
+}
+
+.xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.xterm-viewport::-webkit-scrollbar-thumb {
+  background: var(--vscode-scrollbarSlider-background, rgba(128, 128, 128, 0.25));
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: var(--vscode-scrollbarSlider-hoverBackground, rgba(128, 128, 128, 0.45));
+}

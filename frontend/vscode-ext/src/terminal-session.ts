@@ -114,6 +114,9 @@ function renderHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
   const styleUri = webview.asWebviewUri(
     vscode.Uri.joinPath(extensionUri, "media", "xterm.css"),
   );
+  const customStyleUri = webview.asWebviewUri(
+    vscode.Uri.joinPath(extensionUri, "media", "spaceterm.css"),
+  );
   const csp = [
     "default-src 'none'",
     `style-src ${webview.cspSource} 'unsafe-inline'`,
@@ -128,10 +131,19 @@ function renderHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
     <meta charset="utf-8" />
     <meta http-equiv="Content-Security-Policy" content="${csp}" />
     <link rel="stylesheet" href="${styleUri}" />
+    <link rel="stylesheet" href="${customStyleUri}" />
   </head>
   <body>
-    <div id="terminal"></div>
-    <div id="blocks"></div>
+    <div id="terminal-container">
+      <div id="terminal"></div>
+    </div>
+    <div id="blocks-container">
+      <div class="blocks-header">
+        <span class="blocks-title">Rich Output</span>
+        <span class="blocks-subtitle">SpaceTerm Blocks</span>
+      </div>
+      <div id="blocks"></div>
+    </div>
     <script src="${scriptUri}"></script>
   </body>
 </html>`;
