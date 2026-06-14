@@ -210,6 +210,13 @@ pub struct App {
     pub(crate) settings_view: Option<SettingsView>,
     /// Which tab is shown; index into [`Self::tabs`].
     pub(crate) active_tab: usize,
+    /// Tab indices in most-recently-used order (front = the current tab after a
+    /// deliberate switch). Drives the recency tab commands.
+    pub(crate) tab_mru: Vec<usize>,
+    /// Cursor into [`Self::tab_mru`] while a recency walk is in progress, so
+    /// repeated recency commands step through usage order without reshuffling it.
+    /// `None` once a deliberate switch ends the walk.
+    pub(crate) mru_walk: Option<usize>,
     /// The open menu/dropdown (index into the chrome's menu list), or `None`.
     pub(crate) open_menu: Option<usize>,
     /// Index of the open submenu's parent within the open menu's items, or `None`.
@@ -325,6 +332,8 @@ impl App {
             selection: None,
             settings_view: None,
             active_tab: 0,
+            tab_mru: vec![0],
+            mru_walk: None,
             open_menu: None,
             open_submenu: None,
             selected_item: None,
@@ -549,6 +558,7 @@ impl App {
         self.modes.insert(id, Mode::default());
         self.tabs.push(Tab::with_root(id));
         self.active_tab = self.tabs.len() - 1;
+        self.touch_mru(self.active_tab);
         self.close_menu();
         self.last_tile_layout = None;
         if self.renderer.is_some() {
@@ -558,11 +568,20 @@ impl App {
         self.update_window_title();
     }
 
-    /// Switch the visible tab to `index`.
+    /// Switch the visible tab to `index` as a deliberate selection: record it as
+    /// most-recently-used (ending any recency walk) and show it.
     pub(crate) fn switch_tab(&mut self, index: usize) {
         if index >= self.tabs.len() || index == self.active_tab {
             return;
         }
+        self.touch_mru(index);
+        self.activate_tab(index);
+    }
+
+    /// Make `index` the visible tab without touching the MRU order. Shared by
+    /// deliberate switches ([`Self::switch_tab`]) and recency walks
+    /// ([`Self::recent_tab`]).
+    fn activate_tab(&mut self, index: usize) {
         self.active_tab = index;
         self.selection = None;
         // Force a tile reposition so background-tab WebViews are hidden and the
@@ -575,7 +594,15 @@ impl App {
         self.update_window_title();
     }
 
-    /// Cycle to the next (`forward`) or previous tab, wrapping around.
+    /// Move `index` to the front of the most-recently-used order (inserting it if
+    /// new) and end any in-progress recency walk.
+    fn touch_mru(&mut self, index: usize) {
+        self.tab_mru.retain(|&i| i != index);
+        self.tab_mru.insert(0, index);
+        self.mru_walk = None;
+    }
+
+    /// Cycle to the next (`forward`) or previous tab by position, wrapping around.
     pub(crate) fn cycle_tab(&mut self, forward: bool) {
         let count = self.tabs.len();
         if count <= 1 {
@@ -587,6 +614,32 @@ impl App {
             (self.active_tab + count - 1) % count
         };
         self.switch_tab(next);
+    }
+
+    /// Switch tabs in most-recently-used order: `forward` steps toward more
+    /// recently used, otherwise toward less recently used, wrapping around. The
+    /// MRU order is held still across consecutive calls (a "walk") so the user can
+    /// step back and forth through usage history; the next deliberate switch ends
+    /// the walk and re-seeds the order from the chosen tab.
+    pub(crate) fn recent_tab(&mut self, forward: bool) {
+        let count = self.tabs.len();
+        if count <= 1 {
+            return;
+        }
+        // Guard against any drift from tab open/close bookkeeping: a malformed
+        // order is rebuilt with the current tab most-recent.
+        if self.tab_mru.len() != count {
+            self.tab_mru = (0..count).collect();
+            self.touch_mru(self.active_tab);
+        }
+        let cursor = self.mru_walk.unwrap_or(0);
+        let next = if forward {
+            (cursor + count - 1) % count
+        } else {
+            (cursor + 1) % count
+        };
+        self.mru_walk = Some(next);
+        self.activate_tab(self.tab_mru[next]);
     }
 
     /// Close tab `index`, dropping all its panes. The last tab is never closed.
@@ -606,6 +659,15 @@ impl App {
             self.active_tab -= 1;
         }
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+        // Drop the closed tab from the MRU order and shift the indices above it
+        // down, then re-seed the current tab as most-recent.
+        self.tab_mru.retain(|&i| i != index);
+        for i in self.tab_mru.iter_mut() {
+            if *i > index {
+                *i -= 1;
+            }
+        }
+        self.touch_mru(self.active_tab);
         self.close_menu();
         self.last_tile_layout = None;
         if self.renderer.is_some() {
@@ -753,6 +815,12 @@ impl App {
             }
             "prev_tab" => {
                 self.cycle_tab(false);
+            }
+            "recent_tab_back" => {
+                self.recent_tab(false);
+            }
+            "recent_tab_forward" => {
+                self.recent_tab(true);
             }
             "toggle_mode" => {
                 let mode = self.modes.get(&focused).copied().unwrap_or_default();
@@ -1551,5 +1619,81 @@ mod tests {
             &cfg,
         );
         assert_eq!(bar.notice.as_deref(), Some("oops"));
+    }
+
+    /// An app with `n` empty tabs (no panes/PTYs), active tab 0, MRU `[0, 1, ..]`.
+    fn app_with_tabs(n: usize) -> App {
+        let mut app = App::new();
+        for i in 1..n {
+            app.tabs.push(Tab::with_root(PaneId(i as u64)));
+        }
+        app.tab_mru = (0..n).collect();
+        app
+    }
+
+    #[test]
+    fn test_switch_tab_moves_to_front_of_mru() {
+        let mut app = app_with_tabs(3);
+        app.switch_tab(2);
+        assert_eq!(app.active_tab, 2);
+        assert_eq!(app.tab_mru, vec![2, 0, 1]);
+        app.switch_tab(1);
+        assert_eq!(app.tab_mru, vec![1, 2, 0]);
+        assert_eq!(app.mru_walk, None);
+    }
+
+    #[test]
+    fn test_recent_tab_walks_backward_and_forward_without_reshuffling() {
+        let mut app = app_with_tabs(3);
+        app.switch_tab(2);
+        app.switch_tab(1); // MRU now [1, 2, 0], current tab 1.
+
+        // Backward steps toward less-recently-used, holding the order still.
+        app.recent_tab(false);
+        assert_eq!(app.active_tab, 2);
+        assert_eq!(app.mru_walk, Some(1));
+        assert_eq!(app.tab_mru, vec![1, 2, 0]);
+        app.recent_tab(false);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.mru_walk, Some(2));
+
+        // Forward steps back toward more-recently-used.
+        app.recent_tab(true);
+        assert_eq!(app.active_tab, 2);
+        assert_eq!(app.tab_mru, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn test_deliberate_switch_ends_walk_and_reseeds_mru() {
+        let mut app = app_with_tabs(3);
+        app.switch_tab(1); // MRU [1, 0, 2], current tab 1.
+        app.recent_tab(false); // Walk to tab 0 (a less-recent tab).
+        assert_eq!(app.active_tab, 0);
+        assert!(app.mru_walk.is_some());
+        // A deliberate switch to a different tab ends the walk and re-seeds.
+        app.switch_tab(2);
+        assert_eq!(app.mru_walk, None);
+        assert_eq!(app.tab_mru[0], 2);
+    }
+
+    #[test]
+    fn test_recent_tab_is_noop_with_one_tab() {
+        let mut app = App::new();
+        app.recent_tab(false);
+        app.recent_tab(true);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.mru_walk, None);
+    }
+
+    #[test]
+    fn test_close_tab_compacts_mru_indices() {
+        let mut app = app_with_tabs(3);
+        app.switch_tab(2); // MRU [2, 0, 1], current tab 2.
+        app.close_tab(0); // Tabs above the closed index shift down by one.
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab, 1);
+        // The closed index is gone and 1->0, 2->1; current tab re-seeded to front.
+        assert_eq!(app.tab_mru, vec![1, 0]);
+        assert_eq!(app.mru_walk, None);
     }
 }

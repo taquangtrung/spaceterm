@@ -104,6 +104,14 @@ fn builtin_commands() -> Vec<PaletteEntry> {
             action: "prev_tab".into(),
         },
         PaletteEntry {
+            label: "Recent Tab (Backward)".into(),
+            action: "recent_tab_back".into(),
+        },
+        PaletteEntry {
+            label: "Recent Tab (Forward)".into(),
+            action: "recent_tab_forward".into(),
+        },
+        PaletteEntry {
             label: "Toggle Mode (Insert/Normal)".into(),
             action: "toggle_mode".into(),
         },
