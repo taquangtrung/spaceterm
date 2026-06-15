@@ -568,6 +568,32 @@ impl GpuRenderer {
         (self.cols.max(1), self.rows.max(1))
     }
 
+    /// Acquire the next swapchain texture, recovering a stale surface in place.
+    ///
+    /// On `Outdated`/`Lost` (after a resize, GPU reset, or a monitor sleep/wake)
+    /// the surface configuration no longer matches its swapchain. We reconfigure
+    /// and retry once so this frame paints a valid image, rather than leaving the
+    /// freshly reconfigured swapchain showing uninitialized garbage. Transient
+    /// states (`Timeout`, `Occluded`) and validation errors skip the frame; the
+    /// previously presented frame stays on screen until the next redraw.
+    fn acquire_surface_texture(&mut self) -> Option<wgpu::SurfaceTexture> {
+        match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => Some(texture),
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.config);
+                match self.surface.get_current_texture() {
+                    wgpu::CurrentSurfaceTexture::Success(texture)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => Some(texture),
+                    _ => None,
+                }
+            }
+            wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Validation => None,
+        }
+    }
+
     /// Render multiple panes to the surface. Each `PaneView` specifies a grid
     /// and its viewport rect. Pane dividers are drawn between adjacent panes.
     /// When `status` is set, a status bar is drawn across the bottom cell row;
@@ -583,13 +609,9 @@ impl GpuRenderer {
         bell_active: bool,
         images: &[ImagePlacement],
     ) {
-        let surface_texture = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) => t,
-            wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            _ => {
-                self.surface.configure(&self.device, &self.config);
-                return;
-            }
+        let surface_texture = match self.acquire_surface_texture() {
+            Some(texture) => texture,
+            None => return,
         };
 
         let view = surface_texture

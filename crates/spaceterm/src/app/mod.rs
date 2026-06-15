@@ -1517,6 +1517,14 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+                // Regaining focus (e.g. after a screen sleep/wake or unlock) may
+                // follow a surface loss; repaint so the renderer reconfigures and
+                // presents a valid frame instead of leaving stale GPU contents.
+                if focused {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
             }
 
             WindowEvent::ThemeChanged(theme) => {
@@ -1533,6 +1541,14 @@ impl ApplicationHandler for App {
                             window.request_redraw();
                         }
                     }
+                }
+            }
+
+            // The window became visible again (unminimized, uncovered, or the
+            // screen woke). Repaint so a surface lost while hidden is recovered.
+            WindowEvent::Occluded(false) => {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
                 }
             }
 
