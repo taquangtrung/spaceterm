@@ -35,9 +35,9 @@ use crate::model::input::{self, Action, KeyCode, PendingPrefix, WindowKeymap};
 use crate::model::layout::{Direction, FocusDir, PaneId, Rect, Tab};
 use crate::model::mode::Mode;
 use crate::model::palette::Palette;
+use crate::model::settings_page::{ChoiceOption, SettingsField, SettingsPage};
 use crate::session::Session;
 use crate::terminal::pane::Pane;
-use crate::terminal::settings_view::{SettingsMsg, SettingsView};
 use crate::terminal::webview::WebViewManager;
 use spaceterm_render::renderer::{GpuRenderer, PaneRect};
 use spaceterm_render::{MenuStyle, StatusBar, Theme};
@@ -58,6 +58,15 @@ const ERROR_NOTICE_DURATION: Duration = Duration::from_secs(3);
 /// treated as the shell's boundary ding (e.g. Backspace with nothing to delete,
 /// or Left at the start of the prompt), and its flash is suppressed.
 const EDIT_KEY_BELL_WINDOW: Duration = Duration::from_millis(150);
+
+/// Bounds and step for the settings page's font-size and opacity rows. The
+/// opacity range matches the clamp in [`App::apply_setting`].
+const MIN_FONT_SIZE: f32 = 6.0;
+const MAX_FONT_SIZE: f32 = 72.0;
+const FONT_SIZE_STEP: f32 = 1.0;
+const MIN_OPACITY: f32 = 0.1;
+const MAX_OPACITY: f32 = 1.0;
+const OPACITY_STEP: f32 = 0.05;
 
 const DEFAULT_COLS: u32 = 80;
 const DEFAULT_ROWS: u32 = 24;
@@ -134,6 +143,32 @@ fn status_bar(
     }
 }
 
+/// The theme dropdown choices for the settings page: the three built-ins, then
+/// each `themes/*.kdl` file by name. Mirrors the values [`ThemeSetting`] accepts.
+fn settings_theme_options() -> Vec<ChoiceOption> {
+    let mut options = vec![
+        ChoiceOption {
+            label: "Dark".into(),
+            value: "dark".into(),
+        },
+        ChoiceOption {
+            label: "Light".into(),
+            value: "light".into(),
+        },
+        ChoiceOption {
+            label: "Auto (follow system)".into(),
+            value: "auto".into(),
+        },
+    ];
+    for name in crate::config::available_themes() {
+        options.push(ChoiceOption {
+            label: name.clone(),
+            value: name,
+        });
+    }
+    options
+}
+
 fn winit_key_to_code(key: &winit::keyboard::Key) -> KeyCode {
     match key.as_ref() {
         Key::Character(c) => KeyCode::Char(c.chars().next().unwrap_or('\0')),
@@ -206,8 +241,9 @@ pub struct App {
     pub(crate) renderer: Option<GpuRenderer>,
     pub(crate) search_query: Option<String>,
     pub(crate) selection: Option<Selection>,
-    /// The open full-window settings page (a child WebView), or `None`.
-    pub(crate) settings_view: Option<SettingsView>,
+    /// The open full-window settings page (a native text-mode overlay), or
+    /// `None`. Rendered by [`render`] as a terminal grid covering the window.
+    pub(crate) settings_page: Option<SettingsPage>,
     /// Which tab is shown; index into [`Self::tabs`].
     pub(crate) active_tab: usize,
     /// Tab indices in most-recently-used order (front = the current tab after a
@@ -330,7 +366,7 @@ impl App {
             renderer: None,
             search_query: None,
             selection: None,
-            settings_view: None,
+            settings_page: None,
             active_tab: 0,
             tab_mru: vec![0],
             mru_walk: None,
@@ -433,7 +469,9 @@ impl App {
             return;
         };
 
-        let title = if let Some(palette) = &self.palette {
+        let title = if self.settings_page.is_some() {
+            "SpaceTerm - Settings".to_string()
+        } else if let Some(palette) = &self.palette {
             let selected = palette.selected_action().unwrap_or("");
             format!("SpaceTerm - palette: > {} [{}]", palette.query, selected)
         } else if self.search_query.is_some() || self.pending == PendingPrefix::SearchInput {
@@ -924,76 +962,157 @@ impl App {
     }
 
     /// Open the full-window settings page, dismissing any open menu or palette
-    /// first. A no-op if it is already open or the window/renderer are not ready.
+    /// first. A no-op if it is already open.
     pub(crate) fn open_settings(&mut self) {
-        if self.settings_view.is_some() {
+        if self.settings_page.is_some() {
             return;
         }
         self.close_menu();
         self.palette = None;
-        let opened = match (&self.window, &self.renderer) {
-            (Some(window), Some(renderer)) => {
-                Some(SettingsView::open(window, &self.config, renderer.theme()))
-            }
-            _ => None,
-        };
-        match opened {
-            Some(Ok(view)) => {
-                self.settings_view = Some(view);
-                self.dirty = true;
-            }
-            Some(Err(e)) => {
-                eprintln!("spaceterm: settings page error: {e}");
-                self.set_error("settings unavailable");
-            }
-            None => {}
+        self.settings_page = Some(self.build_settings_page());
+        // The page covers the window; hide block tiles so they don't show over it.
+        self.webview_mgr.hide_all();
+        self.dirty = true;
+    }
+
+    /// Side effects of leaving the settings page: re-show block tiles and redraw.
+    fn on_settings_closed(&mut self) {
+        // The overlay is gone; force block tiles to re-show and re-position.
+        self.last_tile_layout = None;
+        self.dirty = true;
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
-    /// Close the settings page (dropping its WebView) and restore the panes.
-    pub(crate) fn close_settings(&mut self) {
-        if self.settings_view.take().is_some() {
-            // The overlay is gone; force block tiles to re-show and re-position.
-            self.last_tile_layout = None;
-            self.dirty = true;
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
-        }
+    /// Build the settings page from the live config: one row per editable setting,
+    /// pre-filled with the current value.
+    fn build_settings_page(&self) -> SettingsPage {
+        let theme_options = settings_theme_options();
+        let theme_value = self.config.theme.as_value();
+        let theme_index = theme_options
+            .iter()
+            .position(|o| o.value == theme_value)
+            .unwrap_or(0);
+
+        let menu_options = vec![
+            ChoiceOption {
+                label: "Modern".into(),
+                value: "modern".into(),
+            },
+            ChoiceOption {
+                label: "Classic".into(),
+                value: "classic".into(),
+            },
+        ];
+        let menu_index = match self.config.menu_style {
+            MenuStyle::Modern => 0,
+            MenuStyle::Classic => 1,
+        };
+
+        let status = &self.config.status_bar;
+        let fields = vec![
+            SettingsField::choice("theme", "Theme", theme_options, theme_index)
+                .in_section("Appearance")
+                .with_note("Color palette for the terminal and chrome"),
+            SettingsField::choice("menu_style", "Menu style", menu_options, menu_index)
+                .with_note("Modern hamburger menu or a classic menubar"),
+            SettingsField::toggle("status.enabled", "Show status bar", status.enabled)
+                .in_section("Status bar"),
+            SettingsField::toggle("status.show_mode", "Show mode indicator", status.show_mode),
+            SettingsField::toggle("status.show_title", "Show pane title", status.show_title),
+            SettingsField::toggle(
+                "status.show_branding",
+                "Show branding",
+                status.show_branding,
+            ),
+            SettingsField::text(
+                "font_family",
+                "Font family",
+                self.config.font_family.clone().unwrap_or_default(),
+            )
+            .in_section("Text")
+            .with_note("Applied on restart"),
+            SettingsField::number(
+                "font_size",
+                "Font size",
+                self.config.font_size,
+                MIN_FONT_SIZE,
+                MAX_FONT_SIZE,
+                FONT_SIZE_STEP,
+                0,
+            )
+            .with_note("Applied on restart"),
+            SettingsField::number(
+                "opacity",
+                "Opacity",
+                self.config.opacity,
+                MIN_OPACITY,
+                MAX_OPACITY,
+                OPACITY_STEP,
+                2,
+            )
+            .with_note("Applied on restart"),
+        ];
+        SettingsPage::new(fields)
     }
 
-    /// Drain and apply edits queued by the settings page, persisting the config
-    /// when anything changed and closing the page on a close request.
-    pub(crate) fn apply_settings(&mut self) {
-        let Some(view) = &self.settings_view else {
-            return;
-        };
-        let messages = view.drain();
-        if messages.is_empty() {
-            return;
-        }
-
-        let mut should_close = false;
-        let mut changed = false;
-        for message in messages {
-            match message {
-                SettingsMsg::Close => should_close = true,
-                SettingsMsg::Set(set) => changed |= self.apply_setting(&set.key, &set.value),
+    /// Route one key to the open settings page. Returns whether the page should
+    /// stay open (`false` on Enter/Escape). Each value change is applied and
+    /// persisted immediately, mirroring the WebView's live preview.
+    fn handle_settings_input(&mut self, page: &mut SettingsPage, key: &Key) -> bool {
+        match key {
+            Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter) => return false,
+            Key::Named(NamedKey::ArrowUp) => page.move_up(),
+            Key::Named(NamedKey::ArrowDown) => page.move_down(),
+            Key::Named(NamedKey::ArrowLeft) => {
+                if let Some((k, v)) = page.adjust(false) {
+                    self.apply_settings_edit(&k, &v);
+                }
             }
+            Key::Named(NamedKey::ArrowRight) => {
+                if let Some((k, v)) = page.adjust(true) {
+                    self.apply_settings_edit(&k, &v);
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some((k, v)) = page.pop_char() {
+                    self.apply_settings_edit(&k, &v);
+                }
+            }
+            // winit reports the space bar as a named key, not a character. On a
+            // text row it inserts a space (font names have them); elsewhere it
+            // flips the toggle or steps the control.
+            Key::Named(NamedKey::Space) => {
+                let edit = if page.selected_is_text() {
+                    page.push_char(' ')
+                } else {
+                    page.adjust(true)
+                };
+                if let Some((k, v)) = edit {
+                    self.apply_settings_edit(&k, &v);
+                }
+            }
+            Key::Character(chars) => {
+                for ch in chars.chars() {
+                    if let Some((k, v)) = page.push_char(ch) {
+                        self.apply_settings_edit(&k, &v);
+                    }
+                }
+            }
+            _ => {}
         }
+        true
+    }
 
-        if changed {
+    /// Apply one settings edit to the live config and persist it.
+    fn apply_settings_edit(&mut self, key: &str, value: &str) {
+        if self.apply_setting(key, value) {
             if let Err(e) = self.config.save() {
                 eprintln!("spaceterm: could not save settings: {e}");
             }
-            self.dirty = true;
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
         }
-        if should_close {
-            self.close_settings();
-        }
+        self.dirty = true;
     }
 
     /// Apply one settings edit to the live config and perform any renderer or
@@ -1084,9 +1203,6 @@ impl ApplicationHandler for App {
                     if self.renderer.is_some() {
                         self.resize_all_panes();
                     }
-                    if let Some(view) = &self.settings_view {
-                        view.resize(size.width, size.height);
-                    }
                     self.dirty = true;
                     if let Some(window) = &self.window {
                         window.request_redraw();
@@ -1114,12 +1230,19 @@ impl ApplicationHandler for App {
                     shift: mods_state.shift_key(),
                 };
 
-                // While the settings page is up it owns input via its WebView; the
-                // page closes itself on Esc, but if focus is elsewhere honor Esc
-                // here too and swallow other keys so they don't reach the PTY.
-                if self.settings_view.is_some() {
-                    if key.code == KeyCode::Escape {
-                        self.close_settings();
+                // While the settings page is up it owns all input: edits apply
+                // live, Enter/Escape close it, and every key is swallowed so none
+                // reaches the PTY.
+                if self.settings_page.is_some() {
+                    let logical = event.logical_key.clone();
+                    let mut page = self.settings_page.take().unwrap();
+                    if self.handle_settings_input(&mut page, &logical) {
+                        self.settings_page = Some(page);
+                    } else {
+                        self.on_settings_closed();
+                    }
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
                     }
                     return;
                 }
@@ -1421,11 +1544,6 @@ impl ApplicationHandler for App {
         #[cfg(target_os = "linux")]
         while gtk::events_pending() {
             gtk::main_iteration_do(false);
-        }
-
-        // The settings page posts edits during the GTK pump above; apply them now.
-        if self.settings_view.is_some() {
-            self.apply_settings();
         }
 
         self.reap_dead_panes();

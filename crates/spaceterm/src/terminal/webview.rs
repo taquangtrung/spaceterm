@@ -197,6 +197,14 @@ impl WebViewManager {
         self.tiles.retain(|key, _| key.pane_id != pane_id);
     }
 
+    /// Hide every tile, e.g. while a full-window overlay (the settings page) is
+    /// up. Tiles are re-shown by the next `reposition_tiles` after it closes.
+    pub fn hide_all(&self) {
+        for slot in self.tiles.values() {
+            let _ = slot.webview.set_visible(false);
+        }
+    }
+
     /// Hide all WebView tiles for a folded block.
     pub fn fold_block(&mut self, pane_id: crate::model::layout::PaneId, block_index: usize) {
         for (key, slot) in self.tiles.iter_mut() {
