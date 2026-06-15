@@ -157,11 +157,13 @@ impl ApplicationHandler for GlyphonBench {
         }))
         .expect("request wgpu adapter");
 
+        let scale_factor = window.scale_factor();
         let mut renderer = GpuRenderer::new(
             surface,
             adapter,
             size.width,
             size.height,
+            scale_factor,
             FontConfig::default(),
             font_load,
         );

@@ -102,6 +102,7 @@ impl WebViewManager {
                 size: wry::dpi::LogicalSize::new(params.width, params.height).into(),
             })
             .with_visible(true)
+            .with_transparent(true)
             .with_navigation_handler(|_url| false);
 
         match entry.trust {

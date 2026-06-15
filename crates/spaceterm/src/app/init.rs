@@ -100,9 +100,18 @@ impl App {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(self.config.font_size),
+            normal_weight: std::env::var("SPACETERM_FONT_WEIGHT")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| self.config.font_weight.clone()),
+            bold_weight: std::env::var("SPACETERM_FONT_WEIGHT_BOLD")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| self.config.font_weight_bold.clone()),
         };
+        let scale_factor = window.scale_factor();
         let mut renderer =
-            GpuRenderer::new(surface, adapter, size.width, size.height, font, font_load);
+            GpuRenderer::new(surface, adapter, size.width, size.height, scale_factor, font, font_load);
 
         let mut initial_theme = match &self.config.theme {
             ThemeSetting::Auto => window

@@ -117,6 +117,8 @@ pub struct Config {
     pub colors: ColorOverrides,
     pub font_family: Option<String>,
     pub font_size: f32,
+    pub font_weight: Option<String>,
+    pub font_weight_bold: Option<String>,
     pub keybindings: HashMap<String, HashMap<String, String>>,
     /// Tabbar menu presentation: a modern hamburger dropdown or a classic menubar.
     pub menu_style: MenuStyle,
@@ -232,6 +234,10 @@ struct KdlConfig {
     #[knuffel(child)]
     font_size: Option<KdlFontSize>,
     #[knuffel(child)]
+    font_weight: Option<KdlFontWeight>,
+    #[knuffel(child)]
+    font_weight_bold: Option<KdlFontWeightBold>,
+    #[knuffel(child)]
     keybindings: Option<KdlKeybindings>,
     #[knuffel(child, unwrap(argument))]
     menu_style: Option<String>,
@@ -311,6 +317,18 @@ struct KdlFont {
 
 #[derive(knuffel::Decode)]
 struct KdlFontSize {
+    #[knuffel(argument)]
+    value: String,
+}
+
+#[derive(knuffel::Decode)]
+struct KdlFontWeight {
+    #[knuffel(argument)]
+    value: String,
+}
+
+#[derive(knuffel::Decode)]
+struct KdlFontWeightBold {
     #[knuffel(argument)]
     value: String,
 }
@@ -475,6 +493,14 @@ impl Config {
                 .as_ref()
                 .and_then(|f| f.value.parse().ok())
                 .unwrap_or(15.0),
+            font_weight: kdl
+                .font_weight
+                .map(|w| w.value)
+                .filter(|s| !s.trim().is_empty()),
+            font_weight_bold: kdl
+                .font_weight_bold
+                .map(|w| w.value)
+                .filter(|s| !s.trim().is_empty()),
             keybindings,
             menu_style,
             opacity: kdl
@@ -506,6 +532,18 @@ impl Config {
             "font-size {}\n",
             kdl_string(&self.font_size.to_string())
         ));
+        if let Some(font_weight) = &self.font_weight {
+            out.push_str(&format!(
+                "font-weight {}\n",
+                kdl_string(font_weight)
+            ));
+        }
+        if let Some(bold_weight) = &self.font_weight_bold {
+            out.push_str(&format!(
+                "font-weight-bold {}\n",
+                kdl_string(bold_weight)
+            ));
+        }
         out.push_str(&format!(
             "opacity {}\n",
             kdl_string(&self.opacity.to_string())
@@ -605,6 +643,8 @@ impl Default for Config {
             colors: ColorOverrides::default(),
             font_family: None,
             font_size: 15.0,
+            font_weight: None,
+            font_weight_bold: None,
             keybindings: HashMap::new(),
             menu_style: MenuStyle::default(),
             opacity: 1.0,

@@ -117,6 +117,8 @@ struct FontCtx<'a> {
     family: Option<&'a str>,
     font_size: f32,
     line_height: f32,
+    normal_weight: Option<&'a str>,
+    bold_weight: Option<&'a str>,
 }
 
 /// A rasterized dropdown overlay: its pixels and the surface position to place
@@ -137,6 +139,8 @@ struct DropdownImage {
 pub struct FontConfig {
     pub family: Option<String>,
     pub size: f32,
+    pub normal_weight: Option<String>,
+    pub bold_weight: Option<String>,
 }
 
 impl Default for FontConfig {
@@ -144,6 +148,8 @@ impl Default for FontConfig {
         Self {
             family: None,
             size: DEFAULT_FONT_SIZE,
+            normal_weight: None,
+            bold_weight: None,
         }
     }
 }
@@ -189,6 +195,10 @@ pub struct GpuRenderer {
     font_family: Option<String>,
     font_size: f32,
     line_height: f32,
+    logical_font_size: f32,
+    scale_factor: f64,
+    normal_weight: Option<String>,
+    bold_weight: Option<String>,
     theme: Theme,
     /// Persistent per-pane text buffers, reused across frames so cosmic-text
     /// only re-shapes lines whose content changed (one line per keystroke
@@ -229,6 +239,7 @@ impl GpuRenderer {
         adapter: wgpu::Adapter,
         width: u32,
         height: u32,
+        scale_factor: f64,
         font: FontConfig,
         font_load: FontLoad,
     ) -> Self {
@@ -270,9 +281,11 @@ impl GpuRenderer {
         };
         surface.configure(&device, &config);
 
-        let font_size = font.size;
+        let font_size = font.size * scale_factor as f32;
         let line_height = font_size * (DEFAULT_LINE_HEIGHT / DEFAULT_FONT_SIZE);
         let font_family = font.family;
+        let normal_weight = font.normal_weight;
+        let bold_weight = font.bold_weight;
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         // ColorMode::Accurate makes glyphon convert text colors to linear and
@@ -296,6 +309,7 @@ impl GpuRenderer {
             font_size,
             line_height,
             font_family.as_deref(),
+            normal_weight.as_deref(),
         );
 
         let bg_pipeline = create_bg_pipeline(&device, format);
@@ -331,6 +345,10 @@ impl GpuRenderer {
             font_family,
             font_size,
             line_height,
+            logical_font_size: font.size,
+            scale_factor,
+            normal_weight,
+            bold_weight,
             theme: Theme::default(),
             text_buffers: Vec::new(),
             status_buffer: None,
@@ -438,7 +456,7 @@ impl GpuRenderer {
                     Attrs::new().family(base_family(fam.as_deref())).color(fg)
                 };
                 if span.bold {
-                    attrs = attrs.weight(glyphon::cosmic_text::Weight::BOLD);
+                    attrs = attrs.weight(parse_weight(self.bold_weight.as_deref(), glyphon::cosmic_text::Weight::BOLD));
                 }
                 if span.italic {
                     attrs = attrs.style(glyphon::cosmic_text::Style::Italic);
@@ -554,18 +572,52 @@ impl GpuRenderer {
         (self.cell_width, self.cell_height)
     }
 
-    /// Resize the surface and recompute grid dimensions. Returns `(cols, rows)`.
-    pub fn resize(&mut self, width: u32, height: u32) -> (usize, usize) {
+    /// Resize the surface and recompute grid dimensions. Returns `Some((cols, rows))`
+    /// if the size or scale factor actually changed.
+    pub fn resize(&mut self, width: u32, height: u32, scale_factor: f64) -> Option<(usize, usize)> {
         let width = width.max(1);
         let height = height.max(1);
+        
+        let size_changed = self.config.width != width || self.config.height != height;
+        let scale_changed = (self.scale_factor - scale_factor).abs() > 1e-5;
+        
+        if !size_changed && !scale_changed {
+            return None;
+        }
+        
         self.config.width = width;
         self.config.height = height;
+        self.scale_factor = scale_factor;
         self.surface.configure(&self.device, &self.config);
         self.viewport
             .update(&self.queue, glyphon::Resolution { width, height });
-        self.cols = (width as f32 / self.cell_width).floor() as usize;
-        self.rows = (height as f32 / self.cell_height).floor() as usize;
-        (self.cols.max(1), self.rows.max(1))
+            
+        if scale_changed {
+            // Recompute physical font size and line height
+            self.font_size = self.logical_font_size * scale_factor as f32;
+            self.line_height = self.font_size * (DEFAULT_LINE_HEIGHT / DEFAULT_FONT_SIZE);
+            
+            // Re-measure cell
+            let (cell_width, cell_height) = measure_cell(
+                &mut self.font_system,
+                self.font_size,
+                self.line_height,
+                self.font_family.as_deref(),
+                self.normal_weight.as_deref(),
+            );
+            self.cell_width = cell_width;
+            self.cell_height = cell_height;
+            
+            // Clear existing buffers so they are re-allocated with updated physical metrics next frame
+            self.text_buffers.clear();
+            self.status_buffer = None;
+        }
+        
+        let phys_cell_w = self.cell_width;
+        let phys_cell_h = self.cell_height;
+        self.cols = (width as f32 / phys_cell_w).floor() as usize;
+        self.rows = (height as f32 / phys_cell_h).floor() as usize;
+        Some((self.cols.max(1), self.rows.max(1)))
     }
 
     /// Acquire the next swapchain texture, recovering a stale surface in place.
@@ -673,7 +725,9 @@ impl GpuRenderer {
                 }
             }
 
-            let default_attrs = Attrs::new().family(base_family(fam));
+            let default_attrs = Attrs::new()
+                .family(base_family(fam))
+                .weight(parse_weight(self.normal_weight.as_deref(), glyphon::cosmic_text::Weight::NORMAL));
             let mut rows_data: Vec<(String, glyphon::AttrsList)> = Vec::with_capacity(pane_rows);
 
             let sel = pane.selection;
@@ -706,7 +760,7 @@ impl GpuRenderer {
                         let label_color = Color::rgba(255, 200, 50, 255);
                         let label_attrs = Attrs::new()
                             .family(base_family(fam))
-                            .weight(glyphon::cosmic_text::Weight::BOLD)
+                            .weight(parse_weight(self.bold_weight.as_deref(), glyphon::cosmic_text::Weight::BOLD))
                             .color(label_color);
                         attrs_list.add_span(start..start + 1, &label_attrs);
                     } else if sel_norm.is_some_and(|(sr1, sc1, sr2, sc2)| {
@@ -720,7 +774,9 @@ impl GpuRenderer {
                         let mut attrs = Attrs::new().family(base_family(fam));
 
                         if cell.style.bold {
-                            attrs = attrs.weight(glyphon::cosmic_text::Weight::BOLD);
+                            attrs = attrs.weight(parse_weight(self.bold_weight.as_deref(), glyphon::cosmic_text::Weight::BOLD));
+                        } else {
+                            attrs = attrs.weight(parse_weight(self.normal_weight.as_deref(), glyphon::cosmic_text::Weight::NORMAL));
                         }
                         if cell.style.italic {
                             attrs = attrs.style(glyphon::cosmic_text::Style::Italic);
@@ -838,17 +894,19 @@ impl GpuRenderer {
             // Font attributes
             let accent_attrs = Attrs::new()
                 .family(base_family(fam))
-                .weight(glyphon::cosmic_text::Weight::BOLD)
+                .weight(parse_weight(self.bold_weight.as_deref(), glyphon::cosmic_text::Weight::BOLD))
                 .color(status.accent.to_glyphon());
             let foreground_attrs = Attrs::new()
                 .family(base_family(fam))
+                .weight(parse_weight(self.normal_weight.as_deref(), glyphon::cosmic_text::Weight::NORMAL))
                 .color(self.theme.foreground.to_glyphon());
             let muted_attrs = Attrs::new()
                 .family(base_family(fam))
+                .weight(parse_weight(self.normal_weight.as_deref(), glyphon::cosmic_text::Weight::NORMAL))
                 .color(self.theme.ansi[8].to_glyphon());
             let error_attrs = Attrs::new()
                 .family(base_family(fam))
-                .weight(glyphon::cosmic_text::Weight::BOLD)
+                .weight(parse_weight(self.bold_weight.as_deref(), glyphon::cosmic_text::Weight::BOLD))
                 .color(self.theme.ansi[1].to_glyphon());
 
             // Left padding
@@ -1290,6 +1348,8 @@ impl GpuRenderer {
             family: self.font_family.as_deref(),
             font_size: self.font_size,
             line_height: self.line_height,
+            normal_weight: self.normal_weight.as_deref(),
+            bold_weight: self.bold_weight.as_deref(),
         };
         // Computed sequentially: each borrows the shared font system in turn.
         let parent = dropdown_rgba(
@@ -1347,6 +1407,8 @@ impl GpuRenderer {
             family: self.font_family.as_deref(),
             font_size: self.font_size,
             line_height: self.line_height,
+            normal_weight: self.normal_weight.as_deref(),
+            bold_weight: self.bold_weight.as_deref(),
         };
         shape_chrome_line(&mut self.font_system, &ctx, text, color, bold, proportional)
     }
@@ -1855,7 +1917,9 @@ fn shape_chrome_line(
     };
     let mut attrs = Attrs::new().family(family).color(color);
     if bold {
-        attrs = attrs.weight(glyphon::cosmic_text::Weight::BOLD);
+        attrs = attrs.weight(parse_weight(ctx.bold_weight, glyphon::cosmic_text::Weight::BOLD));
+    } else {
+        attrs = attrs.weight(parse_weight(ctx.normal_weight, glyphon::cosmic_text::Weight::NORMAL));
     }
     buffer.set_text(font_system, text, &attrs, Shaping::Advanced, None);
     buffer.shape_until_scroll(font_system, false);
@@ -2111,16 +2175,43 @@ fn base_family(name: Option<&str>) -> Family<'_> {
     }
 }
 
+fn parse_weight(weight: Option<&str>, default: glyphon::cosmic_text::Weight) -> glyphon::cosmic_text::Weight {
+    match weight {
+        None => default,
+        Some(w) => match w.to_lowercase().as_str() {
+            "thin" | "100" => glyphon::cosmic_text::Weight::THIN,
+            "extra-light" | "extralight" | "200" => glyphon::cosmic_text::Weight::EXTRA_LIGHT,
+            "light" | "300" => glyphon::cosmic_text::Weight::LIGHT,
+            "normal" | "regular" | "400" => glyphon::cosmic_text::Weight::NORMAL,
+            "medium" | "500" => glyphon::cosmic_text::Weight::MEDIUM,
+            "semibold" | "semi-bold" | "600" => glyphon::cosmic_text::Weight::SEMIBOLD,
+            "bold" | "700" => glyphon::cosmic_text::Weight::BOLD,
+            "extra-bold" | "extrabold" | "800" => glyphon::cosmic_text::Weight::EXTRA_BOLD,
+            "black" | "heavy" | "900" => glyphon::cosmic_text::Weight::BLACK,
+            parsed => {
+                if let Ok(num) = parsed.parse::<u16>() {
+                    glyphon::cosmic_text::Weight(num)
+                } else {
+                    default
+                }
+            }
+        }
+    }
+}
+
 fn measure_cell(
     font_system: &mut FontSystem,
     font_size: f32,
     line_height: f32,
     family: Option<&str>,
+    normal_weight: Option<&str>,
 ) -> (f32, f32) {
     let metrics = glyphon::Metrics::new(font_size, line_height);
     let mut buffer = glyphon::Buffer::new(font_system, metrics);
     buffer.set_size(font_system, Some(f32::MAX), Some(line_height));
-    let attrs = Attrs::new().family(base_family(family));
+    let attrs = Attrs::new()
+        .family(base_family(family))
+        .weight(parse_weight(normal_weight, glyphon::cosmic_text::Weight::NORMAL));
     buffer.set_text(font_system, "M", &attrs, Shaping::Advanced, None);
     buffer.shape_until_scroll(font_system, false);
 
@@ -2243,6 +2334,8 @@ mod tests {
             family: None,
             font_size: 14.0,
             line_height: 18.0,
+            normal_weight: None,
+            bold_weight: None,
         }
     }
 
@@ -2294,6 +2387,8 @@ mod tests {
             family: None,
             font_size: 14.0,
             line_height: 19.4,
+            normal_weight: None,
+            bold_weight: None,
         };
         let chrome = sample_menu_chrome(None);
         let image = dropdown_rgba(&mut font_system, &mut swash, &ctx, &theme, &chrome, 1003.0)

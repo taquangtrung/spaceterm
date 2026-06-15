@@ -73,17 +73,29 @@ function getTerminalTheme() {
 }
 
 function getTerminalFontFamily(): string {
-  return getCssVar("--vscode-editor-font-family", "Consolas, 'Courier New', monospace");
+  const terminalFont = getCssVar("--spaceterm-font-family", "");
+  return terminalFont || getCssVar("--vscode-editor-font-family", "Consolas, 'Courier New', monospace");
 }
 
 function getTerminalFontSize(): number {
+  const terminalSize = getCssVar("--spaceterm-font-size", "");
+  if (terminalSize) {
+    const size = parseInt(terminalSize);
+    if (!isNaN(size)) return size;
+  }
   const sizeStr = getCssVar("--vscode-editor-font-size", "13px");
   const size = parseInt(sizeStr);
   return isNaN(size) ? 13 : size;
 }
 
 function getTerminalFontWeight(): "normal" | "bold" | "100" | "200" | "300" | "400" | "500" | "600" | "700" | "800" | "900" {
-  const weight = getCssVar("--vscode-editor-font-weight", "normal");
+  const terminalWeight = getCssVar("--spaceterm-font-weight", "");
+  const weight = terminalWeight || getCssVar("--vscode-editor-font-weight", "normal");
+  return weight as any;
+}
+
+function getTerminalFontWeightBold(): "normal" | "bold" | "100" | "200" | "300" | "400" | "500" | "600" | "700" | "800" | "900" {
+  const weight = getCssVar("--spaceterm-font-weight-bold", "bold");
   return weight as any;
 }
 
@@ -105,6 +117,7 @@ function mount(): void {
     fontFamily: getTerminalFontFamily(),
     fontSize: getTerminalFontSize(),
     fontWeight: getTerminalFontWeight(),
+    fontWeightBold: getTerminalFontWeightBold(),
     lineHeight: 1.45,
     theme: getTerminalTheme(),
     cursorBlink: true,
@@ -133,6 +146,7 @@ function mount(): void {
     term.options.fontFamily = getTerminalFontFamily();
     term.options.fontSize = getTerminalFontSize();
     term.options.fontWeight = getTerminalFontWeight();
+    term.options.fontWeightBold = getTerminalFontWeightBold();
     fitAddon.fit();
   });
   themeObserver.observe(document.body, {

@@ -58,6 +58,9 @@ const ERROR_NOTICE_DURATION: Duration = Duration::from_secs(3);
 /// treated as the shell's boundary ding (e.g. Backspace with nothing to delete,
 /// or Left at the start of the prompt), and its flash is suppressed.
 const EDIT_KEY_BELL_WINDOW: Duration = Duration::from_millis(150);
+/// A bell arriving within this window after window focus changes is treated as a
+/// focus reporting artifact, and its flash is suppressed.
+const FOCUS_CHANGE_BELL_WINDOW: Duration = Duration::from_millis(150);
 
 /// Bounds and step for the settings page's font-size and opacity rows. The
 /// opacity range matches the clamp in [`App::apply_setting`].
@@ -221,6 +224,7 @@ pub struct App {
     pub(crate) image_blocks: Vec<ImageBlock>,
     pub(crate) last_click: Option<(Instant, f32, f32)>,
     pub(crate) last_edit_key: Option<Instant>,
+    pub(crate) last_focus_change: Option<Instant>,
     /// The last char-search (`f`/`F`/`t`/`T`), repeated by `;` and `,`.
     pub(crate) last_find: Option<input::FindChar>,
     pub(crate) last_tile_layout: Option<(usize, usize, u32, u32)>,
@@ -350,6 +354,7 @@ impl App {
             folded_blocks: HashMap::new(),
             last_click: None,
             last_edit_key: None,
+            last_focus_change: None,
             last_find: None,
             image_blocks: Vec::new(),
             last_tile_layout: None,
@@ -763,13 +768,16 @@ impl App {
             }
         }
         if any_bell {
-            // Suppress the visual flash for the shell's prompt-boundary ding
-            // (a navigation/edit key the shell can't act on); keep it for
-            // genuine bells.
+            // Suppress the visual flash for:
+            // 1. The shell's prompt-boundary ding (a navigation/edit key the shell can't act on)
+            // 2. Focus change artifacts (unsolicited input bells on Alt-tab or focus switch)
             let from_edit_key = self
                 .last_edit_key
                 .is_some_and(|t| t.elapsed() < EDIT_KEY_BELL_WINDOW);
-            if from_edit_key {
+            let from_focus_change = self
+                .last_focus_change
+                .is_some_and(|t| t.elapsed() < FOCUS_CHANGE_BELL_WINDOW);
+            if from_edit_key || from_focus_change {
                 self.last_edit_key = None;
             } else {
                 self.flash_bell();
@@ -1043,6 +1051,20 @@ impl App {
                 0,
             )
             .with_note("Applied on restart"),
+            SettingsField::text(
+                "font_weight",
+                "Font weight",
+                self.config.font_weight.clone().unwrap_or_default(),
+            )
+            .in_section("Text")
+            .with_note("e.g. 300, light, normal. Applied on restart"),
+            SettingsField::text(
+                "font_weight_bold",
+                "Bold font weight",
+                self.config.font_weight_bold.clone().unwrap_or_default(),
+            )
+            .in_section("Text")
+            .with_note("e.g. 500, bold, medium. Applied on restart"),
             SettingsField::number(
                 "opacity",
                 "Opacity",
@@ -1136,6 +1158,14 @@ impl App {
                 let trimmed = value.trim();
                 self.config.font_family = (!trimmed.is_empty()).then(|| trimmed.to_string());
             }
+            "font_weight" => {
+                let trimmed = value.trim();
+                self.config.font_weight = (!trimmed.is_empty()).then(|| trimmed.to_string());
+            }
+            "font_weight_bold" => {
+                let trimmed = value.trim();
+                self.config.font_weight_bold = (!trimmed.is_empty()).then(|| trimmed.to_string());
+            }
             "font_size" => match value.parse::<f32>() {
                 Ok(size) => self.config.font_size = size,
                 Err(_) => return false,
@@ -1197,15 +1227,40 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::Resized(size) => {
                 if size.width > 0 && size.height > 0 {
+                    let mut size_changed = false;
                     if let Some(renderer) = &mut self.renderer {
-                        renderer.resize(size.width, size.height);
+                        if let Some(window) = &self.window {
+                            let scale_factor = window.scale_factor();
+                            if renderer.resize(size.width, size.height, scale_factor).is_some() {
+                                size_changed = true;
+                            }
+                        }
                     }
-                    if self.renderer.is_some() {
+                    if size_changed {
                         self.resize_all_panes();
+                        self.dirty = true;
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
                     }
-                    self.dirty = true;
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
+                }
+            }
+
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                let size = self.window.as_ref().map(|w| w.inner_size());
+                if let Some(size) = size {
+                    let mut changed = false;
+                    if let Some(renderer) = &mut self.renderer {
+                        if renderer.resize(size.width, size.height, scale_factor).is_some() {
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.resize_all_panes();
+                        self.dirty = true;
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
                     }
                 }
             }
@@ -1508,6 +1563,7 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::Focused(focused) => {
+                self.last_focus_change = Some(Instant::now());
                 let focused_pane = self.tab().focused();
                 if let Some(pane) = self.panes.get(&focused_pane) {
                     if pane.focus_event() {
@@ -1515,14 +1571,6 @@ impl ApplicationHandler for App {
                         if let Some(pane) = self.panes.get_mut(&focused_pane) {
                             pane.write(seq.as_bytes());
                         }
-                    }
-                }
-                // Regaining focus (e.g. after a screen sleep/wake or unlock) may
-                // follow a surface loss; repaint so the renderer reconfigures and
-                // presents a valid frame instead of leaving stale GPU contents.
-                if focused {
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
                     }
                 }
             }
@@ -1544,13 +1592,7 @@ impl ApplicationHandler for App {
                 }
             }
 
-            // The window became visible again (unminimized, uncovered, or the
-            // screen woke). Repaint so a surface lost while hidden is recovered.
-            WindowEvent::Occluded(false) => {
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
-            }
+
 
             _ => {}
         }
@@ -1718,6 +1760,15 @@ mod tests {
     fn test_bell_flash_duration() {
         let _ = BELL_FLASH_DURATION;
     }
+
+    #[test]
+    fn test_focus_change_bell_window() {
+        let mut app = App::new();
+        assert!(app.last_focus_change.is_none());
+        app.last_focus_change = Some(Instant::now());
+        assert!(app.last_focus_change.unwrap().elapsed() < FOCUS_CHANGE_BELL_WINDOW);
+    }
+
 
     #[test]
     fn test_app_new_has_no_quick_select() {

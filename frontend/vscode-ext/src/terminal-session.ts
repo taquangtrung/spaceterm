@@ -125,6 +125,12 @@ function renderHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
     "frame-src 'self'",
   ].join("; ");
 
+  const config = vscode.workspace.getConfiguration("terminal.integrated");
+  const fontFamily = config.get<string>("fontFamily") || "";
+  const fontSize = config.get<number>("fontSize") || 14;
+  const fontWeight = config.get<string | number>("fontWeight") || "normal";
+  const fontWeightBold = config.get<string | number>("fontWeightBold") || "bold";
+
   return `<!doctype html>
 <html>
   <head>
@@ -133,7 +139,7 @@ function renderHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
     <link rel="stylesheet" href="${styleUri}" />
     <link rel="stylesheet" href="${customStyleUri}" />
   </head>
-  <body>
+  <body style="--spaceterm-font-family: ${fontFamily}; --spaceterm-font-size: ${fontSize}px; --spaceterm-font-weight: ${fontWeight}; --spaceterm-font-weight-bold: ${fontWeightBold};">
     <div id="terminal-container">
       <div id="terminal"></div>
     </div>
@@ -148,3 +154,4 @@ function renderHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
   </body>
 </html>`;
 }
+
