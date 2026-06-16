@@ -462,10 +462,10 @@ impl App {
 
     pub(crate) fn layout_rect_to_pane(rect: Rect) -> PaneRect {
         PaneRect {
-            x: rect.x,
-            y: rect.y,
-            width: rect.width,
-            height: rect.height,
+            x: rect.x.round(),
+            y: rect.y.round(),
+            width: rect.width.round(),
+            height: rect.height.round(),
         }
     }
 

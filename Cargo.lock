@@ -3519,6 +3519,7 @@ dependencies = [
  "image",
  "knuffel",
  "knuffel-derive",
+ "miette",
  "pollster",
  "portable-pty",
  "serde",

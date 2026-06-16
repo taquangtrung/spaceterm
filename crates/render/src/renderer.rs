@@ -1059,13 +1059,13 @@ impl GpuRenderer {
             .zip(panes.iter())
             .map(|(buffer, pane)| TextArea {
                 buffer,
-                left: pane.rect.x,
-                top: pane.rect.y,
+                left: pane.rect.x.round(),
+                top: pane.rect.y.round(),
                 bounds: TextBounds {
-                    left: pane.rect.x as i32,
-                    top: pane.rect.y as i32,
-                    right: (pane.rect.x + pane.rect.width) as i32,
-                    bottom: (pane.rect.y + pane.rect.height) as i32,
+                    left: pane.rect.x.round() as i32,
+                    top: pane.rect.y.round() as i32,
+                    right: (pane.rect.x + pane.rect.width).round() as i32,
+                    bottom: (pane.rect.y + pane.rect.height).round() as i32,
                 },
                 default_color: self.theme.foreground.to_glyphon(),
                 scale: 1.0,
@@ -1077,10 +1077,10 @@ impl GpuRenderer {
             text_areas.push(TextArea {
                 buffer: &status_buffer,
                 left: 0.0,
-                top: status_top,
+                top: status_top.round(),
                 bounds: TextBounds {
                     left: 0,
-                    top: status_top as i32,
+                    top: status_top.round() as i32,
                     right: surface_w as i32,
                     bottom: surface_h as i32,
                 },
@@ -1093,9 +1093,14 @@ impl GpuRenderer {
         for text in &chrome_texts {
             text_areas.push(TextArea {
                 buffer: &text.buffer,
-                left: text.left,
-                top: text.top,
-                bounds: text.bounds,
+                left: text.left.round(),
+                top: text.top.round(),
+                bounds: TextBounds {
+                    left: text.bounds.left,
+                    top: text.bounds.top,
+                    right: text.bounds.right,
+                    bottom: text.bounds.bottom,
+                },
                 default_color: text.color,
                 scale: 1.0,
                 custom_glyphs: &[],
@@ -2217,10 +2222,10 @@ fn measure_cell(
 
     if let Some(run) = buffer.layout_runs().next() {
         let glyph_w = run.glyphs.first().map(|g| g.w).unwrap_or(font_size * 0.6);
-        return (glyph_w, line_height);
+        return (glyph_w.round(), line_height.round());
     }
 
-    (font_size * 0.6, line_height)
+    ((font_size * 0.6).round(), line_height.round())
 }
 
 fn grid_color_to_rgb(color: &GridColor, theme: &Theme) -> (f32, f32, f32) {

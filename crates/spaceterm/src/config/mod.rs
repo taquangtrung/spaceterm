@@ -433,9 +433,19 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Self {
-        let kdl: KdlConfig = match knuffel::parse("spaceterm.kdl", text) {
+        let kdl: KdlConfig = match knuffel::parse("settings.kdl", text) {
             Ok(c) => c,
-            Err(_) => return Self::default(),
+            Err(e) => {
+                let problems = config_problems(&e, text);
+                eprintln!(
+                    "spaceterm: ignoring settings.kdl ({} problem(s)); using built-in defaults until fixed:",
+                    problems.len()
+                );
+                for problem in &problems {
+                    eprintln!("  line {}: {}", problem.line, problem.message);
+                }
+                return Self::default();
+            }
         };
 
         let theme = kdl
@@ -533,16 +543,10 @@ impl Config {
             kdl_string(&self.font_size.to_string())
         ));
         if let Some(font_weight) = &self.font_weight {
-            out.push_str(&format!(
-                "font-weight {}\n",
-                kdl_string(font_weight)
-            ));
+            out.push_str(&format!("font-weight {}\n", kdl_string(font_weight)));
         }
         if let Some(bold_weight) = &self.font_weight_bold {
-            out.push_str(&format!(
-                "font-weight-bold {}\n",
-                kdl_string(bold_weight)
-            ));
+            out.push_str(&format!("font-weight-bold {}\n", kdl_string(bold_weight)));
         }
         out.push_str(&format!(
             "opacity {}\n",
@@ -796,6 +800,60 @@ fn config_dir() -> PathBuf {
     }
 }
 
+/// One problem found in a config file: its 1-based `line` and a human `message`.
+struct ConfigProblem {
+    line: usize,
+    message: String,
+}
+
+/// Pull the individual problems out of a knuffel parse error so each can be
+/// reported on its own line. knuffel collects every issue (an unknown key, a
+/// duplicate key, a bad value) as a "related" diagnostic, but its own top-level
+/// message collapses to "error parsing KDL"; this surfaces the details, located
+/// against `text` so we can show the line each one is on.
+fn config_problems(err: &knuffel::Error, text: &str) -> Vec<ConfigProblem> {
+    use miette::Diagnostic;
+
+    let related: Vec<&dyn Diagnostic> = err
+        .related()
+        .map(|problems| problems.collect())
+        .unwrap_or_default();
+
+    // No related diagnostics means the file failed to tokenize at all; report the
+    // whole error as a single problem rather than dropping it silently.
+    if related.is_empty() {
+        return vec![ConfigProblem {
+            line: 1,
+            message: err.to_string(),
+        }];
+    }
+
+    related
+        .into_iter()
+        .map(|problem| {
+            let offset = problem
+                .labels()
+                .and_then(|mut labels| labels.next())
+                .map(|label| label.offset())
+                .unwrap_or(0);
+            ConfigProblem {
+                line: line_number(text, offset),
+                message: problem.to_string(),
+            }
+        })
+        .collect()
+}
+
+/// The 1-based line number containing byte `offset` within `text`.
+fn line_number(text: &str, offset: usize) -> usize {
+    let end = offset.min(text.len());
+    text.as_bytes()[..end]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        + 1
+}
+
 // ========================================================================
 // Tests
 // ========================================================================
@@ -818,6 +876,33 @@ mod tests {
         let config = Config::parse("font-size \"18\"\nopacity \"0.9\"");
         assert_eq!(config.font_size, 18.0);
         assert_eq!(config.opacity, 0.9);
+    }
+
+    #[test]
+    fn test_config_problems_report_unknown_and_duplicate_keys() {
+        let text = "theme \"dark\"\nfont-weigth \"300\"\ntheme \"light\"\n";
+        let err = knuffel::parse::<KdlConfig>("settings.kdl", text)
+            .err()
+            .expect("unknown and duplicate keys should fail to parse");
+        let problems = config_problems(&err, text);
+
+        let unknown = problems
+            .iter()
+            .find(|p| p.message.contains("font-weigth"))
+            .expect("unknown key reported");
+        assert_eq!(unknown.line, 2);
+
+        let duplicate = problems
+            .iter()
+            .find(|p| p.message.contains("duplicate") && p.message.contains("theme"))
+            .expect("duplicate key reported");
+        assert_eq!(duplicate.line, 3);
+    }
+
+    #[test]
+    fn test_valid_config_has_no_problems() {
+        // A clean parse never reaches the problem reporter.
+        assert!(knuffel::parse::<KdlConfig>("settings.kdl", "theme \"dark\"\n").is_ok());
     }
 
     #[test]
