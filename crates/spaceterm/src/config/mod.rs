@@ -125,6 +125,7 @@ pub struct Config {
     pub opacity: f32,
     pub status_bar: StatusBarConfig,
     pub theme: ThemeSetting,
+    pub title_bar_style: TitleBarStyle,
 }
 
 /// Per-color overrides parsed from the KDL `colors` block. Applied on top of the
@@ -187,6 +188,37 @@ impl ColorOverrides {
     }
 }
 
+/// Window title-bar presentation: the OS-drawn decorations, or a borderless
+/// window whose tab strip doubles as a VS Code-style title bar carrying its own
+/// minimize/maximize/close controls.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TitleBarStyle {
+    /// Native OS window decorations; the tab strip sits inside, below them.
+    System,
+    /// Borderless: the tab strip is the title bar, with custom window controls.
+    #[default]
+    Modern,
+}
+
+impl TitleBarStyle {
+    /// Interpret a `title-bar-style` config value; unknown values fall back to the
+    /// modern default. `native` is accepted as an alias for `system`.
+    pub fn from_value(value: &str) -> Self {
+        match value {
+            "system" | "native" => Self::System,
+            _ => Self::Modern,
+        }
+    }
+
+    /// The `title-bar-style` config value this selection serializes to.
+    pub fn as_value(&self) -> &str {
+        match self {
+            Self::System => "system",
+            Self::Modern => "modern",
+        }
+    }
+}
+
 /// The selected theme: a built-in preset, the system-following `Auto`, or a
 /// user theme file `themes/<name>.kdl` referenced by name.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -241,6 +273,8 @@ struct KdlConfig {
     keybindings: Option<KdlKeybindings>,
     #[knuffel(child, unwrap(argument))]
     menu_style: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    title_bar_style: Option<String>,
     #[knuffel(child)]
     opacity: Option<KdlOpacity>,
     #[knuffel(child)]
@@ -495,6 +529,12 @@ impl Config {
             })
             .unwrap_or_default();
 
+        let title_bar_style = kdl
+            .title_bar_style
+            .as_deref()
+            .map(TitleBarStyle::from_value)
+            .unwrap_or_default();
+
         Config {
             colors: kdl.colors.map(color_overrides_from_kdl).unwrap_or_default(),
             font_family: kdl.font.map(|f| f.value).filter(|s| !s.trim().is_empty()),
@@ -521,6 +561,7 @@ impl Config {
                 .clamp(0.1, 1.0),
             status_bar,
             theme,
+            title_bar_style,
         }
     }
 
@@ -553,6 +594,10 @@ impl Config {
             kdl_string(&self.opacity.to_string())
         ));
         out.push_str(&format!("menu-style {}\n", kdl_string(menu_style)));
+        out.push_str(&format!(
+            "title-bar-style {}\n",
+            kdl_string(self.title_bar_style.as_value())
+        ));
         out.push_str(&self.status_bar_kdl());
         if let Some(colors) = self.colors_kdl() {
             out.push_str(&colors);
@@ -654,6 +699,7 @@ impl Default for Config {
             opacity: 1.0,
             status_bar: StatusBarConfig::default(),
             theme: ThemeSetting::default(),
+            title_bar_style: TitleBarStyle::default(),
         }
     }
 }
@@ -947,6 +993,31 @@ colors {
         let mut theme = Theme::dark();
         config.colors.apply(&mut theme);
         assert_eq!(theme, Theme::dark());
+    }
+
+    #[test]
+    fn test_title_bar_style_defaults_modern_and_roundtrips() {
+        assert_eq!(Config::default().title_bar_style, TitleBarStyle::Modern);
+        assert_eq!(
+            Config::parse("title-bar-style \"system\"").title_bar_style,
+            TitleBarStyle::System
+        );
+        // `native` is an alias; unknown values fall back to the modern default.
+        assert_eq!(
+            Config::parse("title-bar-style \"native\"").title_bar_style,
+            TitleBarStyle::System
+        );
+        assert_eq!(
+            Config::parse("title-bar-style \"bogus\"").title_bar_style,
+            TitleBarStyle::Modern
+        );
+        // Serializes and parses back to the same selection.
+        let mut config = Config::default();
+        config.title_bar_style = TitleBarStyle::System;
+        assert_eq!(
+            Config::parse(&config.to_kdl()).title_bar_style,
+            TitleBarStyle::System
+        );
     }
 
     #[test]

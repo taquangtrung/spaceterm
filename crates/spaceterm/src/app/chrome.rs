@@ -8,6 +8,7 @@
 use spaceterm_render::{ChromeHit, Menu, MenuItem, MenuStyle, TabLabel, TopChrome};
 
 use super::App;
+use crate::config::TitleBarStyle;
 
 // ========================================================================
 // Data Structures
@@ -195,6 +196,7 @@ impl App {
             selected_item: self.selected_item,
             selected_subitem: self.selected_subitem,
             tabs,
+            window_controls: self.config.title_bar_style == TitleBarStyle::Modern,
         }
     }
 
@@ -241,6 +243,22 @@ impl App {
                     self.toggle_menu(0);
                 }
             }
+            ChromeHit::Minimize => {
+                self.close_menu();
+                if let Some(window) = &self.window {
+                    window.set_minimized(true);
+                }
+            }
+            ChromeHit::Maximize => {
+                self.close_menu();
+                if let Some(window) = &self.window {
+                    window.set_maximized(!window.is_maximized());
+                }
+            }
+            ChromeHit::Close => {
+                // Drained by the mouse handler into the shared quit path.
+                self.exit_requested = true;
+            }
             ChromeHit::MenuTitle(i) => self.toggle_menu(i),
             ChromeHit::DropdownItem(i) => {
                 if let Some(item) = self.open_menu_item(i) {
@@ -271,10 +289,18 @@ impl App {
             ChromeHit::None => {
                 if menu_was_open {
                     self.close_menu();
+                } else if y < self.top_chrome_height() {
+                    // Empty title-bar space. In the borderless modern style this is
+                    // the drag handle to move the window; either way, swallow the
+                    // click so it does not select pane text.
+                    if self.config.title_bar_style == TitleBarStyle::Modern {
+                        if let Some(window) = &self.window {
+                            let _ = window.drag_window();
+                        }
+                    }
+                    return true;
                 } else {
-                    // A click on empty chrome space is still inside the band, so
-                    // swallow it rather than letting it select pane text.
-                    return y < self.top_chrome_height();
+                    return false;
                 }
             }
         }

@@ -32,7 +32,6 @@ pub struct Theme {
     pub menu_hover_bg: Rgb,
     pub selection_bg: Rgb,
     pub selection_fg: Rgb,
-    pub status_bar_bg: Rgb,
     pub status_bar_fg: Rgb,
     /// Fill behind the active tab in the tabbar.
     pub tab_active_bg: Rgb,
@@ -104,7 +103,6 @@ impl Theme {
             bell: Rgb::parse_hex("#202020").unwrap(),
             menu_bg: Rgb::parse_hex("#313841").unwrap(),
             menu_hover_bg: Rgb::parse_hex("#3b4a63").unwrap(),
-            status_bar_bg: Rgb::parse_hex("#1b1f20").unwrap(),
             status_bar_fg: Rgb::parse_hex("#15181a").unwrap(),
             tab_active_bg: Rgb::parse_hex("#2a2f31").unwrap(),
             tab_active_fg: Rgb::parse_hex("#d8d8d8").unwrap(),
@@ -145,7 +143,6 @@ impl Theme {
             bell: Rgb::parse_hex("#dddddd").unwrap(),
             menu_bg: Rgb::parse_hex("#ffffff").unwrap(),
             menu_hover_bg: Rgb::parse_hex("#e6eefb").unwrap(),
-            status_bar_bg: Rgb::parse_hex("#d0d0d0").unwrap(),
             tab_active_bg: Rgb::parse_hex("#f2f2f2").unwrap(),
             tab_active_fg: Rgb::parse_hex("#1e1e1e").unwrap(),
             tabbar_bg: Rgb::parse_hex("#d0d0d0").unwrap(),

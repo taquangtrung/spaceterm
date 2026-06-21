@@ -18,6 +18,8 @@ const CLOSE_CELLS: f32 = 2.0;
 const NEW_TAB_CELLS: f32 = 3.0;
 /// Width of the modern hamburger (`☰`) button, in cells.
 const HAMBURGER_CELLS: f32 = 3.0;
+/// Width of each window-control button (minimize/maximize/close), in cells.
+const CONTROL_CELLS: f32 = 3.0;
 /// Horizontal padding around a classic menu title, in cells (one each side).
 const MENU_TITLE_PAD_CELLS: f32 = 2.0;
 /// Minimum dropdown panel width, in cells.
@@ -27,7 +29,7 @@ const DROPDOWN_MIN_CELLS: f32 = 22.0;
 const DROPDOWN_PAD_CELLS: f32 = 4.0;
 /// Height of one dropdown item row as a multiple of the cell height. Taller than
 /// a terminal row so the menu reads as an app menu, not a packed text grid.
-const DROPDOWN_ITEM_RATIO: f32 = 1.7;
+const DROPDOWN_ITEM_RATIO: f32 = 1.9;
 /// Padding above the first and below the last dropdown item, in cells.
 const DROPDOWN_PAD_Y_CELLS: f32 = 0.4;
 
@@ -92,6 +94,9 @@ pub struct TopChrome {
     /// The highlighted submenu child (mouse hover), if any.
     pub selected_subitem: Option<usize>,
     pub tabs: Vec<TabLabel>,
+    /// Whether to draw custom minimize/maximize/close controls at the right edge
+    /// (the borderless "modern" title bar); `false` lets the OS draw them.
+    pub window_controls: bool,
 }
 
 /// A pixel rectangle in surface coordinates (origin top-left).
@@ -119,6 +124,9 @@ pub(crate) struct DropdownLayout {
 pub(crate) struct ChromeLayout {
     /// Per-tab close (`×`) targets, parallel to `tabs`.
     pub closes: Vec<Region>,
+    /// The `[minimize, maximize, close]` window-control targets at the right edge,
+    /// or `None` when the OS draws the decorations.
+    pub controls: Option<[Region; 3]>,
     pub dropdown: Option<DropdownLayout>,
     /// The modern hamburger button, or `None` in classic style.
     pub hamburger: Option<Region>,
@@ -137,12 +145,18 @@ pub(crate) struct ChromeLayout {
 /// What a click landed on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChromeHit {
+    /// The window close (`✕`) control.
+    Close,
     CloseTab(usize),
     /// An item in the open dropdown, by index into that menu's `items`.
     DropdownItem(usize),
     Hamburger,
+    /// The window maximize/restore (`□`) control.
+    Maximize,
     /// A classic menu title, by index into `menus`.
     MenuTitle(usize),
+    /// The window minimize (`—`) control.
+    Minimize,
     NewTab,
     None,
     /// A child of the open submenu, by index into that submenu's items. The
@@ -169,8 +183,10 @@ impl Region {
 /// in classic style.
 pub fn chrome_rows(style: MenuStyle) -> usize {
     match style {
+        // Classic stacks a menubar over the tabbar. Modern is a single bar, two
+        // cells tall so the title bar has room to breathe (VS Code-ish height).
         MenuStyle::Classic => 2,
-        MenuStyle::Modern => 1,
+        MenuStyle::Modern => 2,
     }
 }
 
@@ -199,6 +215,18 @@ pub fn hit_test(
             if dropdown_item_region(dropdown, i).contains(x, y) {
                 return ChromeHit::DropdownItem(i);
             }
+        }
+    }
+
+    if let Some([minimize, maximize, close]) = &layout.controls {
+        if close.contains(x, y) {
+            return ChromeHit::Close;
+        }
+        if maximize.contains(x, y) {
+            return ChromeHit::Maximize;
+        }
+        if minimize.contains(x, y) {
+            return ChromeHit::Minimize;
         }
     }
 
@@ -236,13 +264,17 @@ pub fn hit_test(
 /// renderer so both agree on every rectangle.
 pub(crate) fn layout(chrome: &TopChrome, surface_w: f32, cw: f32, ch: f32) -> ChromeLayout {
     let classic = chrome.menu_style == MenuStyle::Classic;
+    let chrome_h = chrome_rows(chrome.menu_style) as f32 * ch;
     let menubar_top = if classic { Some(0.0) } else { None };
     let tab_row_top = if classic { ch } else { 0.0 };
+    // Interactive elements are one cell tall in classic (one row each) but span
+    // the whole taller bar in modern, so clicks land anywhere in the band.
+    let bar_h = if classic { ch } else { chrome_h };
 
     // The modern hamburger sits at the left of the tabbar; the tabs begin after
     // it. Classic style has no hamburger and tabs start at the left edge.
     let hamburger = (!classic).then_some(Region {
-        h: ch,
+        h: bar_h,
         w: HAMBURGER_CELLS * cw,
         x: 0.0,
         y: tab_row_top,
@@ -255,13 +287,13 @@ pub(crate) fn layout(chrome: &TopChrome, surface_w: f32, cw: f32, ch: f32) -> Ch
     for i in 0..chrome.tabs.len() {
         let x = tabs_left + i as f32 * tab_w;
         tabs.push(Region {
-            h: ch,
+            h: bar_h,
             w: tab_w,
             x,
             y: tab_row_top,
         });
         closes.push(Region {
-            h: ch,
+            h: bar_h,
             w: CLOSE_CELLS * cw,
             x: x + tab_w - CLOSE_CELLS * cw,
             y: tab_row_top,
@@ -269,11 +301,24 @@ pub(crate) fn layout(chrome: &TopChrome, surface_w: f32, cw: f32, ch: f32) -> Ch
     }
 
     let new_tab = Region {
-        h: ch,
+        h: bar_h,
         w: NEW_TAB_CELLS * cw,
         x: tabs_left + chrome.tabs.len() as f32 * tab_w,
         y: tab_row_top,
     };
+
+    // Window controls hug the right edge of the tabbar row: minimize, maximize,
+    // then close (rightmost). Only present in the borderless modern title bar.
+    let controls = chrome.window_controls.then(|| {
+        let w = CONTROL_CELLS * cw;
+        let control = |slot: f32| Region {
+            h: bar_h,
+            w,
+            x: surface_w - (3.0 - slot) * w,
+            y: tab_row_top,
+        };
+        [control(0.0), control(1.0), control(2.0)]
+    });
 
     let menu_titles = if classic {
         let mut titles = Vec::with_capacity(chrome.menus.len());
@@ -300,9 +345,9 @@ pub(crate) fn layout(chrome: &TopChrome, surface_w: f32, cw: f32, ch: f32) -> Ch
             let title = menu_titles.get(open)?;
             (title.x, ch)
         } else {
-            // Left-aligned with the hamburger, opening below the tabbar row.
+            // Left-aligned with the hamburger, opening below the whole bar.
             let hb = hamburger.as_ref()?;
-            (hb.x, tab_row_top + ch)
+            (hb.x, chrome_h)
         };
         Some(DropdownLayout {
             item_h: ch * DROPDOWN_ITEM_RATIO,
@@ -335,6 +380,7 @@ pub(crate) fn layout(chrome: &TopChrome, surface_w: f32, cw: f32, ch: f32) -> Ch
 
     ChromeLayout {
         closes,
+        controls,
         dropdown,
         hamburger,
         menubar_top,
@@ -424,12 +470,13 @@ mod tests {
                     title: format!("Tab {i}"),
                 })
                 .collect(),
+            window_controls: false,
         }
     }
 
     #[test]
     fn test_chrome_rows_by_style() {
-        assert_eq!(chrome_rows(MenuStyle::Modern), 1);
+        assert_eq!(chrome_rows(MenuStyle::Modern), 2);
         assert_eq!(chrome_rows(MenuStyle::Classic), 2);
     }
 
@@ -519,6 +566,32 @@ mod tests {
         assert_eq!(
             hit_test(&c, SURFACE_W, CW, CH, second.x + 2.0, second.y + 2.0),
             ChromeHit::DropdownItem(1)
+        );
+    }
+
+    #[test]
+    fn test_window_controls_hit_only_when_enabled() {
+        let mut c = chrome(MenuStyle::Modern, 1, None);
+        // Disabled by default: the far-right edge is empty title-bar space.
+        assert_eq!(
+            hit_test(&c, SURFACE_W, CW, CH, SURFACE_W - 5.0, 5.0),
+            ChromeHit::None
+        );
+
+        c.window_controls = true;
+        let w = CONTROL_CELLS * CW;
+        // Rightmost is close, then maximize, then minimize moving left.
+        assert_eq!(
+            hit_test(&c, SURFACE_W, CW, CH, SURFACE_W - 1.0, 5.0),
+            ChromeHit::Close
+        );
+        assert_eq!(
+            hit_test(&c, SURFACE_W, CW, CH, SURFACE_W - w - 1.0, 5.0),
+            ChromeHit::Maximize
+        );
+        assert_eq!(
+            hit_test(&c, SURFACE_W, CW, CH, SURFACE_W - 2.0 * w - 1.0, 5.0),
+            ChromeHit::Minimize
         );
     }
 

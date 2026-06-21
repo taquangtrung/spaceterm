@@ -230,6 +230,9 @@ pub struct App {
     pub(crate) last_tile_layout: Option<(usize, usize, u32, u32)>,
     pub(crate) modifiers: winit::event::Modifiers,
     pub(crate) mouse_down: bool,
+    /// Set when the custom window-close control is clicked, drained by the mouse
+    /// handler into the same quit path as a native close request.
+    pub(crate) exit_requested: bool,
     /// The Normal-mode traversal cursor for the focused pane, in viewport
     /// `(row, col)`. `Some` only while that pane is in Normal mode.
     pub(crate) nav_cursor: Option<(usize, usize)>,
@@ -360,6 +363,7 @@ impl App {
             last_tile_layout: None,
             modifiers: winit::event::Modifiers::default(),
             mouse_down: false,
+            exit_requested: false,
             nav_cursor: None,
             nav_resync_pending: false,
             next_image_id: 0,
@@ -1204,6 +1208,14 @@ impl App {
         }
         self.dirty = true;
     }
+
+    /// Persist the session and exit the event loop. Shared by the native close
+    /// request and the custom window-close control.
+    fn quit(&mut self, event_loop: &ActiveEventLoop) {
+        Session::save(self.tab(), &self.panes);
+        self.panes.clear();
+        event_loop.exit();
+    }
 }
 
 // ========================================================================
@@ -1432,6 +1444,11 @@ impl ApplicationHandler for App {
                     if (self.open_menu.is_some() || y < self.top_chrome_height())
                         && self.handle_chrome_click(x, y)
                     {
+                        if self.exit_requested {
+                            self.exit_requested = false;
+                            self.quit(event_loop);
+                            return;
+                        }
                         if let Some(window) = &self.window {
                             window.request_redraw();
                         }
@@ -1557,9 +1574,7 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::CloseRequested => {
-                Session::save(self.tab(), &self.panes);
-                self.panes.clear();
-                event_loop.exit();
+                self.quit(event_loop);
             }
 
             WindowEvent::Focused(focused) => {

@@ -34,6 +34,21 @@ use crate::theme::{Rgb, Theme};
 
 const DEFAULT_FONT_SIZE: f32 = 15.0;
 const DEFAULT_LINE_HEIGHT: f32 = 20.0;
+/// The bundled default font family, used when the user has set no `font`. Its
+/// faces are embedded below and loaded into the font database at startup, so
+/// this resolves identically on every machine regardless of installed fonts.
+const DEFAULT_FONT_FAMILY: &str = "FiraCode Nerd Font Mono";
+/// Default weight for bold/bright cells when the user has set no `font-weight-bold`.
+/// SemiBold reads as clearly bolder without the chunky look of a 700 face; the
+/// bundled font ships this exact weight, so no cross-family substitution occurs.
+const DEFAULT_BOLD_WEIGHT: glyphon::cosmic_text::Weight = glyphon::cosmic_text::Weight::SEMIBOLD;
+/// FiraCode Nerd Font Mono faces embedded into the binary (SIL OFL 1.1, see
+/// `assets/fonts/LICENSE-FiraCode-OFL.txt`). Only Regular (400) and SemiBold
+/// (600) are bundled: the normal and default-bold weights, both kept in-family.
+const BUNDLED_FONT_REGULAR: &[u8] =
+    include_bytes!("../assets/fonts/FiraCodeNerdFontMono-Regular.ttf");
+const BUNDLED_FONT_SEMIBOLD: &[u8] =
+    include_bytes!("../assets/fonts/FiraCodeNerdFontMono-SemiBold.ttf");
 const BG_SHADER: &str = include_str!("bg.wgsl");
 const CURSOR_BAR_WIDTH_RATIO: f32 = 0.15;
 const CURSOR_UNDERLINE_HEIGHT_RATIO: f32 = 0.2;
@@ -43,16 +58,23 @@ const MAX_SVG_DIM: u32 = 4096;
 /// top of the id space so they never collide with block image ids.
 const DROPDOWN_TEXTURE_ID: u64 = u64::MAX;
 const SUBMENU_TEXTURE_ID: u64 = u64::MAX - 1;
+/// Reserved id for the rasterized top-chrome strip (band + rounded-top tabs).
+const CHROME_STRIP_TEXTURE_ID: u64 = u64::MAX - 2;
 /// Corner radius of the dropdown menu panel and its hover highlight, in pixels.
-const DROPDOWN_RADIUS: f32 = 8.0;
+const DROPDOWN_RADIUS: f32 = 12.0;
 /// Width of the soft drop shadow cast around the dropdown panel, in pixels.
-const DROPDOWN_SHADOW: f32 = 12.0;
+const DROPDOWN_SHADOW: f32 = 22.0;
 /// Peak opacity of the dropdown drop shadow, fading to zero at its outer edge.
-const DROPDOWN_SHADOW_ALPHA: f32 = 0.4;
+const DROPDOWN_SHADOW_ALPHA: f32 = 0.3;
 /// Inset of the hover-highlight pill from the dropdown item-row edges, in pixels.
-const MENU_HOVER_INSET: f32 = 4.0;
-/// Thickness of the accent bar under the active tab, in pixels.
-const TAB_ACCENT_THICKNESS: f32 = 2.0;
+const MENU_HOVER_INSET: f32 = 6.0;
+/// Strength of the dropdown panel's hairline border, mixed from the surface
+/// toward white for a crisp, elevated edge against the content behind it.
+const MENU_BORDER_MIX: f32 = 0.14;
+/// Corner radius of the rounded tab tops, as a fraction of the cell height.
+const TAB_CORNER_RADIUS_RATIO: f32 = 0.34;
+/// Opacity of the hairline separating the tab band from the content below.
+const CHROME_BORDER_ALPHA: f32 = 0.5;
 /// Color of the dropdown drop shadow (alpha is applied per pixel).
 const SHADOW_COLOR: Rgb = Rgb::new(0, 0, 0);
 
@@ -132,7 +154,7 @@ struct DropdownImage {
 }
 
 /// Font selection for the renderer. `family` is the primary family name (e.g.
-/// "FiraCode Nerd Font"); `None` falls back to the system default monospace.
+/// "FiraCode Nerd Font"); `None` falls back to the bundled [`DEFAULT_FONT_FAMILY`].
 /// Glyphs missing from the primary font are filled in from the system font
 /// database automatically.
 #[derive(Clone, Debug)]
@@ -209,6 +231,9 @@ pub struct GpuRenderer {
     status_buffer: Option<glyphon::Buffer>,
     /// Textured-quad pass for image blocks rendered natively (no webview).
     image_pass: ImagePass,
+    /// Image pass for the rasterized top-chrome strip. Rendered between the bg
+    /// quads and the text so the rounded tab cards sit under the tab titles.
+    chrome_strip_pass: ImagePass,
     /// System fonts for SVG text, loaded lazily on first SVG with text and then
     /// reused (the scan costs ~150ms, so it is deferred off the startup path).
     svg_fontdb: Option<std::sync::Arc<resvg::usvg::fontdb::Database>>,
@@ -283,7 +308,9 @@ impl GpuRenderer {
 
         let font_size = font.size * scale_factor as f32;
         let line_height = font_size * (DEFAULT_LINE_HEIGHT / DEFAULT_FONT_SIZE);
-        let font_family = font.family;
+        let font_family = font
+            .family
+            .or_else(|| Some(DEFAULT_FONT_FAMILY.to_string()));
         let normal_weight = font.normal_weight;
         let bold_weight = font.bold_weight;
         let swash_cache = SwashCache::new();
@@ -304,6 +331,7 @@ impl GpuRenderer {
         let viewport = Viewport::new(&device, &cache);
 
         let mut font_system = font_load.join();
+        load_bundled_fonts(&mut font_system);
         let (cell_width, cell_height) = measure_cell(
             &mut font_system,
             font_size,
@@ -324,6 +352,7 @@ impl GpuRenderer {
         let rows = (height as f32 / cell_height).floor() as usize;
 
         let image_pass = ImagePass::new(&device, format);
+        let chrome_strip_pass = ImagePass::new(&device, format);
 
         Self {
             device,
@@ -353,6 +382,7 @@ impl GpuRenderer {
             text_buffers: Vec::new(),
             status_buffer: None,
             image_pass,
+            chrome_strip_pass,
             svg_fontdb: None,
         }
     }
@@ -456,7 +486,7 @@ impl GpuRenderer {
                     Attrs::new().family(base_family(fam.as_deref())).color(fg)
                 };
                 if span.bold {
-                    attrs = attrs.weight(parse_weight(self.bold_weight.as_deref(), glyphon::cosmic_text::Weight::BOLD));
+                    attrs = attrs.weight(parse_weight(self.bold_weight.as_deref(), DEFAULT_BOLD_WEIGHT));
                 }
                 if span.italic {
                     attrs = attrs.style(glyphon::cosmic_text::Style::Italic);
@@ -760,7 +790,7 @@ impl GpuRenderer {
                         let label_color = Color::rgba(255, 200, 50, 255);
                         let label_attrs = Attrs::new()
                             .family(base_family(fam))
-                            .weight(parse_weight(self.bold_weight.as_deref(), glyphon::cosmic_text::Weight::BOLD))
+                            .weight(parse_weight(self.bold_weight.as_deref(), DEFAULT_BOLD_WEIGHT))
                             .color(label_color);
                         attrs_list.add_span(start..start + 1, &label_attrs);
                     } else if sel_norm.is_some_and(|(sr1, sc1, sr2, sc2)| {
@@ -774,7 +804,7 @@ impl GpuRenderer {
                         let mut attrs = Attrs::new().family(base_family(fam));
 
                         if cell.style.bold {
-                            attrs = attrs.weight(parse_weight(self.bold_weight.as_deref(), glyphon::cosmic_text::Weight::BOLD));
+                            attrs = attrs.weight(parse_weight(self.bold_weight.as_deref(), DEFAULT_BOLD_WEIGHT));
                         } else {
                             attrs = attrs.weight(parse_weight(self.normal_weight.as_deref(), glyphon::cosmic_text::Weight::NORMAL));
                         }
@@ -865,13 +895,14 @@ impl GpuRenderer {
                 surface_h,
             ));
 
-            // Draw status bar background spanning full width
+            // Status bar background spanning full width; matches the terminal
+            // background so the status line blends into the content.
             all_bg_verts.extend_from_slice(&quad_vertices(
                 0.0,
                 status_top + 1.0,
                 surface_w,
                 surface_h,
-                self.theme.status_bar_bg.as_linear(),
+                self.theme.background.as_linear(),
                 surface_w,
                 surface_h,
             ));
@@ -894,7 +925,7 @@ impl GpuRenderer {
             // Font attributes
             let accent_attrs = Attrs::new()
                 .family(base_family(fam))
-                .weight(parse_weight(self.bold_weight.as_deref(), glyphon::cosmic_text::Weight::BOLD))
+                .weight(parse_weight(self.bold_weight.as_deref(), DEFAULT_BOLD_WEIGHT))
                 .color(status.accent.to_glyphon());
             let foreground_attrs = Attrs::new()
                 .family(base_family(fam))
@@ -906,7 +937,7 @@ impl GpuRenderer {
                 .color(self.theme.ansi[8].to_glyphon());
             let error_attrs = Attrs::new()
                 .family(base_family(fam))
-                .weight(parse_weight(self.bold_weight.as_deref(), glyphon::cosmic_text::Weight::BOLD))
+                .weight(parse_weight(self.bold_weight.as_deref(), DEFAULT_BOLD_WEIGHT))
                 .color(self.theme.ansi[1].to_glyphon());
 
             // Left padding
@@ -987,7 +1018,7 @@ impl GpuRenderer {
         // Top chrome (tabbar/menubar) bands and text. The dropdown overlay is
         // handled separately via the image pass so it sits above pane text.
         let chrome_texts = match chrome {
-            Some(c) => self.draw_chrome(c, &mut all_bg_verts, surface_w, surface_h),
+            Some(c) => self.draw_chrome(c, surface_w),
             None => Vec::new(),
         };
 
@@ -1044,6 +1075,15 @@ impl GpuRenderer {
         let bg_count = all_bg_verts.len() as u32;
         let bg_bytes: Vec<u8> = all_bg_verts.iter().flat_map(|v| v.to_bytes()).collect();
         self.queue.write_buffer(&self.bg_buffer, 0, &bg_bytes);
+
+        // The top-chrome strip (band + rounded-top tabs) is composited before the
+        // text pass so the tab cards sit under the tab titles.
+        let chrome_strip: Vec<ImagePlacement> = chrome
+            .and_then(|c| self.rasterize_chrome_strip(c, surface_w))
+            .into_iter()
+            .collect();
+        self.chrome_strip_pass
+            .prepare(&self.queue, &chrome_strip, surface_w, surface_h);
 
         // The open dropdown is rasterized to a texture and drawn by the image
         // pass (which runs after the text pass) so it overlays pane glyphs.
@@ -1160,6 +1200,10 @@ impl GpuRenderer {
                 pass.draw(0..bg_count, 0..1);
             }
 
+            // Chrome strip sits above the bg quads but below the text so the
+            // rounded tab cards back the tab titles.
+            self.chrome_strip_pass.render(&mut pass);
+
             self.text_renderer
                 .render(&self.text_atlas, &self.viewport, &mut pass)
                 .expect("glyphon render");
@@ -1174,98 +1218,21 @@ impl GpuRenderer {
     /// Append the top chrome's background quads to `verts` and return its text
     /// runs (tab titles, close glyphs, the new-tab button, and either the modern
     /// hamburger or the classic menu titles). The dropdown is drawn separately.
-    fn draw_chrome(
-        &mut self,
-        chrome: &TopChrome,
-        verts: &mut Vec<BgVertex>,
-        surface_w: f32,
-        surface_h: f32,
-    ) -> Vec<ChromeText> {
+    fn draw_chrome(&mut self, chrome: &TopChrome, surface_w: f32) -> Vec<ChromeText> {
         let cw = self.cell_width;
         let ch = self.cell_height;
         let layout = chrome_layout(chrome, surface_w, cw, ch);
-        let chrome_h = chrome::chrome_rows(chrome.menu_style) as f32 * ch;
         let pad = cw * 0.4;
         let muted = self.theme.ansi[8].to_glyphon();
         let foreground = self.theme.foreground.to_glyphon();
         let mut texts = Vec::new();
+        // The taller modern bar is two cells high, so center a single text line
+        // vertically within each element's region instead of top-aligning it.
+        let line_h = self.line_height;
+        let vcenter = |y: f32, h: f32| y + (h - line_h) / 2.0;
 
-        // Band background covering the menubar and tabbar rows.
-        verts.extend_from_slice(&quad_vertices(
-            0.0,
-            0.0,
-            surface_w,
-            chrome_h,
-            self.theme.tabbar_bg.as_linear(),
-            surface_w,
-            surface_h,
-        ));
-
-        // Active-tab fill, topped with an accent bar for a modern, flat look.
-        if let Some(tab) = layout.tabs.get(chrome.active_tab) {
-            verts.extend_from_slice(&quad_vertices(
-                tab.x,
-                tab.y,
-                tab.x + tab.w,
-                tab.y + tab.h,
-                self.theme.tab_active_bg.as_linear(),
-                surface_w,
-                surface_h,
-            ));
-            verts.extend_from_slice(&quad_vertices(
-                tab.x,
-                tab.y,
-                tab.x + tab.w,
-                tab.y + TAB_ACCENT_THICKNESS,
-                self.theme.ansi[4].as_linear(),
-                surface_w,
-                surface_h,
-            ));
-        }
-
-        // Thin separators between adjacent inactive tabs only; the active tab's
-        // fill and accent already set it apart, so flanking separators just add
-        // visual noise.
-        for (i, tab) in layout.tabs.iter().enumerate() {
-            let touches_active = i == chrome.active_tab || i + 1 == chrome.active_tab;
-            if touches_active {
-                continue;
-            }
-            let x = tab.x + tab.w - 0.5;
-            verts.extend_from_slice(&quad_vertices(
-                x,
-                tab.y + 4.0,
-                x + 1.0,
-                tab.y + tab.h - 4.0,
-                self.theme.divider.as_linear(),
-                surface_w,
-                surface_h,
-            ));
-        }
-
-        // Divider under the whole chrome.
-        verts.extend_from_slice(&quad_vertices(
-            0.0,
-            chrome_h,
-            surface_w,
-            chrome_h + 1.0,
-            self.theme.divider.as_linear(),
-            surface_w,
-            surface_h,
-        ));
-
-        // In classic style, separate the menubar row from the tabbar row.
-        if layout.menubar_top.is_some() {
-            verts.extend_from_slice(&quad_vertices(
-                0.0,
-                layout.tab_row_top,
-                surface_w,
-                layout.tab_row_top + 1.0,
-                self.theme.divider.as_linear(),
-                surface_w,
-                surface_h,
-            ));
-        }
+        // The band, rounded-top tab cards, and chrome border are rasterized into a
+        // texture by `rasterize_chrome_strip` and composited under this text.
 
         // Tab titles and their close glyphs.
         for (i, tab) in layout.tabs.iter().enumerate() {
@@ -1285,7 +1252,7 @@ impl GpuRenderer {
                 buffer,
                 color,
                 left: tab.x + pad,
-                top: tab.y,
+                top: vcenter(tab.y, tab.h),
             });
 
             let close_buf = self.chrome_line_buffer("\u{00d7}", muted, false, false);
@@ -1294,7 +1261,7 @@ impl GpuRenderer {
                 buffer: close_buf,
                 color: muted,
                 left: close.x + (close.w - cw) / 2.0,
-                top: close.y,
+                top: vcenter(close.y, close.h),
             });
         }
 
@@ -1311,7 +1278,7 @@ impl GpuRenderer {
             buffer: plus,
             color: muted,
             left: new_tab.x + (new_tab.w - cw) / 2.0,
-            top: new_tab.y,
+            top: vcenter(new_tab.y, new_tab.h),
         });
 
         // Modern hamburger, or classic menu titles.
@@ -1322,7 +1289,7 @@ impl GpuRenderer {
                 buffer: glyph,
                 color: foreground,
                 left: hb.x + (hb.w - cw) / 2.0,
-                top: hb.y,
+                top: vcenter(hb.y, hb.h),
             });
         }
         for (i, region) in layout.menu_titles.iter().enumerate() {
@@ -1333,11 +1300,121 @@ impl GpuRenderer {
                 buffer,
                 color: foreground,
                 left: region.x + cw,
-                top: region.y,
+                top: vcenter(region.y, region.h),
             });
         }
 
+        // Window controls (minimize / maximize / close) for the borderless title
+        // bar. Glyphs: an en-dash, a hollow square, and a multiplication sign.
+        // Drawn in the brighter foreground so they read as live window actions.
+        if let Some(controls) = layout.controls {
+            let glyphs = ["\u{2013}", "\u{25a1}", "\u{2715}"];
+            for (region, glyph) in controls.iter().zip(glyphs) {
+                let buffer = self.chrome_line_buffer(glyph, foreground, false, false);
+                texts.push(ChromeText {
+                    bounds: text_bounds(region.x, region.y, region.x + region.w, region.y + region.h),
+                    buffer,
+                    color: foreground,
+                    left: region.x + (region.w - cw) / 2.0,
+                    top: vcenter(region.y, region.h),
+                });
+            }
+        }
+
         texts
+    }
+
+    /// Rasterize the top-chrome strip, the recessed band, the rounded-top tab
+    /// cards, and the hairline border, into a texture composited under the chrome
+    /// text. The active tab is filled with the terminal background so it merges
+    /// seamlessly into the content below; inactive tabs sit recessed and darker.
+    fn rasterize_chrome_strip(
+        &mut self,
+        chrome: &TopChrome,
+        surface_w: f32,
+    ) -> Option<ImagePlacement> {
+        let cw = self.cell_width;
+        let ch = self.cell_height;
+        let layout = chrome_layout(chrome, surface_w, cw, ch);
+        let chrome_h = chrome::chrome_rows(chrome.menu_style) as f32 * ch;
+        let width = surface_w.ceil().max(1.0) as u32;
+        let height = chrome_h.ceil().max(1.0) as u32;
+        let canvas = (width, height);
+        let radius = ch * TAB_CORNER_RADIUS_RATIO;
+
+        let band = self.theme.tabbar_bg;
+        let active_bg = self.theme.tab_active_bg;
+        let inactive_bg = mix_rgb(self.theme.tabbar_bg, self.theme.tab_active_bg, 0.5);
+
+        let mut rgba = vec![0u8; (width * height * 4) as usize];
+
+        // Recessed band across the whole strip.
+        fill_rounded_rect(&mut rgba, canvas, (0.0, 0.0, width as f32, height as f32), 0.0, band, 1.0);
+        // Hairline border separating the band from the content; the tab cards
+        // drawn after cover it under themselves, so it shows only in empty band.
+        fill_rounded_rect(
+            &mut rgba,
+            canvas,
+            (0.0, chrome_h - 1.0, width as f32, 1.0),
+            0.0,
+            self.theme.divider,
+            CHROME_BORDER_ALPHA,
+        );
+        // In classic style, separate the menubar row from the tabbar row.
+        if let Some(menubar_top) = layout.menubar_top {
+            let _ = menubar_top;
+            fill_rounded_rect(
+                &mut rgba,
+                canvas,
+                (0.0, layout.tab_row_top - 1.0, width as f32, 1.0),
+                0.0,
+                self.theme.divider,
+                CHROME_BORDER_ALPHA,
+            );
+        }
+
+        // Inactive tabs first (recessed), then the active tab on top so its
+        // rounded corners win where they meet a neighbor.
+        for (i, tab) in layout.tabs.iter().enumerate() {
+            if i == chrome.active_tab {
+                continue;
+            }
+            fill_rounded_top_rect(
+                &mut rgba,
+                canvas,
+                (tab.x, tab.y, tab.w, tab.h),
+                radius,
+                inactive_bg,
+                1.0,
+            );
+        }
+        if let Some(tab) = layout.tabs.get(chrome.active_tab) {
+            fill_rounded_top_rect(
+                &mut rgba,
+                canvas,
+                (tab.x, tab.y, tab.w, tab.h),
+                radius,
+                active_bg,
+                1.0,
+            );
+        }
+
+        self.chrome_strip_pass.upload(
+            &self.device,
+            &self.queue,
+            CHROME_STRIP_TEXTURE_ID,
+            &rgba,
+            width,
+            height,
+        );
+        Some(ImagePlacement {
+            height: height as f32,
+            id: CHROME_STRIP_TEXTURE_ID,
+            v_max: 1.0,
+            width: width as f32,
+            x: 0.0,
+            y: 0.0,
+        })
     }
 
     /// Rasterize the open dropdown to a texture and return its placement, or
@@ -1880,6 +1957,33 @@ fn fill_rounded_rect(
     }
 }
 
+/// Fill a rectangle whose top corners are rounded but whose bottom edge stays
+/// flush. Achieved by rounding a rect extended `radius` below the real bottom, so
+/// the bottom corners curve off the drawn region (the canvas clips them away).
+fn fill_rounded_top_rect(
+    rgba: &mut [u8],
+    canvas: (u32, u32),
+    rect: (f32, f32, f32, f32),
+    radius: f32,
+    color: Rgb,
+    max_alpha: f32,
+) {
+    let (x, y, w, h) = rect;
+    fill_rounded_rect(rgba, canvas, (x, y, w, h + radius), radius, color, max_alpha);
+}
+
+/// Linearly interpolate two colors channel-wise; `t` clamps to `0.0..=1.0`,
+/// where `0.0` returns `a` and `1.0` returns `b`.
+fn mix_rgb(a: Rgb, b: Rgb, t: f32) -> Rgb {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Rgb {
+        r: lerp(a.r, b.r),
+        g: lerp(a.g, b.g),
+        b: lerp(a.b, b.b),
+    }
+}
+
 /// Decode one 8-bit sRGB channel to a linear `0.0..=1.0` value. Used for the
 /// surface clear, which an sRGB target interprets as linear.
 fn srgb_to_linear_f64(channel: u8) -> f64 {
@@ -1922,7 +2026,7 @@ fn shape_chrome_line(
     };
     let mut attrs = Attrs::new().family(family).color(color);
     if bold {
-        attrs = attrs.weight(parse_weight(ctx.bold_weight, glyphon::cosmic_text::Weight::BOLD));
+        attrs = attrs.weight(parse_weight(ctx.bold_weight, DEFAULT_BOLD_WEIGHT));
     } else {
         attrs = attrs.weight(parse_weight(ctx.normal_weight, glyphon::cosmic_text::Weight::NORMAL));
     }
@@ -2075,13 +2179,16 @@ fn panel_rgba(
         }
     }
 
-    // Elevated rounded panel surface, then the rounded hover pill for the
-    // selected row. The first row begins below the panel's top padding.
+    // Elevated rounded panel: a subtle hairline border, then the surface inset
+    // one pixel within it, then the rounded hover pill for the selected row. The
+    // first row begins below the panel's top padding.
+    let border = mix_rgb(theme.menu_bg, Rgb::new(255, 255, 255), MENU_BORDER_MIX);
+    fill_rounded_rect(&mut rgba, canvas, panel_rect, DROPDOWN_RADIUS, border, 1.0);
     fill_rounded_rect(
         &mut rgba,
         canvas,
-        panel_rect,
-        DROPDOWN_RADIUS,
+        (margin + 1.0, margin + 1.0, panel_w - 2.0, panel_h - 2.0),
+        DROPDOWN_RADIUS - 1.0,
         theme.menu_bg,
         1.0,
     );
@@ -2169,6 +2276,16 @@ fn panel_rgba(
         x: (layout.origin_x - margin).round(),
         y: (layout.top - margin).round(),
     }
+}
+
+/// Register the embedded [`DEFAULT_FONT_FAMILY`] faces in the font database so
+/// the default font is available even when it is not installed on the system.
+/// Loading is idempotent in effect: if the user already has the same family
+/// installed, both copies coexist and the weight match picks one identical face.
+fn load_bundled_fonts(font_system: &mut FontSystem) {
+    let db = font_system.db_mut();
+    db.load_font_data(BUNDLED_FONT_REGULAR.to_vec());
+    db.load_font_data(BUNDLED_FONT_SEMIBOLD.to_vec());
 }
 
 /// The cosmic-text font family for a configured family name, defaulting to the
@@ -2329,6 +2446,7 @@ mod tests {
             tabs: vec![TabLabel {
                 title: "Terminal 1".into(),
             }],
+            window_controls: false,
         }
     }
 
@@ -2377,6 +2495,26 @@ mod tests {
             (r, g, b, a),
             (theme.menu_bg.r, theme.menu_bg.g, theme.menu_bg.b, 255)
         );
+    }
+
+    #[test]
+    fn test_rounded_top_rect_rounds_only_the_top() {
+        let (w, h) = (40u32, 40u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        let white = Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        };
+        fill_rounded_top_rect(&mut rgba, (w, h), (0.0, 0.0, 40.0, 40.0), 12.0, white, 1.0);
+        let alpha = |x: u32, y: u32| rgba[((y * w + x) * 4 + 3) as usize];
+        // The top corners are rounded away (transparent), but the bottom edge is
+        // flush (opaque) so the tab connects seamlessly to the content below. A
+        // regression to all-corner rounding would make the bottom corner sheer off.
+        assert!(alpha(0, 0) < 40, "top-left rounded, got {}", alpha(0, 0));
+        assert!(alpha(39, 0) < 40, "top-right rounded, got {}", alpha(39, 0));
+        assert!(alpha(0, 39) > 220, "bottom-left flush, got {}", alpha(0, 39));
+        assert!(alpha(39, 39) > 220, "bottom-right flush, got {}", alpha(39, 39));
     }
 
     #[test]
