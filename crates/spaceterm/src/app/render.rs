@@ -11,7 +11,7 @@ use crate::terminal::pane::{BLOCK_RESERVE_ROWS, MAX_IMAGE_ROWS};
 use crate::terminal::webview;
 use spaceterm_core::spaceterm_proto::EmitBlock;
 use spaceterm_render::renderer::{PaneRect, PaneView};
-use spaceterm_render::{Color, Grid, ImagePlacement, RgbColor, Style, Theme, ThemeRgb};
+use spaceterm_render::{Color, CursorShape, Grid, ImagePlacement, RgbColor, Style, Theme, ThemeRgb};
 
 use super::{status_bar, App, ImageBlock, ReflowSource};
 
@@ -111,12 +111,27 @@ impl App {
                 } else {
                     None
                 };
+                // Pick the cursor shape for this pane: the focused pane uses
+                // its current mode's configured shape, non-focused panes act as
+                // Insert. The renderer applies it to whichever cursor is drawn
+                // (in-grid shell cursor or nav cursor).
+                let cursor_shape = if *id == focused {
+                    match mode {
+                        Mode::Insert => self.config.cursor.insert,
+                        Mode::Normal => self.config.cursor.normal,
+                        Mode::Visual => self.config.cursor.visual,
+                        Mode::BlockFocus => self.config.cursor.block_focus,
+                    }
+                } else {
+                    self.config.cursor.insert
+                };
                 views.push(PaneView {
                     grid: pane.grid(),
                     labels,
                     nav_cursor,
                     rect: Self::layout_rect_to_pane(*rect),
                     selection: sel_tuple,
+                    cursor_shape,
                 });
             }
         }
@@ -269,6 +284,7 @@ impl App {
                 y: 0.0,
             },
             selection: None,
+            cursor_shape: CursorShape::Block,
         };
         renderer.render(std::slice::from_ref(&view), None, None, false, &[]);
     }

@@ -20,6 +20,37 @@ interface VsCodeApi {
 
 declare function acquireVsCodeApi(): VsCodeApi;
 
+type FontWeight =
+  | "normal"
+  | "bold"
+  | "100"
+  | "200"
+  | "300"
+  | "400"
+  | "500"
+  | "600"
+  | "700"
+  | "800"
+  | "900";
+
+const FONT_WEIGHTS: readonly string[] = [
+  "normal",
+  "bold",
+  "100",
+  "200",
+  "300",
+  "400",
+  "500",
+  "600",
+  "700",
+  "800",
+  "900",
+];
+
+function asFontWeight(value: string, fallback: FontWeight): FontWeight {
+  return FONT_WEIGHTS.includes(value) ? (value as FontWeight) : fallback;
+}
+
 // ========================================================================
 // Webview entry
 // ========================================================================
@@ -88,15 +119,15 @@ function getTerminalFontSize(): number {
   return isNaN(size) ? 13 : size;
 }
 
-function getTerminalFontWeight(): "normal" | "bold" | "100" | "200" | "300" | "400" | "500" | "600" | "700" | "800" | "900" {
+function getTerminalFontWeight(): FontWeight {
   const terminalWeight = getCssVar("--spaceterm-font-weight", "");
   const weight = terminalWeight || getCssVar("--vscode-editor-font-weight", "normal");
-  return weight as any;
+  return asFontWeight(weight, "normal");
 }
 
-function getTerminalFontWeightBold(): "normal" | "bold" | "100" | "200" | "300" | "400" | "500" | "600" | "700" | "800" | "900" {
+function getTerminalFontWeightBold(): FontWeight {
   const weight = getCssVar("--spaceterm-font-weight-bold", "bold");
-  return weight as any;
+  return asFontWeight(weight, "bold");
 }
 
 // ========================================================================
@@ -140,7 +171,8 @@ function mount(): void {
   const observer = new ResizeObserver(() => fitAddon.fit());
   observer.observe(terminalHost);
 
-  // Synchronize terminal theme dynamically with VSCode theme/font changes
+  // Re-sync the terminal when VSCode switches theme (body `class` changes); the
+  // `--spaceterm-*` font vars are static, so observing `class` alone suffices.
   const themeObserver = new MutationObserver(() => {
     term.options.theme = getTerminalTheme();
     term.options.fontFamily = getTerminalFontFamily();
@@ -151,7 +183,7 @@ function mount(): void {
   });
   themeObserver.observe(document.body, {
     attributes: true,
-    attributeFilter: ["class", "style"]
+    attributeFilter: ["class"]
   });
 
   window.addEventListener("message", (event: MessageEvent<HostMessage>) => {

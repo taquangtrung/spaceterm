@@ -27,6 +27,13 @@
 //! font-size "15"
 //! opacity "1.0"
 //! menu-style "modern"
+//! window-controls-side "right"
+//! cursor {
+//!     insert "bar"
+//!     normal "block"
+//!     visual "block"
+//!     block-focus "bar"
+//! }
 //!
 //! colors {
 //!     background "#2a2f31"
@@ -64,7 +71,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use spaceterm_render::{MenuStyle, Theme, ThemeRgb};
+use spaceterm_render::{ControlsSide, CursorShape, MenuStyle, Theme, ThemeRgb};
 
 // ========================================================================
 // Data Structures
@@ -115,6 +122,7 @@ impl Default for StatusBarConfig {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub colors: ColorOverrides,
+    pub cursor: CursorConfig,
     pub font_family: Option<String>,
     pub font_size: f32,
     pub font_weight: Option<String>,
@@ -126,6 +134,31 @@ pub struct Config {
     pub status_bar: StatusBarConfig,
     pub theme: ThemeSetting,
     pub title_bar_style: TitleBarStyle,
+    /// Which edge carries the minimize/maximize/close buttons (the hamburger
+    /// button sits on the opposite edge).
+    pub window_controls_side: ControlsSide,
+}
+
+/// Per-mode cursor shapes, parsed from the `cursor` block. Each mode renders
+/// its cursor with the configured shape; defaults follow the common terminal
+/// convention (a bar for insert-like modes, a block for navigation).
+#[derive(Clone, Copy, Debug)]
+pub struct CursorConfig {
+    pub block_focus: CursorShape,
+    pub insert: CursorShape,
+    pub normal: CursorShape,
+    pub visual: CursorShape,
+}
+
+impl Default for CursorConfig {
+    fn default() -> Self {
+        Self {
+            block_focus: CursorShape::Bar,
+            insert: CursorShape::Bar,
+            normal: CursorShape::Block,
+            visual: CursorShape::Block,
+        }
+    }
 }
 
 /// Per-color overrides parsed from the KDL `colors` block. Applied on top of the
@@ -262,6 +295,8 @@ struct KdlConfig {
     #[knuffel(child)]
     colors: Option<KdlColors>,
     #[knuffel(child)]
+    cursor: Option<KdlCursor>,
+    #[knuffel(child)]
     font: Option<KdlFont>,
     #[knuffel(child)]
     font_size: Option<KdlFontSize>,
@@ -275,12 +310,26 @@ struct KdlConfig {
     menu_style: Option<String>,
     #[knuffel(child, unwrap(argument))]
     title_bar_style: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    window_controls_side: Option<String>,
     #[knuffel(child)]
     opacity: Option<KdlOpacity>,
     #[knuffel(child)]
     theme: Option<KdlTheme>,
     #[knuffel(child)]
     status_bar: Option<KdlStatusBar>,
+}
+
+#[derive(knuffel::Decode)]
+struct KdlCursor {
+    #[knuffel(child, unwrap(argument))]
+    insert: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    normal: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    visual: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    block_focus: Option<String>,
 }
 
 #[derive(knuffel::Decode)]
@@ -535,8 +584,15 @@ impl Config {
             .map(TitleBarStyle::from_value)
             .unwrap_or_default();
 
+        let window_controls_side = kdl
+            .window_controls_side
+            .as_deref()
+            .map(controls_side_from_value)
+            .unwrap_or_default();
+
         Config {
             colors: kdl.colors.map(color_overrides_from_kdl).unwrap_or_default(),
+            cursor: kdl.cursor.map(cursor_config_from_kdl).unwrap_or_default(),
             font_family: kdl.font.map(|f| f.value).filter(|s| !s.trim().is_empty()),
             font_size: kdl
                 .font_size
@@ -562,6 +618,7 @@ impl Config {
             status_bar,
             theme,
             title_bar_style,
+            window_controls_side,
         }
     }
 
@@ -598,6 +655,11 @@ impl Config {
             "title-bar-style {}\n",
             kdl_string(self.title_bar_style.as_value())
         ));
+        out.push_str(&format!(
+            "window-controls-side {}\n",
+            kdl_string(controls_side_as_value(self.window_controls_side))
+        ));
+        out.push_str(&self.cursor_kdl());
         out.push_str(&self.status_bar_kdl());
         if let Some(colors) = self.colors_kdl() {
             out.push_str(&colors);
@@ -611,6 +673,30 @@ impl Config {
         let dir = config_dir();
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join("settings.kdl"), self.to_kdl())
+    }
+
+    /// The `cursor` block, always emitted so every per-mode shape round-trips.
+    fn cursor_kdl(&self) -> String {
+        let c = &self.cursor;
+        let mut out = String::from("cursor {\n");
+        out.push_str(&format!(
+            "    insert {}\n",
+            kdl_string(c.insert.as_value())
+        ));
+        out.push_str(&format!(
+            "    normal {}\n",
+            kdl_string(c.normal.as_value())
+        ));
+        out.push_str(&format!(
+            "    visual {}\n",
+            kdl_string(c.visual.as_value())
+        ));
+        out.push_str(&format!(
+            "    block-focus {}\n",
+            kdl_string(c.block_focus.as_value())
+        ));
+        out.push_str("}\n");
+        out
     }
 
     /// The `status-bar` block, always emitted so every flag and icon round-trips.
@@ -690,6 +776,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             colors: ColorOverrides::default(),
+            cursor: CursorConfig::default(),
             font_family: None,
             font_size: 15.0,
             font_weight: None,
@@ -700,6 +787,7 @@ impl Default for Config {
             status_bar: StatusBarConfig::default(),
             theme: ThemeSetting::default(),
             title_bar_style: TitleBarStyle::default(),
+            window_controls_side: ControlsSide::default(),
         }
     }
 }
@@ -812,6 +900,53 @@ fn color_overrides_from_kdl(kdl: KdlColors) -> ColorOverrides {
             .into_iter()
             .filter_map(|e| ThemeRgb::parse_hex(&e.color).map(|c| (e.index, c)))
             .collect(),
+    }
+}
+
+/// Interpret a `window-controls-side` config value: `"left"` or `"right"`
+/// (the default). Unknown values fall back to the default right side.
+fn controls_side_from_value(value: &str) -> ControlsSide {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "left" => ControlsSide::Left,
+        _ => ControlsSide::Right,
+    }
+}
+
+/// The canonical config value for a [`ControlsSide`] (round-trips through
+/// [`controls_side_from_value`]).
+fn controls_side_as_value(side: ControlsSide) -> &'static str {
+    match side {
+        ControlsSide::Left => "left",
+        ControlsSide::Right => "right",
+    }
+}
+
+/// Apply the `cursor` block on top of the default per-mode shapes; any unset
+/// entry keeps its default. Unknown shape strings fall back to `Block` via
+/// [`CursorShape::from_value`].
+fn cursor_config_from_kdl(kdl: KdlCursor) -> CursorConfig {
+    let defaults = CursorConfig::default();
+    CursorConfig {
+        block_focus: kdl
+            .block_focus
+            .as_deref()
+            .map(CursorShape::from_value)
+            .unwrap_or(defaults.block_focus),
+        insert: kdl
+            .insert
+            .as_deref()
+            .map(CursorShape::from_value)
+            .unwrap_or(defaults.insert),
+        normal: kdl
+            .normal
+            .as_deref()
+            .map(CursorShape::from_value)
+            .unwrap_or(defaults.normal),
+        visual: kdl
+            .visual
+            .as_deref()
+            .map(CursorShape::from_value)
+            .unwrap_or(defaults.visual),
     }
 }
 
@@ -1136,6 +1271,67 @@ status-bar {
         assert_eq!(config.status_bar.icons.insert, "I");
         assert_eq!(config.status_bar.icons.block, "B");
         assert_eq!(config.status_bar.icons.branding, "S");
+    }
+
+    #[test]
+    fn test_parse_cursor_block_and_synonyms() {
+        let config = Config::parse(
+            r#"
+cursor {
+    insert "beam"
+    normal "underline"
+    visual "underscore"
+    block-focus "bar"
+}
+"#,
+        );
+        // Synonyms resolve to the canonical variants; "beam"→Bar,
+        // "underline"/"underscore"→Underline.
+        assert_eq!(config.cursor.insert, CursorShape::Bar);
+        assert_eq!(config.cursor.normal, CursorShape::Underline);
+        assert_eq!(config.cursor.visual, CursorShape::Underline);
+        assert_eq!(config.cursor.block_focus, CursorShape::Bar);
+    }
+
+    #[test]
+    fn test_window_controls_side_defaults_right_parses_left() {
+        assert_eq!(Config::default().window_controls_side, ControlsSide::Right);
+
+        let config = Config::parse("window-controls-side \"left\"");
+        assert_eq!(config.window_controls_side, ControlsSide::Left);
+
+        // Unknown values fall back to the right-side default.
+        let config = Config::parse("window-controls-side \"sideways\"");
+        assert_eq!(config.window_controls_side, ControlsSide::Right);
+    }
+
+    #[test]
+    fn test_window_controls_side_roundtrips() {
+        let mut config = Config::default();
+        config.window_controls_side = ControlsSide::Left;
+        let parsed = Config::parse(&config.to_kdl());
+        assert_eq!(parsed.window_controls_side, ControlsSide::Left);
+    }
+
+    #[test]
+    fn test_cursor_defaults_to_block_for_nav_bar_for_insert() {
+        let config = Config::default();
+        assert_eq!(config.cursor.insert, CursorShape::Bar);
+        assert_eq!(config.cursor.normal, CursorShape::Block);
+        assert_eq!(config.cursor.visual, CursorShape::Block);
+        assert_eq!(config.cursor.block_focus, CursorShape::Bar);
+    }
+
+    #[test]
+    fn test_cursor_block_roundtrips_through_kdl() {
+        let mut config = Config::default();
+        config.cursor.normal = CursorShape::Underline;
+        config.cursor.visual = CursorShape::Bar;
+        let parsed = Config::parse(&config.to_kdl());
+        assert_eq!(parsed.cursor.insert, CursorShape::Bar);
+        assert_eq!(parsed.cursor.normal, CursorShape::Underline);
+        assert_eq!(parsed.cursor.visual, CursorShape::Bar);
+        assert_eq!(parsed.cursor.block_focus, CursorShape::Bar);
     }
 
     #[test]

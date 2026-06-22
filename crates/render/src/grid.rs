@@ -90,6 +90,33 @@ struct Cursor {
     shape: CursorShape,
 }
 
+// ========================================================================
+// CursorShape
+// ========================================================================
+
+impl CursorShape {
+    /// Interpret a `cursor` config value (`"block"`/`"bar"`/`"underline"`).
+    /// Common synonyms (`"beam"`, `"underscore"`) are accepted; unknown values
+    /// fall back to `Block` so a typo never produces a missing cursor.
+    pub fn from_value(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "bar" | "beam" | "line" => Self::Bar,
+            "underline" | "underscore" => Self::Underline,
+            _ => Self::Block,
+        }
+    }
+
+    /// The canonical config value for this shape (round-trips through
+    /// [`Self::from_value`]).
+    pub fn as_value(&self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Bar => "bar",
+            Self::Underline => "underline",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct AltBuffer {
     cells: Vec<Cell>,

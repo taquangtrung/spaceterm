@@ -75,6 +75,7 @@ fn run_once(renderer: &mut GpuRenderer, corpus: &[u8]) -> RunResult {
             nav_cursor: None,
             rect,
             selection: None,
+            cursor_shape: spaceterm_render::CursorShape::Block,
         };
         let frame_start = Instant::now();
         renderer.render(std::slice::from_ref(&view), None, None, false, &[]);

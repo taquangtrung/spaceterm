@@ -47,6 +47,17 @@ pub enum MenuStyle {
     Modern,
 }
 
+/// Which edge of the title bar carries the minimize/maximize/close buttons.
+/// The hamburger button (modern style only) sits on the opposite edge.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ControlsSide {
+    /// Window controls hug the left edge; hamburger (if any) on the right.
+    Left,
+    /// Window controls hug the right edge; hamburger (if any) on the left.
+    #[default]
+    Right,
+}
+
 /// One tab's label in the tabbar.
 #[derive(Clone, Debug)]
 pub struct TabLabel {
@@ -82,6 +93,9 @@ impl MenuItem {
 #[derive(Clone, Debug)]
 pub struct TopChrome {
     pub active_tab: usize,
+    /// Which edge the window controls occupy; the hamburger button (modern style
+    /// only) is placed on the opposite edge.
+    pub controls_side: ControlsSide,
     pub menu_style: MenuStyle,
     pub menus: Vec<Menu>,
     /// Index into `menus` of the open dropdown, or `None` when closed.
@@ -94,8 +108,8 @@ pub struct TopChrome {
     /// The highlighted submenu child (mouse hover), if any.
     pub selected_subitem: Option<usize>,
     pub tabs: Vec<TabLabel>,
-    /// Whether to draw custom minimize/maximize/close controls at the right edge
-    /// (the borderless "modern" title bar); `false` lets the OS draw them.
+    /// Whether to draw custom minimize/maximize/close controls (the borderless
+    /// "modern" title bar); `false` lets the OS draw them.
     pub window_controls: bool,
 }
 
@@ -271,15 +285,32 @@ pub(crate) fn layout(chrome: &TopChrome, surface_w: f32, cw: f32, ch: f32) -> Ch
     // the whole taller bar in modern, so clicks land anywhere in the band.
     let bar_h = if classic { ch } else { chrome_h };
 
-    // The modern hamburger sits at the left of the tabbar; the tabs begin after
-    // it. Classic style has no hamburger and tabs start at the left edge.
+    // The modern hamburger sits on the edge opposite the window controls; the
+    // tabs begin after whichever element is on the left. Classic style has no
+    // hamburger, but window controls (if enabled) still reserve their edge.
+    let controls_left = chrome.controls_side == ControlsSide::Left;
+    let hamburger_w = HAMBURGER_CELLS * cw;
+    let left_reserve = if controls_left {
+        if chrome.window_controls {
+            3.0 * CONTROL_CELLS * cw
+        } else {
+            0.0
+        }
+    } else {
+        hamburger_w
+    };
+
     let hamburger = (!classic).then_some(Region {
         h: bar_h,
-        w: HAMBURGER_CELLS * cw,
-        x: 0.0,
+        w: hamburger_w,
+        x: if controls_left {
+            surface_w - hamburger_w
+        } else {
+            0.0
+        },
         y: tab_row_top,
     });
-    let tabs_left = hamburger.map_or(0.0, |hb| hb.w);
+    let tabs_left = left_reserve;
 
     let tab_w = TAB_CELLS * cw;
     let mut tabs = Vec::with_capacity(chrome.tabs.len());
@@ -307,14 +338,18 @@ pub(crate) fn layout(chrome: &TopChrome, surface_w: f32, cw: f32, ch: f32) -> Ch
         y: tab_row_top,
     };
 
-    // Window controls hug the right edge of the tabbar row: minimize, maximize,
-    // then close (rightmost). Only present in the borderless modern title bar.
+    // Window controls hug the edge chosen by `controls_side`: minimize,
+    // maximize, then close. Only present in the borderless modern title bar.
     let controls = chrome.window_controls.then(|| {
         let w = CONTROL_CELLS * cw;
         let control = |slot: f32| Region {
             h: bar_h,
             w,
-            x: surface_w - (3.0 - slot) * w,
+            x: if controls_left {
+                slot * w
+            } else {
+                surface_w - (3.0 - slot) * w
+            },
             y: tab_row_top,
         };
         [control(0.0), control(1.0), control(2.0)]
@@ -345,9 +380,17 @@ pub(crate) fn layout(chrome: &TopChrome, surface_w: f32, cw: f32, ch: f32) -> Ch
             let title = menu_titles.get(open)?;
             (title.x, ch)
         } else {
-            // Left-aligned with the hamburger, opening below the whole bar.
+            // Anchor to the hamburger: when it is on the left (controls right,
+            // the default) the dropdown opens flush with its left edge growing
+            // right; when it is on the right (controls left) the dropdown right-
+            // aligns with the hamburger so it stays on screen.
             let hb = hamburger.as_ref()?;
-            (hb.x, chrome_h)
+            let x = if controls_left {
+                (hb.x + hb.w - width).max(0.0)
+            } else {
+                hb.x
+            };
+            (x, chrome_h)
         };
         Some(DropdownLayout {
             item_h: ch * DROPDOWN_ITEM_RATIO,
@@ -359,8 +402,10 @@ pub(crate) fn layout(chrome: &TopChrome, surface_w: f32, cw: f32, ch: f32) -> Ch
         })
     });
 
-    // The submenu opens to the right of the parent panel, its first child row
-    // aligned with the hovered parent item; the parent panel stays put.
+    // The submenu opens beside the parent panel — to the right by default, or
+    // to the left when controls are on the left edge (so it does not run off the
+    // right side of the window). Its first child row aligns with the hovered
+    // parent item; the parent panel stays put.
     let submenu = dropdown.and_then(|parent| {
         let open = chrome.open_menu?;
         let parent_idx = chrome.open_submenu?;
@@ -368,13 +413,19 @@ pub(crate) fn layout(chrome: &TopChrome, surface_w: f32, cw: f32, ch: f32) -> Ch
         if item.children.is_empty() {
             return None;
         }
+        let child_width = panel_width(&item.children, cw).min(surface_w);
+        let origin_x = if controls_left {
+            (parent.origin_x - child_width).max(0.0)
+        } else {
+            parent.origin_x + parent.width
+        };
         Some(DropdownLayout {
             item_h: parent.item_h,
             items: item.children.len(),
-            origin_x: parent.origin_x + parent.width,
+            origin_x,
             pad: parent.pad,
             top: parent.top + parent_idx as f32 * parent.item_h,
-            width: panel_width(&item.children, cw).min(surface_w),
+            width: child_width,
         })
     });
 
@@ -459,6 +510,7 @@ mod tests {
         };
         TopChrome {
             active_tab: 0,
+            controls_side: ControlsSide::Right,
             menu_style: style,
             menus,
             open_menu: open,
@@ -602,6 +654,50 @@ mod tests {
         assert_eq!(
             hit_test(&c, SURFACE_W, CW, CH, SURFACE_W / 2.0, 5.0),
             ChromeHit::None
+        );
+    }
+
+    #[test]
+    fn test_controls_left_puts_hamburger_right_and_mirrors_hits() {
+        let mut c = chrome(MenuStyle::Modern, 1, None);
+        c.window_controls = true;
+        c.controls_side = ControlsSide::Left;
+        let w = CONTROL_CELLS * CW;
+        let hb_w = HAMBURGER_CELLS * CW;
+
+        // Left edge is now Minimize (slot 0), then Maximize, then Close.
+        assert_eq!(
+            hit_test(&c, SURFACE_W, CW, CH, 1.0, 5.0),
+            ChromeHit::Minimize
+        );
+        assert_eq!(
+            hit_test(&c, SURFACE_W, CW, CH, w + 1.0, 5.0),
+            ChromeHit::Maximize
+        );
+        assert_eq!(
+            hit_test(&c, SURFACE_W, CW, CH, 2.0 * w + 1.0, 5.0),
+            ChromeHit::Close
+        );
+
+        // Hamburger moved to the far right.
+        assert_eq!(
+            hit_test(&c, SURFACE_W, CW, CH, SURFACE_W - 1.0, 5.0),
+            ChromeHit::Hamburger
+        );
+        let layout = layout(&c, SURFACE_W, CW, CH);
+        let hamburger = layout.hamburger.expect("hamburger present");
+        assert_eq!(hamburger.x + hamburger.w, SURFACE_W);
+
+        // Tabs start after the three controls, not at the hamburger's old left slot.
+        let tabs_left = 3.0 * w;
+        assert_eq!(
+            hit_test(&c, SURFACE_W, CW, CH, tabs_left + 5.0, 5.0),
+            ChromeHit::Tab(0)
+        );
+        // The first cell is no longer the hamburger (it became Minimize).
+        assert_ne!(
+            hit_test(&c, SURFACE_W, CW, CH, 1.0, 5.0),
+            ChromeHit::Hamburger
         );
     }
 

@@ -17,15 +17,16 @@ use super::App;
 
 impl App {
     /// Place the traversal cursor at the focused pane's terminal cursor, where
-    /// the prompt sits, when entering Normal mode. The shell cursor rests one
-    /// cell past the last typed character; clamp onto it so Normal mode never
-    /// starts beyond the typed text (Vim steps left off the end on `Esc`).
+    /// the prompt sits, when entering Normal mode. The shell cursor marks the
+    /// insertion point (one past the last typed character); Normal mode adopts
+    /// that exact column so the cursor does not appear to jump when switching
+    /// modes — only its shape changes (e.g. bar → block).
     pub(crate) fn init_nav_cursor(&mut self, focused: PaneId) {
         if let Some(pane) = self.panes.get(&focused) {
             let grid = pane.grid();
             let (cursor_row, cursor_col) = grid.cursor();
             let row = cursor_row.min(grid.rows().saturating_sub(1));
-            let col = cursor_col.min(vim::nav_line_end(grid, row));
+            let col = cursor_col.min(grid.cols().saturating_sub(1));
             self.nav_cursor = Some((row, col));
         }
     }

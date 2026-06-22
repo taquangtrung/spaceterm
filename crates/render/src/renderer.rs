@@ -99,11 +99,15 @@ pub struct PaneRect {
 pub struct PaneView<'a> {
     pub grid: &'a Grid,
     pub labels: Option<&'a [(usize, usize, char)]>,
-    /// The Normal-mode traversal cursor, in viewport `(row, col)`, drawn as a
-    /// block. `None` when the pane is not being navigated.
+    /// The Normal-mode traversal cursor, in viewport `(row, col)`, drawn in
+    /// [`Self::cursor_shape`]. `None` when the pane is not being navigated.
     pub nav_cursor: Option<(usize, usize)>,
     pub rect: PaneRect,
     pub selection: Option<(usize, usize, usize, usize)>,
+    /// The shape used to draw whichever cursor is active: the in-grid shell
+    /// cursor when `nav_cursor` is `None`, or the traversal cursor otherwise.
+    /// Hosts pick this per pane from the active mode's configured shape.
+    pub cursor_shape: CursorShape,
 }
 
 /// A Vim-style bottom status bar: the `label` (e.g. " NORMAL ") is drawn over a
@@ -307,7 +311,13 @@ impl GpuRenderer {
         surface.configure(&device, &config);
 
         let font_size = font.size * scale_factor as f32;
-        let line_height = font_size * (DEFAULT_LINE_HEIGHT / DEFAULT_FONT_SIZE);
+        // Round to whole pixels so the line stride cosmic-text uses for shaping
+        // matches `cell_height` (which `measure_cell` also rounds). Without this,
+        // a fractional `line_height` (e.g. font_size 14 → 18.667) accumulates a
+        // sub-pixel drift per row until the cursor — drawn at `row * cell_height` —
+        // sits half a line below the glyphs cosmic-text laid out at
+        // `row * line_height`.
+        let line_height = (font_size * (DEFAULT_LINE_HEIGHT / DEFAULT_FONT_SIZE)).round();
         let font_family = font
             .family
             .or_else(|| Some(DEFAULT_FONT_FAMILY.to_string()));
@@ -625,7 +635,8 @@ impl GpuRenderer {
         if scale_changed {
             // Recompute physical font size and line height
             self.font_size = self.logical_font_size * scale_factor as f32;
-            self.line_height = self.font_size * (DEFAULT_LINE_HEIGHT / DEFAULT_FONT_SIZE);
+            self.line_height =
+                (self.font_size * (DEFAULT_LINE_HEIGHT / DEFAULT_FONT_SIZE)).round();
             
             // Re-measure cell
             let (cell_width, cell_height) = measure_cell(
@@ -727,6 +738,7 @@ impl GpuRenderer {
                 BgParams {
                     cw: self.cell_width,
                     ch: self.cell_height,
+                    cursor_shape: pane.cursor_shape,
                     hide_cursor: pane.nav_cursor.is_some(),
                     surface_w,
                     surface_h,
@@ -743,11 +755,13 @@ impl GpuRenderer {
                 if nav_row < pane_rows && nav_col < pane_cols {
                     let px0 = rect.x + nav_col as f32 * self.cell_width;
                     let py0 = rect.y + nav_row as f32 * self.cell_height;
+                    let (qx0, qy0, qx1, qy1) =
+                        cursor_quad(pane.cursor_shape, px0, py0, self.cell_width, self.cell_height);
                     all_bg_verts.extend_from_slice(&quad_vertices(
-                        px0,
-                        py0,
-                        px0 + self.cell_width,
-                        py0 + self.cell_height,
+                        qx0,
+                        qy0,
+                        qx1,
+                        qy1,
                         self.theme.cursor_bg.as_linear(),
                         surface_w,
                         surface_h,
@@ -1518,6 +1532,7 @@ impl BgVertex {
 struct BgParams<'a> {
     cw: f32,
     ch: f32,
+    cursor_shape: CursorShape,
     hide_cursor: bool,
     labels: Option<&'a [(usize, usize, char)]>,
     offset_x: f32,
@@ -1532,6 +1547,7 @@ fn build_bg_vertices_offset(grid: &Grid, params: BgParams) -> Vec<BgVertex> {
     let BgParams {
         cw,
         ch,
+        cursor_shape,
         hide_cursor,
         surface_w,
         surface_h,
@@ -1583,19 +1599,7 @@ fn build_bg_vertices_offset(grid: &Grid, params: BgParams) -> Vec<BgVertex> {
                 let px0 = offset_x + col as f32 * cw;
                 let py0 = offset_y + row as f32 * ch;
                 let (px0, py0, px1, py1) = if is_cursor {
-                    let px1_full = px0 + cw;
-                    let py1_full = py0 + ch;
-                    match grid.cursor_shape() {
-                        CursorShape::Block => (px0, py0, px1_full, py1_full),
-                        CursorShape::Bar => {
-                            let px1 = px0 + cw * CURSOR_BAR_WIDTH_RATIO;
-                            (px0, py0, px1, py1_full)
-                        }
-                        CursorShape::Underline => {
-                            let py0_new = py1_full - ch * CURSOR_UNDERLINE_HEIGHT_RATIO;
-                            (px0, py0_new, px1_full, py1_full)
-                        }
-                    }
+                    cursor_quad(cursor_shape, px0, py0, cw, ch)
                 } else {
                     (px0, py0, px0 + cw, py0 + ch)
                 };
@@ -1808,6 +1812,25 @@ fn create_bg_pipeline(device: &Device, format: TextureFormat) -> RenderPipeline 
 // ========================================================================
 // Helpers
 // ========================================================================
+
+/// The pixel rect of a cursor of `shape` whose full cell starts at `(x, y)`
+/// with size `(cw, ch)`. Block fills the cell; Bar covers a thin strip on the
+/// left edge; Underline covers a thin strip on the bottom edge.
+fn cursor_quad(shape: CursorShape, x: f32, y: f32, cw: f32, ch: f32) -> (f32, f32, f32, f32) {
+    let x1_full = x + cw;
+    let y1_full = y + ch;
+    match shape {
+        CursorShape::Block => (x, y, x1_full, y1_full),
+        CursorShape::Bar => {
+            let x1 = x + cw * CURSOR_BAR_WIDTH_RATIO;
+            (x, y, x1, y1_full)
+        }
+        CursorShape::Underline => {
+            let y0 = y1_full - ch * CURSOR_UNDERLINE_HEIGHT_RATIO;
+            (x, y0, x1_full, y1_full)
+        }
+    }
+}
 
 /// Two triangles covering the pixel rect `[px0,px1] x [py0,py1]` in `color`,
 /// converted to normalized device coordinates for the bg pipeline.
@@ -2418,7 +2441,7 @@ mod tests {
     use super::*;
 
     fn sample_menu_chrome(selected: Option<usize>) -> crate::chrome::TopChrome {
-        use crate::chrome::{Menu, MenuItem, MenuStyle, TabLabel, TopChrome};
+        use crate::chrome::{ControlsSide, Menu, MenuItem, MenuStyle, TabLabel, TopChrome};
         let leaf = |label: &str, shortcut: &str| MenuItem {
             children: Vec::new(),
             label: label.into(),
@@ -2426,6 +2449,7 @@ mod tests {
         };
         TopChrome {
             active_tab: 0,
+            controls_side: ControlsSide::Right,
             menu_style: MenuStyle::Modern,
             menus: vec![Menu {
                 title: "Menu".into(),
@@ -2622,6 +2646,7 @@ mod tests {
             BgParams {
                 cw: 10.0,
                 ch: 20.0,
+                cursor_shape: CursorShape::Block,
                 hide_cursor: false,
                 surface_w: 800.0,
                 surface_h: 600.0,
@@ -2644,6 +2669,7 @@ mod tests {
             BgParams {
                 cw: 10.0,
                 ch: 20.0,
+                cursor_shape: CursorShape::Block,
                 hide_cursor: false,
                 surface_w: 800.0,
                 surface_h: 600.0,
@@ -2666,6 +2692,7 @@ mod tests {
             BgParams {
                 cw: 10.0,
                 ch: 20.0,
+                cursor_shape: CursorShape::Block,
                 hide_cursor: false,
                 surface_w: 800.0,
                 surface_h: 600.0,
@@ -2681,6 +2708,7 @@ mod tests {
             BgParams {
                 cw: 10.0,
                 ch: 20.0,
+                cursor_shape: CursorShape::Block,
                 hide_cursor: false,
                 surface_w: 800.0,
                 surface_h: 600.0,
@@ -2703,6 +2731,7 @@ mod tests {
             BgParams {
                 cw: 10.0,
                 ch: 20.0,
+                cursor_shape: CursorShape::Block,
                 hide_cursor: false,
                 surface_w: 800.0,
                 surface_h: 600.0,
@@ -2726,6 +2755,7 @@ mod tests {
             BgParams {
                 cw: 10.0,
                 ch: 20.0,
+                cursor_shape: CursorShape::Block,
                 hide_cursor: false,
                 surface_w: 800.0,
                 surface_h: 600.0,

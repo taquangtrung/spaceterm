@@ -195,14 +195,15 @@ fn prev_row(grid: &mut Grid, row: usize) -> usize {
 /// Usually the last printed character ([`Grid::visible_line_end`]), so the
 /// cursor never wanders into the blank padding past a line. On the live prompt
 /// row it extends to the shell cursor: a typed trailing space is indistinguishable
-/// from blank padding in the cell grid (both are `' '`), so the shell cursor is
-/// the only marker of the command's true end, keeping its trailing whitespace
-/// navigable for editing.
+/// from blank padding in the cell grid (both are `' '`), and reaching the
+/// insertion point itself keeps the cursor at the same column when the user
+/// switches modes (Insert's shell cursor sits at that exact column).
 pub(super) fn nav_line_end(grid: &Grid, row: usize) -> usize {
     let end = grid.visible_line_end(row);
     let (cursor_row, cursor_col) = grid.cursor();
     if grid.scroll_offset() == 0 && row == cursor_row {
-        end.max(cursor_col.saturating_sub(1))
+        let cap = grid.cols().saturating_sub(1);
+        end.max(cursor_col.min(cap))
     } else {
         end
     }
@@ -266,19 +267,22 @@ mod tests {
         }
         assert_eq!(grid.visible_line_end(0), 1); // last printed glyph is 'd'
         assert_eq!(grid.cursor(), (0, 3));
-        // The trailing space at col 2 stays navigable.
-        assert_eq!(nav_line_end(&grid, 0), 2);
+        // nav_line_end reaches the shell cursor's column so the Normal-mode
+        // cursor can sit at the same position the Insert-mode cursor did.
+        assert_eq!(nav_line_end(&grid, 0), 3);
     }
 
     #[test]
-    fn test_nav_line_end_stops_at_last_char_without_trailing_space() {
+    fn test_nav_line_end_reaches_shell_cursor_without_trailing_space() {
         let mut grid = Grid::new(20, 3);
         for ch in "cd".chars() {
             grid.print(ch);
         }
-        // No trailing whitespace: stop on 'd' (Vim leaves the cursor on the
-        // last character, not one past it).
-        assert_eq!(nav_line_end(&grid, 0), 1);
+        // Even without trailing whitespace, nav_line_end reaches the shell
+        // cursor (col 2) so Normal mode can start at the same column Insert's
+        // shell cursor occupied.
+        assert_eq!(grid.cursor(), (0, 2));
+        assert_eq!(nav_line_end(&grid, 0), 2);
     }
 
     #[test]

@@ -189,6 +189,7 @@ impl App {
             .collect();
         TopChrome {
             active_tab: self.active_tab,
+            controls_side: self.config.window_controls_side,
             menu_style: self.config.menu_style,
             menus,
             open_menu: self.open_menu,
