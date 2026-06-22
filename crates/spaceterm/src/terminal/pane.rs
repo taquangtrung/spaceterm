@@ -43,6 +43,14 @@ pub(crate) const MAX_IMAGE_ROWS: usize = 24;
 /// pixel dimensions at emit time (so they reserve an exact band).
 const RASTER_MIMES: [&str; 4] = ["image/gif", "image/jpeg", "image/png", "image/webp"];
 
+/// Whether `url`'s scheme is on the safe-open allowlist (`http`, `https`,
+/// `mailto`). Rejects `file://`, `javascript:`, custom app schemes, and
+/// anything else that could invoke an unexpected OS handler on Ctrl+click.
+fn is_safe_url_scheme(url: &str) -> bool {
+    let scheme = url.split(':').next().unwrap_or("").to_ascii_lowercase();
+    matches!(scheme.as_str(), "http" | "https" | "mailto")
+}
+
 /// Number of renderable (`Content`/`Live`) segments across the scrollback, used
 /// to detect how many blocks an escape just produced.
 fn content_segment_count(scrollback: &Scrollback) -> usize {
@@ -278,6 +286,22 @@ impl Perform for CombinedPerformer {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        // OSC 8 ; params ; URI — open/close a hyperlink on the visual grid.
+        // Only store URLs whose scheme is on the allowlist so that rogue
+        // sequences cannot cause Ctrl+click to invoke arbitrary OS handlers
+        // (e.g. `file://`, `javascript:`, custom app schemes).
+        if params.first() == Some(&b"8".as_slice()) {
+            let uri: String = params
+                .get(2..)
+                .unwrap_or_default()
+                .iter()
+                .map(|b| String::from_utf8_lossy(b))
+                .collect::<Vec<_>>()
+                .join(";");
+            let safe = !uri.is_empty() && is_safe_url_scheme(&uri);
+            self.grid.set_active_link(safe.then_some(uri.as_str()));
+        }
+
         let before = content_segment_count(self.performer.scrollback());
         Perform::osc_dispatch(&mut self.performer, params, bell_terminated);
         let after = content_segment_count(self.performer.scrollback());

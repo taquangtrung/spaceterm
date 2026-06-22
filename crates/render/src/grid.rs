@@ -9,12 +9,16 @@
 /// scrollback history ring. Scrolling up reveals previously scrolled-off rows.
 #[derive(Clone, Debug)]
 pub struct Grid {
+    /// Intern ID of the currently active OSC 8 hyperlink; 0 = none.
+    active_link: u16,
     alt_buffer: Option<Box<AltBuffer>>,
     bracketed_paste: bool,
     cells: Vec<Cell>,
     cols: usize,
     cursor: Cursor,
     focus_event: bool,
+    /// Intern table for OSC 8 URLs; index 0 is always the empty string (no link).
+    link_table: Vec<String>,
     mouse_button: bool,
     mouse_drag: bool,
     mouse_sgr: bool,
@@ -41,6 +45,8 @@ pub struct Style {
     pub bold: bool,
     pub foreground: Color,
     pub italic: bool,
+    /// Intern ID into [`Grid::link_table`]; 0 means no hyperlink.
+    pub link: u16,
     pub underline: bool,
 }
 
@@ -149,12 +155,15 @@ impl Grid {
     /// A blank grid of `cols` x `rows` cells with the cursor at the origin.
     pub fn new(cols: usize, rows: usize) -> Self {
         Self {
+            active_link: 0,
             alt_buffer: None,
             bracketed_paste: false,
             cells: vec![Cell::default(); cols * rows],
             cols,
             cursor: Cursor::default(),
             focus_event: false,
+            // Index 0 is the sentinel "no link" entry so id 0 always means none.
+            link_table: vec![String::new()],
             mouse_button: false,
             mouse_drag: false,
             mouse_sgr: false,
@@ -212,6 +221,40 @@ impl Grid {
         self.style = style;
     }
 
+    /// Open or close an OSC 8 hyperlink. `None` or an empty string clears the
+    /// active link; any other value is interned and stamped into future cells.
+    pub fn set_active_link(&mut self, url: Option<&str>) {
+        self.active_link = match url {
+            None | Some("") => 0,
+            Some(u) => self.intern_link(u),
+        };
+    }
+
+    /// Intern `url` into the link table, returning its ID (>0). Reuses an
+    /// existing slot when the same URL has been seen before.
+    fn intern_link(&mut self, url: &str) -> u16 {
+        if let Some(i) = self.link_table.iter().position(|s| s == url) {
+            return i as u16;
+        }
+        let id = self.link_table.len() as u16;
+        self.link_table.push(url.to_string());
+        id
+    }
+
+    /// Resolve a link ID to its URL. Returns `None` for id 0 (no link).
+    pub fn link_url(&self, id: u16) -> Option<&str> {
+        if id == 0 {
+            return None;
+        }
+        self.link_table.get(id as usize).map(String::as_str)
+    }
+
+    /// The hyperlink URL of the visible cell at (row, col), if any.
+    pub fn cell_link(&self, row: usize, col: usize) -> Option<&str> {
+        let cell = self.visible_cell(row, col)?;
+        self.link_url(cell.style.link)
+    }
+
     /// Print a character at the cursor and advance, wrapping and scrolling as
     /// needed.
     pub fn print(&mut self, ch: char) {
@@ -222,7 +265,7 @@ impl Grid {
         if let Some(index) = self.index(self.cursor.row, self.cursor.col) {
             self.cells[index] = Cell {
                 ch,
-                style: self.style,
+                style: Style { link: self.active_link, ..self.style },
             };
         }
         self.cursor.col += 1;
@@ -516,6 +559,7 @@ impl Grid {
         self.scroll_offset = 0;
         self.scroll_top = 0;
         self.scroll_bottom = self.rows.saturating_sub(1);
+        self.active_link = 0;
     }
 
     /// Switch back to the primary screen buffer, restoring the saved state.
@@ -530,6 +574,7 @@ impl Grid {
         self.scroll_offset = 0;
         self.scroll_top = 0;
         self.scroll_bottom = self.rows.saturating_sub(1);
+        self.active_link = 0;
     }
 
     pub fn is_alt_screen(&self) -> bool {
@@ -1117,5 +1162,59 @@ mod tests {
         grid.reset_scroll_region();
         assert_eq!(grid.scroll_top(), 0);
         assert_eq!(grid.scroll_bottom(), 4);
+    }
+
+    #[test]
+    fn test_intern_link_deduplicates_same_url() {
+        let mut grid = Grid::new(5, 1);
+        let id1 = grid.intern_link("https://a.com");
+        let id2 = grid.intern_link("https://a.com");
+        assert!(id1 > 0);
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_intern_link_different_urls_get_different_ids() {
+        let mut grid = Grid::new(5, 1);
+        let id1 = grid.intern_link("https://a.com");
+        let id2 = grid.intern_link("https://b.com");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_link_url_zero_returns_none() {
+        let grid = Grid::new(5, 1);
+        assert_eq!(grid.link_url(0), None);
+    }
+
+    #[test]
+    fn test_set_active_link_stamps_cells() {
+        let mut grid = Grid::new(5, 1);
+        grid.set_active_link(Some("https://example.com"));
+        grid.print('h');
+        grid.print('i');
+        grid.set_active_link(None);
+        grid.print('!');
+
+        let id = grid.cell(0, 0).unwrap().style.link;
+        assert!(id > 0);
+        assert_eq!(grid.link_url(id), Some("https://example.com"));
+        assert_eq!(grid.cell(0, 1).unwrap().style.link, id);
+        assert_eq!(grid.cell(0, 2).unwrap().style.link, 0);
+    }
+
+    #[test]
+    fn test_cell_link_returns_url_for_linked_cell() {
+        let mut grid = Grid::new(5, 1);
+        grid.set_active_link(Some("https://x.io"));
+        grid.print('x');
+        assert_eq!(grid.cell_link(0, 0), Some("https://x.io"));
+    }
+
+    #[test]
+    fn test_cell_link_returns_none_for_unlinked_cell() {
+        let mut grid = Grid::new(5, 1);
+        grid.print('x');
+        assert_eq!(grid.cell_link(0, 0), None);
     }
 }

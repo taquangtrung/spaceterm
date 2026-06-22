@@ -28,7 +28,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::config::{config_file_paths, Config, StatusBarConfig};
 use crate::model::input::{self, Action, KeyCode, PendingPrefix, WindowKeymap};
@@ -300,6 +300,9 @@ pub struct App {
     /// block), resolved against in Normal mode.
     pub(crate) window_keymap: WindowKeymap,
     pub(crate) window_title: String,
+    /// The URL of the hyperlinked cell currently under the pointer, if any.
+    /// Drives the pointer-cursor icon and Ctrl+click to open.
+    pub(crate) hovered_url: Option<String>,
 }
 
 /// A block drawn natively via the GPU. `id` keys the renderer's texture cache;
@@ -416,6 +419,7 @@ impl App {
             window: None,
             window_keymap,
             window_title: String::new(),
+            hovered_url: None,
         }
     }
 
@@ -1628,6 +1632,22 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // Ctrl+click on a hyperlinked cell opens the URL in the browser.
+                // Double-check the scheme even though `osc_dispatch` already
+                // filtered it, as defense in depth.
+                if state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && self.modifiers.state().control_key()
+                {
+                    if let Some(url) = &self.hovered_url {
+                        let scheme = url.split(':').next().unwrap_or("").to_ascii_lowercase();
+                        if matches!(scheme.as_str(), "http" | "https" | "mailto") {
+                            let _ = open::that(url);
+                            return;
+                        }
+                    }
+                }
+
                 let mouse_active = self.panes.get(&focused).is_some_and(|p| p.mouse_tracking());
 
                 if mouse_active {
@@ -1726,6 +1746,20 @@ impl ApplicationHandler for App {
                         if let Some(window) = &self.window {
                             window.request_redraw();
                         }
+                    }
+                }
+
+                // Update hovered hyperlink and change the pointer cursor.
+                let new_url = self.hovered_link_at(x, y);
+                if new_url != self.hovered_url {
+                    self.hovered_url = new_url;
+                    if let Some(window) = &self.window {
+                        let icon = if self.hovered_url.is_some() {
+                            CursorIcon::Pointer
+                        } else {
+                            CursorIcon::Default
+                        };
+                        window.set_cursor(icon);
                     }
                 }
             }

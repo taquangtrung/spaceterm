@@ -1776,6 +1776,31 @@ fn build_bg_vertices_offset(grid: &Grid, params: BgParams) -> Vec<BgVertex> {
                     b,
                 });
             }
+
+            // Underline bar for SGR 4 (style.underline) or OSC 8 hyperlink cells.
+            if let Some(cell) = cell {
+                if cell.style.underline || cell.style.link != 0 {
+                    let ul_color = if let GridColor::Default = cell.style.foreground {
+                        theme.foreground.as_linear()
+                    } else {
+                        grid_color_to_rgb(&cell.style.foreground, theme)
+                    };
+                    let (ur, ug, ub) = ul_color;
+                    let px0 = offset_x + col as f32 * cw;
+                    let py_top = offset_y + row as f32 * ch + ch - UNDERLINE_BOTTOM_OFFSET - UNDERLINE_THICKNESS;
+                    let py_bot = py_top + UNDERLINE_THICKNESS;
+                    let ux0 = px0 * 2.0 / surface_w - 1.0;
+                    let ux1 = (px0 + cw) * 2.0 / surface_w - 1.0;
+                    let uy0 = 1.0 - py_top * 2.0 / surface_h;
+                    let uy1 = 1.0 - py_bot * 2.0 / surface_h;
+                    verts.push(BgVertex { x: ux0, y: uy0, r: ur, g: ug, b: ub });
+                    verts.push(BgVertex { x: ux1, y: uy0, r: ur, g: ug, b: ub });
+                    verts.push(BgVertex { x: ux0, y: uy1, r: ur, g: ug, b: ub });
+                    verts.push(BgVertex { x: ux1, y: uy0, r: ur, g: ug, b: ub });
+                    verts.push(BgVertex { x: ux1, y: uy1, r: ur, g: ug, b: ub });
+                    verts.push(BgVertex { x: ux0, y: uy1, r: ur, g: ug, b: ub });
+                }
+            }
         }
     }
 
@@ -1783,6 +1808,10 @@ fn build_bg_vertices_offset(grid: &Grid, params: BgParams) -> Vec<BgVertex> {
 }
 
 const DIVIDER_THICKNESS: f32 = 1.0;
+/// Height of the underline bar drawn for SGR 4 and OSC 8 hyperlink cells.
+const UNDERLINE_THICKNESS: f32 = 1.0;
+/// Distance from the bottom of a cell to the top of its underline bar.
+const UNDERLINE_BOTTOM_OFFSET: f32 = 2.0;
 
 fn compute_divider(
     a: PaneRect,

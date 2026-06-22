@@ -36,4 +36,12 @@ impl App {
         }
         None
     }
+
+    /// The hyperlink URL of the cell currently under the pointer, if any.
+    pub(crate) fn hovered_link_at(&self, x: f32, y: f32) -> Option<String> {
+        let (pane_id, pane_rect) = self.pane_at_pixel(x, y)?;
+        let pane = self.panes.get(&pane_id)?;
+        let (row, col) = self.pixel_to_cell(x, y, pane_rect);
+        pane.grid().cell_link(row, col).map(str::to_string)
+    }
 }
