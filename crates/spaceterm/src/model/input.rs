@@ -737,6 +737,18 @@ fn encode(key: &Key, flags: u32) -> Vec<u8> {
     }
 }
 
+/// Encode a key-release event for the Kitty protocol.
+/// Returns bytes only when `flags & 2 != 0` (bit 1: report event types).
+/// Release sequences use `: 3` as the event-type sub-field:
+///   `CSI codepoint :: 3 u`  (no modifier)
+///   `CSI codepoint ; modifier : 3 u`  (with modifier)
+pub fn encode_release(key: &Key, flags: u32) -> Vec<u8> {
+    if flags & 2 == 0 {
+        return Vec::new();
+    }
+    encode_kitty_release(key)
+}
+
 // ---- xterm baseline encoding ------------------------------------------------
 
 /// xterm modifier byte: 1 + shift + 2*alt + 4*ctrl. Value 1 means no modifier.
@@ -854,6 +866,45 @@ fn kitty_csi(codepoint: u32, modifier: u32) -> Vec<u8> {
         format!("\x1b[{codepoint}u").into_bytes()
     } else {
         format!("\x1b[{codepoint};{modifier}u").into_bytes()
+    }
+}
+
+/// Release variant: `CSI codepoint :: 3 u` (no modifier) or
+/// `CSI codepoint ; modifier : 3 u` (with modifier).
+fn kitty_csi_release(codepoint: u32, modifier: u32) -> Vec<u8> {
+    if modifier == 1 {
+        format!("\x1b[{codepoint}::3u").into_bytes()
+    } else {
+        format!("\x1b[{codepoint};{modifier}:3u").into_bytes()
+    }
+}
+
+/// Kitty release encoding: same key mapping as `encode_kitty` but with the
+/// `: 3` event-type suffix. Keys that map to raw bytes on press (bare chars,
+/// bare Tab, bare Enter, etc.) get full CSI sequences on release so the app
+/// can distinguish press from release.
+fn encode_kitty_release(key: &Key) -> Vec<u8> {
+    let m = kitty_modifier(key);
+    match key.code {
+        KeyCode::Char('\0') => Vec::new(),
+        KeyCode::Char(c) => kitty_csi_release(base_codepoint(c, key.shift), m),
+        KeyCode::Space => kitty_csi_release(32, m),
+        KeyCode::Tab => kitty_csi_release(9, m),
+        KeyCode::Enter => kitty_csi_release(13, m),
+        KeyCode::Escape => kitty_csi_release(27, m),
+        KeyCode::Backspace => kitty_csi_release(127, m),
+        KeyCode::Insert => kitty_csi_release(KP_INSERT, m),
+        KeyCode::Delete => kitty_csi_release(KP_DELETE, m),
+        KeyCode::Left => kitty_csi_release(KP_LEFT, m),
+        KeyCode::Right => kitty_csi_release(KP_RIGHT, m),
+        KeyCode::Up => kitty_csi_release(KP_UP, m),
+        KeyCode::Down => kitty_csi_release(KP_DOWN, m),
+        KeyCode::PageUp => kitty_csi_release(KP_PAGE_UP, m),
+        KeyCode::PageDown => kitty_csi_release(KP_PAGE_DOWN, m),
+        KeyCode::Home => kitty_csi_release(KP_HOME, m),
+        KeyCode::End => kitty_csi_release(KP_END, m),
+        KeyCode::F(n @ 1..=12) => kitty_csi_release(KP_F1 + (n as u32 - 1), m),
+        KeyCode::F(_) => Vec::new(),
     }
 }
 

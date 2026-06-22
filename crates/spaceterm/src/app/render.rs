@@ -109,6 +109,12 @@ impl App {
             })
             .collect();
 
+        let (cx, cy) = self.cursor_pos;
+        let hovered_pane: Option<PaneId> = rects.iter().find(|(_, r)| {
+            let pr = Self::layout_rect_to_pane(*r);
+            cx >= pr.x && cx < pr.x + pr.width && cy >= pr.y && cy < pr.y + pr.height
+        }).map(|(id, _)| *id);
+
         let mut views: Vec<PaneView> = Vec::new();
         for (i, (id, rect)) in rects.iter().enumerate() {
             if let Some(pane) = self.panes.get(id) {
@@ -143,9 +149,17 @@ impl App {
                 } else {
                     self.config.cursor.insert
                 };
+                let hovered_link = if hovered_pane == Some(*id) {
+                    self.hovered_url.as_deref()
+                        .map(|url| pane.grid().find_link_id(url))
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
                 views.push(PaneView {
                     cursor_shape,
                     grid: pane.grid(),
+                    hovered_link,
                     labels,
                     nav_cursor,
                     rect: Self::layout_rect_to_pane(*rect),
@@ -242,13 +256,20 @@ impl App {
         }
 
         let pane_title = self.pane_titles.get(&focused).cloned();
-        let status = status_bar(
+        let mut status = status_bar(
             mode,
             renderer.theme(),
             pane_title,
             notice,
             &self.config.status_bar,
         );
+        if self.search_query.as_deref().is_some_and(|q| !q.is_empty()) {
+            status.right_label = Some(if self.search_match_total == 0 {
+                "no matches".to_string()
+            } else {
+                format!("{}/{}", self.search_match_index, self.search_match_total)
+            });
+        }
         let status = self.config.status_bar.enabled.then_some(&status);
         let palette_view = self.palette.as_ref().map(|p| PaletteView {
             empty_message: if p.mode == crate::model::palette::PaletteMode::History {
@@ -323,6 +344,7 @@ impl App {
         let view = PaneView {
             cursor_shape: CursorShape::Block,
             grid: &grid,
+            hovered_link: 0,
             labels: None,
             // An out-of-bounds nav cursor suppresses the terminal cursor (the
             // settings grid has no caret of its own) without drawing a nav block.

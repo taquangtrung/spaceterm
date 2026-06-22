@@ -86,6 +86,50 @@ impl App {
         }
     }
 
+    /// Copy the current selection to the X11/Wayland primary selection buffer.
+    /// On non-Linux platforms this is a no-op.
+    pub(crate) fn copy_selection_to_primary(&self) {
+        #[cfg(target_os = "linux")]
+        if let Some(text) = self.selected_text() {
+            use arboard::{LinuxClipboardKind, SetExtLinux};
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                let _ = cb.set().clipboard(LinuxClipboardKind::Primary).text(text);
+            }
+        }
+    }
+
+    /// Paste text from the X11/Wayland primary selection buffer.
+    /// On non-Linux platforms this falls back to the regular clipboard.
+    pub(crate) fn paste_from_primary(&mut self) {
+        let text = self.get_primary_text();
+        let Some(text) = text else { return };
+        let focused = self.tab().focused();
+        let Some(pane) = self.panes.get_mut(&focused) else { return };
+        if pane.bracketed_paste() {
+            let mut bytes = Vec::with_capacity(text.len() + 12);
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            pane.write(&bytes);
+        } else {
+            pane.write(text.as_bytes());
+        }
+    }
+
+    fn get_primary_text(&self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            use arboard::{GetExtLinux, LinuxClipboardKind};
+            return arboard::Clipboard::new()
+                .ok()
+                .and_then(|mut cb| cb.get().clipboard(LinuxClipboardKind::Primary).text().ok());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            arboard::Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok())
+        }
+    }
+
     pub(crate) fn paste_from_clipboard(&mut self) {
         let text = match arboard::Clipboard::new() {
             Ok(mut cb) => cb.get_text().ok(),

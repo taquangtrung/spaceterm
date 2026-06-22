@@ -133,6 +133,8 @@ pub struct Config {
     pub opacity: f32,
     /// Draw an underline under fuzzy-matched characters in the command palette.
     pub palette_match_underline: bool,
+    /// Right-click pastes from the clipboard instead of opening the context menu.
+    pub paste_on_right_click: bool,
     /// Maximum scrollback rows per pane. `None` uses the compiled-in default (10 000).
     pub scrollback_lines: Option<usize>,
     /// Path or name of the shell to launch in new panes. Overrides `SHELL` and
@@ -327,6 +329,8 @@ struct KdlConfig {
     title_bar_style: Option<String>,
     #[knuffel(child, unwrap(argument))]
     palette_match_underline: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    paste_on_right_click: Option<String>,
     #[knuffel(child, unwrap(argument))]
     window_controls_side: Option<String>,
     #[knuffel(child)]
@@ -635,6 +639,7 @@ impl Config {
                 .unwrap_or(1.0f32)
                 .clamp(0.1, 1.0),
             palette_match_underline: parse_bool(kdl.palette_match_underline.as_deref(), false),
+            paste_on_right_click: parse_bool(kdl.paste_on_right_click.as_deref(), false),
             scrollback_lines: kdl.scrollback_lines.as_deref().and_then(|s| s.parse::<usize>().ok()).filter(|&n| n > 0),
             shell: kdl.shell.filter(|s| !s.trim().is_empty()),
             status_bar,
@@ -682,6 +687,10 @@ impl Config {
         out.push_str(&format!(
             "palette-match-underline {}\n",
             kdl_bool(self.palette_match_underline)
+        ));
+        out.push_str(&format!(
+            "paste-on-right-click {}\n",
+            kdl_bool(self.paste_on_right_click)
         ));
         out.push_str(&format!(
             "title-bar-style {}\n",
@@ -818,6 +827,7 @@ impl Default for Config {
             menu_style: MenuStyle::default(),
             opacity: 1.0,
             palette_match_underline: false,
+            paste_on_right_click: false,
             scrollback_lines: None,
             shell: None,
             status_bar: StatusBarConfig::default(),
@@ -884,6 +894,22 @@ pub fn config_file_paths() -> Vec<PathBuf> {
         dir.join("keys.kdl"),
         dir.join("spaceterm.kdl"),
     ]
+}
+
+/// Load the last saved window dimensions from `<config_dir>/window-size`.
+/// Returns `None` if the file is missing or cannot be parsed.
+pub fn load_window_size() -> Option<(u32, u32)> {
+    let text = std::fs::read_to_string(config_dir().join("window-size")).ok()?;
+    let (w, h) = text.trim().split_once('x')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
+}
+
+/// Persist window dimensions to `<config_dir>/window-size`.
+pub fn save_window_size(width: u32, height: u32) {
+    let dir = config_dir();
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(dir.join("window-size"), format!("{width}x{height}"));
+    }
 }
 
 /// Parse a KDL boolean-ish string (`"true"`/`"false"`), falling back to `default`.

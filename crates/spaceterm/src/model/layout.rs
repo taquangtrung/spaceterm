@@ -76,6 +76,19 @@ pub enum FocusDir {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PaneId(pub u64);
 
+/// A serializable snapshot of a `Tab`'s split tree. Used by the session module
+/// to persist and restore the pane layout across restarts.
+#[derive(Clone, Debug)]
+pub enum LayoutTree {
+    Pane(PaneId),
+    Split {
+        direction: Direction,
+        ratio: f32,
+        first: Box<LayoutTree>,
+        second: Box<LayoutTree>,
+    },
+}
+
 // ========================================================================
 // Tab
 // ========================================================================
@@ -93,6 +106,20 @@ impl Tab {
             root: Node::Leaf(root),
             zoomed: false,
         }
+    }
+
+    /// Rebuild a `Tab` from a [`LayoutTree`] snapshot, e.g. on session restore.
+    pub fn from_tree(tree: LayoutTree, focused: PaneId) -> Self {
+        Self {
+            focused,
+            root: layout_tree_to_node(tree),
+            zoomed: false,
+        }
+    }
+
+    /// Export the split tree as a [`LayoutTree`] for session persistence.
+    pub fn export_tree(&self) -> LayoutTree {
+        node_to_layout_tree(&self.root)
     }
 
     /// The currently focused pane.
@@ -427,6 +454,30 @@ fn distance(a: (f32, f32), b: (f32, f32)) -> f32 {
     let dx = a.0 - b.0;
     let dy = a.1 - b.1;
     dx * dx + dy * dy
+}
+
+fn layout_tree_to_node(tree: LayoutTree) -> Node {
+    match tree {
+        LayoutTree::Pane(id) => Node::Leaf(id),
+        LayoutTree::Split { direction, ratio, first, second } => Node::Split(SplitNode {
+            direction,
+            ratio,
+            first: Box::new(layout_tree_to_node(*first)),
+            second: Box::new(layout_tree_to_node(*second)),
+        }),
+    }
+}
+
+fn node_to_layout_tree(node: &Node) -> LayoutTree {
+    match node {
+        Node::Leaf(id) => LayoutTree::Pane(*id),
+        Node::Split(s) => LayoutTree::Split {
+            direction: s.direction,
+            ratio: s.ratio,
+            first: Box::new(node_to_layout_tree(&s.first)),
+            second: Box::new(node_to_layout_tree(&s.second)),
+        },
+    }
 }
 
 // ========================================================================

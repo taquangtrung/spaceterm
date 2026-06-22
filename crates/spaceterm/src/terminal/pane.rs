@@ -12,7 +12,9 @@ use std::io::Cursor;
 use base64::Engine;
 use spaceterm_core::spaceterm_proto::EmitBlock;
 use spaceterm_core::{Performer, Scrollback, Segment};
-use spaceterm_render::{Grid, MAX_SCROLLBACK};
+use spaceterm_render::Grid;
+#[cfg(test)]
+use spaceterm_render::MAX_SCROLLBACK;
 use vte::{Params, Perform};
 
 use super::block_queue::BlockQueue;
@@ -609,6 +611,8 @@ impl Perform for CombinedPerformer {
 pub struct Pane {
     block_queue: BlockQueue,
     child: Box<dyn portable_pty::Child + Send>,
+    /// The shell or command path used to spawn this pane.
+    command: String,
     combined: CombinedPerformer,
     master: Box<dyn portable_pty::MasterPty + Send>,
     parser: vte::Parser,
@@ -626,12 +630,28 @@ impl Pane {
             .or_else(|| std::env::var("SHELL").ok())
             .unwrap_or_else(|| "/bin/bash".to_string());
 
-        let command = CommandBuilder::new(shell);
+        let command = CommandBuilder::new(&shell);
         Self::with_command(cols, rows, command, max_scrollback)
     }
 
     /// Spawn `command` under a PTY with the given grid dimensions.
-    pub fn with_command(cols: usize, rows: usize, mut command: CommandBuilder, max_scrollback: usize) -> Self {
+    pub fn with_command(cols: usize, rows: usize, command: CommandBuilder, max_scrollback: usize) -> Self {
+        let command_str = command
+            .get_argv()
+            .first()
+            .and_then(|a| a.to_str())
+            .unwrap_or("sh")
+            .to_string();
+        Self::with_command_labeled(cols, rows, command, max_scrollback, command_str)
+    }
+
+    fn with_command_labeled(
+        cols: usize,
+        rows: usize,
+        mut command: CommandBuilder,
+        max_scrollback: usize,
+        command_str: String,
+    ) -> Self {
         // Advertise SpaceTerm to the child so capability-detecting tools (e.g.
         // `spacecat`, `clients/client.sh`) emit rich blocks instead of the
         // plain-text fallback.
@@ -681,6 +701,7 @@ impl Pane {
         Self {
             block_queue: BlockQueue::new(),
             child,
+            command: command_str,
             combined: CombinedPerformer::new(cols, rows, max_scrollback),
             master: pair.master,
             parser: vte::Parser::new(),
@@ -845,6 +866,26 @@ impl Pane {
             Ok(None) => true,
             Err(_) => false,
         }
+    }
+
+    /// The shell or command path used to spawn this pane.
+    pub fn shell_command(&self) -> &str {
+        &self.command
+    }
+
+    /// Working directory of the foreground process running in this pane.
+    /// On Linux this reads `/proc/{pid}/cwd`; returns `None` on other
+    /// platforms or when the PID is not available.
+    pub fn cwd(&self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            let pid = self.child.process_id()?;
+            std::fs::read_link(format!("/proc/{pid}/cwd"))
+                .ok()
+                .and_then(|p| p.into_os_string().into_string().ok())
+        }
+        #[cfg(not(target_os = "linux"))]
+        { None }
     }
 }
 

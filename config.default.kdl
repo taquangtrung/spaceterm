@@ -11,6 +11,13 @@
 // Custom: the filename (without .kdl) of a file in ~/.config/spaceterm/themes/.
 theme "dark"
 
+// ── Terminal ──────────────────────────────────────────────────────────────────
+// Shell executable. Defaults to the SHELL environment variable.
+// shell "/bin/zsh"
+
+// Maximum scrollback lines per pane. Applied to new panes (default: 10000).
+// scrollback-lines "10000"
+
 // ── Font ──────────────────────────────────────────────────────────────────────
 // Font family. Falls back to the system monospace font when not set.
 // font "FiraCode Nerd Font"
@@ -48,6 +55,9 @@ menu-style "modern"
 
 // Underline fuzzy-matched characters in the command palette results list.
 palette-match-underline false
+
+// Right-click pastes from the clipboard instead of opening the context menu.
+paste-on-right-click false
 
 // ── Cursor ────────────────────────────────────────────────────────────────────
 // Per-mode cursor shapes: "block", "bar" (vertical beam), or "underline".

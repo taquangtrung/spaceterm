@@ -19,6 +19,7 @@ mod navigation;
 mod pointer;
 mod prompt_edit;
 mod render;
+mod session_restore;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -30,7 +31,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
-use crate::config::{config_file_paths, Config, StatusBarConfig};
+use crate::config::{config_file_paths, Config, StatusBarConfig, TitleBarStyle};
 use crate::model::input::{self, Action, KeyCode, PendingPrefix, WindowKeymap};
 use crate::model::layout::{Direction, FocusDir, PaneId, Rect, Tab};
 use crate::model::mode::Mode;
@@ -40,7 +41,7 @@ use crate::session::Session;
 use crate::terminal::pane::Pane;
 use crate::terminal::webview::WebViewManager;
 use spaceterm_render::renderer::{GpuRenderer, PaneRect};
-use spaceterm_render::{MenuStyle, StatusBar, Theme};
+use spaceterm_render::{ControlsSide, CursorShape, MenuStyle, StatusBar, Theme};
 
 // ========================================================================
 // Constants
@@ -74,6 +75,9 @@ const FONT_SIZE_STEP: f32 = 1.0;
 const MIN_OPACITY: f32 = 0.1;
 const MAX_OPACITY: f32 = 1.0;
 const OPACITY_STEP: f32 = 0.05;
+const MIN_SCROLLBACK: f32 = 100.0;
+const MAX_SCROLLBACK: f32 = 100_000.0;
+const SCROLLBACK_STEP: f32 = 1_000.0;
 
 const DEFAULT_COLS: u32 = 80;
 const DEFAULT_ROWS: u32 = 24;
@@ -236,6 +240,8 @@ pub struct App {
     /// Previous cursor pixel position during a split-divider drag, or `None`
     /// when no drag is in progress. Cleared on mouse release.
     pub(crate) divider_drag: Option<(f32, f32)>,
+    /// Which pane's scrollbar is being dragged, if any. Cleared on mouse release.
+    pub(crate) scrollbar_drag: Option<PaneId>,
     /// A transient error notice and the instant it expires, shown in the status
     /// bar (e.g. a Vim edit aimed at the non-editable scrollback area).
     pub(crate) error_notice: Option<(String, Instant)>,
@@ -272,6 +278,9 @@ pub struct App {
     pub(crate) quick_select: Option<Vec<QuickLabel>>,
     pub(crate) renderer: Option<GpuRenderer>,
     pub(crate) search_query: Option<String>,
+    /// 1-based index of the focused match (0 when no matches).
+    pub(crate) search_match_index: usize,
+    pub(crate) search_match_total: usize,
     pub(crate) selection: Option<Selection>,
     /// The open full-window settings page (a native text-mode overlay), or
     /// `None`. Rendered by [`render`] as a terminal grid covering the window.
@@ -406,6 +415,7 @@ impl App {
             cursor_pos: (0.0, 0.0),
             dirty: true,
             divider_drag: None,
+            scrollbar_drag: None,
             error_notice: None,
             folded_blocks: HashMap::new(),
             last_click: None,
@@ -430,6 +440,8 @@ impl App {
             quick_select: None,
             renderer: None,
             search_query: None,
+            search_match_index: 0,
+            search_match_total: 0,
             selection: None,
             settings_page: None,
             active_tab: 0,
@@ -1244,6 +1256,106 @@ impl App {
                 2,
             )
             .with_note("Applied on restart"),
+            {
+                let cursor_options = vec![
+                    ChoiceOption { label: "Block".into(), value: "block".into() },
+                    ChoiceOption { label: "Bar".into(), value: "bar".into() },
+                    ChoiceOption { label: "Underline".into(), value: "underline".into() },
+                ];
+                let idx = ["block", "bar", "underline"]
+                    .iter()
+                    .position(|&v| v == self.config.cursor.insert.as_value())
+                    .unwrap_or(1);
+                SettingsField::choice("cursor.insert", "Cursor (insert)", cursor_options, idx)
+                    .in_section("Cursor")
+            },
+            {
+                let cursor_options = vec![
+                    ChoiceOption { label: "Block".into(), value: "block".into() },
+                    ChoiceOption { label: "Bar".into(), value: "bar".into() },
+                    ChoiceOption { label: "Underline".into(), value: "underline".into() },
+                ];
+                let idx = ["block", "bar", "underline"]
+                    .iter()
+                    .position(|&v| v == self.config.cursor.normal.as_value())
+                    .unwrap_or(0);
+                SettingsField::choice("cursor.normal", "Cursor (normal)", cursor_options, idx)
+            },
+            {
+                let cursor_options = vec![
+                    ChoiceOption { label: "Block".into(), value: "block".into() },
+                    ChoiceOption { label: "Bar".into(), value: "bar".into() },
+                    ChoiceOption { label: "Underline".into(), value: "underline".into() },
+                ];
+                let idx = ["block", "bar", "underline"]
+                    .iter()
+                    .position(|&v| v == self.config.cursor.visual.as_value())
+                    .unwrap_or(0);
+                SettingsField::choice("cursor.visual", "Cursor (visual)", cursor_options, idx)
+            },
+            SettingsField::text(
+                "shell",
+                "Shell",
+                self.config.shell.clone().unwrap_or_default(),
+            )
+            .in_section("Terminal")
+            .with_note("Default shell executable. Applied to new panes"),
+            SettingsField::number(
+                "scrollback_lines",
+                "Scrollback lines",
+                self.config.scrollback_lines.unwrap_or(spaceterm_render::MAX_SCROLLBACK) as f32,
+                MIN_SCROLLBACK,
+                MAX_SCROLLBACK,
+                SCROLLBACK_STEP,
+                0,
+            )
+            .with_note("Applied to new panes"),
+            {
+                let cursor_options = vec![
+                    ChoiceOption { label: "Block".into(), value: "block".into() },
+                    ChoiceOption { label: "Bar".into(), value: "bar".into() },
+                    ChoiceOption { label: "Underline".into(), value: "underline".into() },
+                ];
+                let idx = ["block", "bar", "underline"]
+                    .iter()
+                    .position(|&v| v == self.config.cursor.block_focus.as_value())
+                    .unwrap_or(1);
+                SettingsField::choice("cursor.block_focus", "Cursor (block focus)", cursor_options, idx)
+                    .in_section("Cursor")
+            },
+            SettingsField::toggle(
+                "palette_match_underline",
+                "Palette match underline",
+                self.config.palette_match_underline,
+            )
+            .in_section("Palette")
+            .with_note("Underline fuzzy-matched characters in palette results"),
+            {
+                let side_options = vec![
+                    ChoiceOption { label: "Left".into(), value: "left".into() },
+                    ChoiceOption { label: "Right".into(), value: "right".into() },
+                ];
+                let idx = if self.config.window_controls_side == ControlsSide::Left { 0 } else { 1 };
+                SettingsField::choice("window_controls_side", "Window controls", side_options, idx)
+                    .in_section("Window")
+                    .with_note("Side for minimize/maximize/close buttons")
+            },
+            {
+                let style_options = vec![
+                    ChoiceOption { label: "Modern".into(), value: "modern".into() },
+                    ChoiceOption { label: "System".into(), value: "system".into() },
+                ];
+                let idx = if self.config.title_bar_style == TitleBarStyle::Modern { 0 } else { 1 };
+                SettingsField::choice("title_bar_style", "Title bar style", style_options, idx)
+                    .with_note("Applied on restart")
+            },
+            SettingsField::toggle(
+                "paste_on_right_click",
+                "Paste on right-click",
+                self.config.paste_on_right_click,
+            )
+            .in_section("Window")
+            .with_note("Right-click pastes clipboard instead of opening the context menu"),
         ];
         SettingsPage::new(fields)
     }
@@ -1359,6 +1471,49 @@ impl App {
                 self.config.status_bar.show_branding = value == "true";
                 self.dirty = true;
             }
+            "cursor.insert" => {
+                self.config.cursor.insert = CursorShape::from_value(value);
+                self.dirty = true;
+            }
+            "cursor.normal" => {
+                self.config.cursor.normal = CursorShape::from_value(value);
+                self.dirty = true;
+            }
+            "cursor.visual" => {
+                self.config.cursor.visual = CursorShape::from_value(value);
+                self.dirty = true;
+            }
+            "shell" => {
+                let trimmed = value.trim();
+                self.config.shell = (!trimmed.is_empty()).then(|| trimmed.to_string());
+            }
+            "scrollback_lines" => match value.parse::<f32>() {
+                Ok(n) if n >= 1.0 => {
+                    self.config.scrollback_lines = Some(n as usize);
+                }
+                _ => return false,
+            },
+            "cursor.block_focus" => {
+                self.config.cursor.block_focus = CursorShape::from_value(value);
+                self.dirty = true;
+            }
+            "palette_match_underline" => {
+                self.config.palette_match_underline = value == "true";
+                self.dirty = true;
+            }
+            "window_controls_side" => {
+                self.config.window_controls_side = match value {
+                    "left" => ControlsSide::Left,
+                    _ => ControlsSide::Right,
+                };
+                self.relayout_chrome();
+            }
+            "title_bar_style" => {
+                self.config.title_bar_style = TitleBarStyle::from_value(value);
+            }
+            "paste_on_right_click" => {
+                self.config.paste_on_right_click = value == "true";
+            }
             _ => return false,
         }
         true
@@ -1416,6 +1571,7 @@ impl ApplicationHandler for App {
                     if size_changed {
                         self.resize_all_panes();
                         self.dirty = true;
+                        crate::config::save_window_size(size.width, size.height);
                         if let Some(window) = &self.window {
                             window.request_redraw();
                         }
@@ -1447,13 +1603,7 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed {
-                    return;
-                }
-
                 let focused = self.tab().focused();
-                let mode = self.modes.get(&focused).copied().unwrap_or_default();
-
                 let mods_state = self.modifiers.state();
                 let key = input::Key {
                     alt: mods_state.alt_key(),
@@ -1461,6 +1611,26 @@ impl ApplicationHandler for App {
                     ctrl: mods_state.control_key(),
                     shift: mods_state.shift_key(),
                 };
+
+                if event.state == ElementState::Released {
+                    let kitty_flags = self
+                        .panes
+                        .get(&focused)
+                        .map(|p| p.kitty_flags())
+                        .unwrap_or(0);
+                    let bytes = input::encode_release(&key, kitty_flags);
+                    if !bytes.is_empty() {
+                        if let Some(pane) = self.panes.get_mut(&focused) {
+                            pane.write(&bytes);
+                        }
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                    return;
+                }
+
+                let mode = self.modes.get(&focused).copied().unwrap_or_default();
 
                 // While a tab rename is in progress, intercept all keyboard
                 // input: Enter confirms, Escape cancels, other keys edit the name.
@@ -1771,12 +1941,16 @@ impl ApplicationHandler for App {
                     return;
                 }
 
-                // Right-click opens the context menu (or replaces the current one).
+                // Right-click: paste if configured, otherwise open the context menu.
                 if state == ElementState::Pressed && button == MouseButton::Right {
-                    let (x, y) = self.cursor_pos;
-                    self.open_context_menu(x, y);
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
+                    if self.config.paste_on_right_click {
+                        self.paste_from_clipboard();
+                    } else {
+                        let (x, y) = self.cursor_pos;
+                        self.open_context_menu(x, y);
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
                     }
                     return;
                 }
@@ -1834,31 +2008,28 @@ impl ApplicationHandler for App {
                             self.divider_drag = Some((x, y));
                         } else {
                             // Scrollbar click: right-edge strip of a pane navigates scrollback.
-                            if let Some((cw, ch)) = self.renderer.as_ref().map(|r| r.cell_size()) {
-                                let vp = self.viewport_rect();
-                                let layout_vp = crate::model::layout::Rect::new(vp.x, vp.y, vp.width, vp.height);
-                                'scroll: for (id, rect) in self.tab().rects(layout_vp) {
-                                    let pr = Self::layout_rect_to_pane(rect);
-                                    let sb_x = pr.x + pr.width - SCROLLBAR_CLICK_WIDTH;
-                                    if x >= sb_x && x <= pr.x + pr.width
-                                        && y >= pr.y && y < pr.y + pr.height
-                                    {
-                                        if let Some(pane) = self.panes.get_mut(&id) {
-                                            let sbl = pane.grid().scrollback_len();
-                                            if sbl > 0 {
-                                                let rows = pane.grid().rows();
-                                                let total = (rows + sbl) as f32;
-                                                let frac = ((y - pr.y) / pr.height).clamp(0.0, 1.0);
-                                                let top_virtual = (frac * total) as usize;
-                                                let new_offset = sbl.saturating_sub(top_virtual);
-                                                let _ = cw;
-                                                let _ = ch;
-                                                pane.grid_mut().set_scroll_offset(new_offset);
-                                                if let Some(window) = &self.window {
-                                                    window.request_redraw();
-                                                }
-                                                break 'scroll;
+                            let vp = self.viewport_rect();
+                            let layout_vp = crate::model::layout::Rect::new(vp.x, vp.y, vp.width, vp.height);
+                            'scroll: for (id, rect) in self.tab().rects(layout_vp) {
+                                let pr = Self::layout_rect_to_pane(rect);
+                                let sb_x = pr.x + pr.width - SCROLLBAR_CLICK_WIDTH;
+                                if x >= sb_x && x <= pr.x + pr.width
+                                    && y >= pr.y && y < pr.y + pr.height
+                                {
+                                    if let Some(pane) = self.panes.get_mut(&id) {
+                                        let sbl = pane.grid().scrollback_len();
+                                        if sbl > 0 {
+                                            let rows = pane.grid().rows();
+                                            let total = (rows + sbl) as f32;
+                                            let frac = ((y - pr.y) / pr.height).clamp(0.0, 1.0);
+                                            let top_virtual = (frac * total) as usize;
+                                            let new_offset = sbl.saturating_sub(top_virtual);
+                                            pane.grid_mut().set_scroll_offset(new_offset);
+                                            self.scrollbar_drag = Some(id);
+                                            if let Some(window) = &self.window {
+                                                window.request_redraw();
                                             }
+                                            break 'scroll;
                                         }
                                     }
                                 }
@@ -1886,10 +2057,12 @@ impl ApplicationHandler for App {
                     (ElementState::Released, MouseButton::Left) => {
                         self.mouse_down = false;
                         self.divider_drag = None;
+                        self.scrollbar_drag = None;
                         self.copy_selection();
+                        self.copy_selection_to_primary();
                     }
                     (ElementState::Pressed, MouseButton::Middle) => {
-                        self.paste_from_clipboard();
+                        self.paste_from_primary();
                     }
                     _ => {}
                 }
@@ -1912,6 +2085,30 @@ impl ApplicationHandler for App {
                             self.dirty = true;
                             if let Some(window) = &self.window {
                                 window.request_redraw();
+                            }
+                        }
+                        return;
+                    }
+
+                    // Scrollbar drag: update scroll position proportionally.
+                    if let Some(sb_pane_id) = self.scrollbar_drag {
+                        let vp = self.viewport_rect();
+                        let layout_vp = crate::model::layout::Rect::new(vp.x, vp.y, vp.width, vp.height);
+                        if let Some((_, rect)) = self.tab().rects(layout_vp).into_iter().find(|(id, _)| *id == sb_pane_id) {
+                            let pr = Self::layout_rect_to_pane(rect);
+                            if let Some(pane) = self.panes.get_mut(&sb_pane_id) {
+                                let sbl = pane.grid().scrollback_len();
+                                if sbl > 0 {
+                                    let rows = pane.grid().rows();
+                                    let total = (rows + sbl) as f32;
+                                    let frac = ((y - pr.y) / pr.height).clamp(0.0, 1.0);
+                                    let top_virtual = (frac * total) as usize;
+                                    pane.grid_mut().set_scroll_offset(sbl.saturating_sub(top_virtual));
+                                    self.dirty = true;
+                                    if let Some(window) = &self.window {
+                                        window.request_redraw();
+                                    }
+                                }
                             }
                         }
                         return;
@@ -2010,11 +2207,22 @@ impl ApplicationHandler for App {
 
                 if scroll_lines != 0 {
                     if let Some(pane) = self.panes.get_mut(&focused) {
-                        let grid = pane.grid_mut();
-                        if scroll_lines > 0 {
-                            grid.scroll_up_history(scroll_lines as usize);
+                        // Alt-screen apps (vim, less, etc.) own their viewport — send
+                        // arrow keys so they respond to the scroll gesture instead of
+                        // us scrolling their non-existent scrollback.
+                        if pane.grid().is_alt_screen() {
+                            let arrow = if scroll_lines > 0 { b"\x1b[A" as &[u8] } else { b"\x1b[B" };
+                            let count = scroll_lines.unsigned_abs();
+                            for _ in 0..count {
+                                pane.write(arrow);
+                            }
                         } else {
-                            grid.scroll_down_history((-scroll_lines) as usize);
+                            let grid = pane.grid_mut();
+                            if scroll_lines > 0 {
+                                grid.scroll_up_history(scroll_lines as usize);
+                            } else {
+                                grid.scroll_down_history((-scroll_lines) as usize);
+                            }
                         }
                     }
                     self.dirty = true;

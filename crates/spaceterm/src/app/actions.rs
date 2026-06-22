@@ -143,6 +143,8 @@ impl App {
             }
             Action::SearchCancel => {
                 self.search_query = None;
+                self.search_match_index = 0;
+                self.search_match_total = 0;
                 self.dirty = true;
             }
             Action::SearchNext => {

@@ -264,6 +264,17 @@ impl Grid {
         self.link_url(cell.style.link)
     }
 
+    /// Return the link ID (non-zero) for the given URL, or 0 if it has never
+    /// been interned. Used to resolve a URL string back to its rendering ID so
+    /// the renderer can highlight all cells belonging to the hovered link.
+    pub fn find_link_id(&self, url: &str) -> u16 {
+        self.link_table
+            .iter()
+            .position(|s| s == url)
+            .map(|i| i as u16)
+            .unwrap_or(0)
+    }
+
     /// Scan the live cell buffer for plain-text `http://` / `https://` patterns
     /// and stamp matching cells with auto-detected link IDs. Cells that already
     /// carry an OSC 8 link are left untouched. Only the live (non-scrollback)

@@ -1,14 +1,14 @@
 //! Session restore: save and reload pane layouts across restarts.
 //!
 //! On clean exit, SpaceTerm writes a session file to
-//! `$XDG_STATE_HOME/spaceterm/session.json`. On startup with `--restore`, it
-//! recreates the same split layout and spawns fresh PTY children (not
-//! in-place reattach — that requires the multiplexer).
+//! `$XDG_STATE_HOME/spaceterm/session.json`. On the next launch SpaceTerm
+//! automatically restores the split layout and reopens each pane at its
+//! last working directory (PTY children are spawned fresh — not reattached).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::model::layout::{PaneId, Tab};
+use crate::model::layout::{Direction, LayoutTree, PaneId, Tab};
 
 // ========================================================================
 // Data Structures
@@ -18,7 +18,7 @@ use crate::model::layout::{PaneId, Tab};
 pub struct Session {
     pub focused: usize,
     pub panes: Vec<PaneSession>,
-    pub splits: Vec<SplitNode>,
+    pub layout: SessionTree,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -28,11 +28,17 @@ pub struct PaneSession {
     pub id: usize,
 }
 
+/// Serializable mirror of [`LayoutTree`].
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct SplitNode {
-    pub direction: String,
-    pub first: usize,
-    pub second: usize,
+#[serde(tag = "t")]
+pub enum SessionTree {
+    Pane { id: usize },
+    Split {
+        dir: String,
+        ratio: f32,
+        first: Box<SessionTree>,
+        second: Box<SessionTree>,
+    },
 }
 
 // ========================================================================
@@ -65,20 +71,63 @@ impl Session {
     }
 
     fn capture(tab: &Tab, panes: &HashMap<PaneId, crate::terminal::pane::Pane>) -> Self {
-        let focused = tab.focused().0;
+        let focused = tab.focused().0 as usize;
         let pane_sessions: Vec<PaneSession> = panes
-            .keys()
-            .map(|id| PaneSession {
+            .iter()
+            .map(|(id, pane)| PaneSession {
                 id: id.0 as usize,
-                command: None,
-                cwd: None,
+                command: Some(pane.shell_command().to_string()),
+                cwd: pane.cwd(),
             })
             .collect();
-        Session {
-            focused: focused as usize,
-            panes: pane_sessions,
-            splits: Vec::new(),
-        }
+        let layout = layout_tree_to_session(&tab.export_tree());
+        Session { focused, panes: pane_sessions, layout }
+    }
+
+    /// Reconstruct a `Tab` from this session snapshot. Returns the tab, the
+    /// focused `PaneId`, and a map of `PaneId -> (command, cwd)` so the caller
+    /// can spawn the right PTY for each pane.
+    pub fn into_tab(self) -> (Tab, PaneId, HashMap<PaneId, (Option<String>, Option<String>)>) {
+        let focused = PaneId(self.focused as u64);
+        let layout = session_to_layout_tree(&self.layout);
+        let tab = Tab::from_tree(layout, focused);
+        let pane_map = self
+            .panes
+            .into_iter()
+            .map(|p| (PaneId(p.id as u64), (p.command, p.cwd)))
+            .collect();
+        (tab, focused, pane_map)
+    }
+}
+
+// ========================================================================
+// Helpers
+// ========================================================================
+
+fn layout_tree_to_session(tree: &LayoutTree) -> SessionTree {
+    match tree {
+        LayoutTree::Pane(id) => SessionTree::Pane { id: id.0 as usize },
+        LayoutTree::Split { direction, ratio, first, second } => SessionTree::Split {
+            dir: match direction {
+                Direction::Horizontal => "h".to_string(),
+                Direction::Vertical => "v".to_string(),
+            },
+            ratio: *ratio,
+            first: Box::new(layout_tree_to_session(first)),
+            second: Box::new(layout_tree_to_session(second)),
+        },
+    }
+}
+
+fn session_to_layout_tree(tree: &SessionTree) -> LayoutTree {
+    match tree {
+        SessionTree::Pane { id } => LayoutTree::Pane(PaneId(*id as u64)),
+        SessionTree::Split { dir, ratio, first, second } => LayoutTree::Split {
+            direction: if dir == "h" { Direction::Horizontal } else { Direction::Vertical },
+            ratio: *ratio,
+            first: Box::new(session_to_layout_tree(first)),
+            second: Box::new(session_to_layout_tree(second)),
+        },
     }
 }
 
@@ -116,18 +165,19 @@ mod tests {
                     cwd: None,
                 },
             ],
-            splits: vec![SplitNode {
-                direction: "horizontal".into(),
-                first: 0,
-                second: 1,
-            }],
+            layout: SessionTree::Split {
+                dir: "v".into(),
+                ratio: 0.5,
+                first: Box::new(SessionTree::Pane { id: 0 }),
+                second: Box::new(SessionTree::Pane { id: 1 }),
+            },
         };
         let json = serde_json::to_string_pretty(&session).unwrap();
         let restored: Session = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.focused, 1);
         assert_eq!(restored.panes.len(), 2);
-        assert_eq!(restored.splits.len(), 1);
         assert_eq!(restored.panes[0].command.as_deref(), Some("/bin/bash"));
+        assert!(matches!(restored.layout, SessionTree::Split { .. }));
     }
 
     #[test]
@@ -144,5 +194,34 @@ mod tests {
             std::fs::remove_file(&path).ok();
         }
         assert!(Session::load().is_none());
+    }
+
+    #[test]
+    fn test_into_tab_single_pane() {
+        let session = Session {
+            focused: 0,
+            panes: vec![PaneSession { id: 0, command: Some("/bin/zsh".into()), cwd: None }],
+            layout: SessionTree::Pane { id: 0 },
+        };
+        let (tab, focused, pane_map) = session.into_tab();
+        assert_eq!(focused, PaneId(0));
+        assert_eq!(tab.focused(), PaneId(0));
+        assert_eq!(pane_map.len(), 1);
+        assert_eq!(pane_map[&PaneId(0)].0.as_deref(), Some("/bin/zsh"));
+    }
+
+    #[test]
+    fn test_layout_tree_round_trip() {
+        let tree = SessionTree::Split {
+            dir: "h".into(),
+            ratio: 0.3,
+            first: Box::new(SessionTree::Pane { id: 10 }),
+            second: Box::new(SessionTree::Pane { id: 11 }),
+        };
+        let layout = session_to_layout_tree(&tree);
+        let back = layout_tree_to_session(&layout);
+        let json1 = serde_json::to_string(&tree).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json1, json2);
     }
 }

@@ -110,6 +110,9 @@ pub struct PaneRect {
 pub struct PaneView<'a> {
     pub cursor_shape: CursorShape,
     pub grid: &'a Grid,
+    /// Link ID currently under the mouse pointer. Cells sharing this link get
+    /// a highlighted underline color. 0 means no link is hovered.
+    pub hovered_link: u16,
     pub labels: Option<&'a [(usize, usize, char)]>,
     /// The Normal-mode traversal cursor, in viewport `(row, col)`, drawn in
     /// [`Self::cursor_shape`]. `None` when the pane is not being navigated.
@@ -778,6 +781,7 @@ impl GpuRenderer {
                     cursor_shape: pane.cursor_shape,
                     cw: self.cell_width,
                     hide_cursor: pane.nav_cursor.is_some(),
+                    hovered_link: pane.hovered_link,
                     labels: pane.labels,
                     offset_x: rect.x,
                     offset_y: rect.y,
@@ -1678,6 +1682,7 @@ struct BgParams<'a> {
     cursor_shape: CursorShape,
     cw: f32,
     hide_cursor: bool,
+    hovered_link: u16,
     labels: Option<&'a [(usize, usize, char)]>,
     offset_x: f32,
     offset_y: f32,
@@ -1696,6 +1701,7 @@ fn build_bg_vertices_offset(grid: &Grid, params: BgParams) -> Vec<BgVertex> {
         cursor_shape,
         cw,
         hide_cursor,
+        hovered_link,
         labels,
         offset_x,
         offset_y,
@@ -1812,7 +1818,9 @@ fn build_bg_vertices_offset(grid: &Grid, params: BgParams) -> Vec<BgVertex> {
             // Underline bar for SGR 4 (style.underline) or OSC 8 hyperlink cells.
             if let Some(cell) = cell {
                 if cell.style.underline || cell.style.link != 0 {
-                    let ul_color = if let GridColor::Default = cell.style.foreground {
+                    let ul_color = if hovered_link != 0 && cell.style.link == hovered_link {
+                        theme.cursor_bg.as_linear()
+                    } else if let GridColor::Default = cell.style.foreground {
                         theme.foreground.as_linear()
                     } else {
                         grid_color_to_rgb(&cell.style.foreground, theme)
@@ -3263,6 +3271,7 @@ mod tests {
                 cursor_shape: CursorShape::Block,
                 cw: 10.0,
                 hide_cursor: false,
+                hovered_link: 0,
                 labels: None,
                 offset_x: 0.0,
                 offset_y: 0.0,
@@ -3289,6 +3298,7 @@ mod tests {
                 cursor_shape: CursorShape::Block,
                 cw: 10.0,
                 hide_cursor: false,
+                hovered_link: 0,
                 labels: None,
                 offset_x: 0.0,
                 offset_y: 0.0,
@@ -3315,6 +3325,7 @@ mod tests {
                 cursor_shape: CursorShape::Block,
                 cw: 10.0,
                 hide_cursor: false,
+                hovered_link: 0,
                 labels: None,
                 offset_x: 100.0,
                 offset_y: 50.0,
@@ -3334,6 +3345,7 @@ mod tests {
                 cursor_shape: CursorShape::Block,
                 cw: 10.0,
                 hide_cursor: false,
+                hovered_link: 0,
                 labels: None,
                 offset_x: 0.0,
                 offset_y: 0.0,
@@ -3360,6 +3372,7 @@ mod tests {
                 cursor_shape: CursorShape::Block,
                 cw: 10.0,
                 hide_cursor: false,
+                hovered_link: 0,
                 labels: None,
                 offset_x: 0.0,
                 offset_y: 0.0,
@@ -3387,6 +3400,7 @@ mod tests {
                 cursor_shape: CursorShape::Block,
                 cw: 10.0,
                 hide_cursor: false,
+                hovered_link: 0,
                 labels: Some(labels),
                 offset_x: 0.0,
                 offset_y: 0.0,

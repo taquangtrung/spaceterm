@@ -5,7 +5,7 @@ use std::sync::Arc;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowAttributes;
 
-use crate::config::{ThemeSetting, TitleBarStyle};
+use crate::config::{load_window_size, ThemeSetting, TitleBarStyle};
 use crate::terminal::pane::Pane;
 use spaceterm_render::renderer::GpuRenderer;
 use spaceterm_render::{FontConfig, Theme};
@@ -61,18 +61,20 @@ impl App {
         // Modern style is borderless: the tab strip is the title bar and carries
         // its own window controls. System style keeps the native OS decorations.
         let decorated = self.config.title_bar_style == TitleBarStyle::System;
+        let base_attrs = WindowAttributes::default()
+            .with_title("SpaceTerm")
+            .with_decorations(decorated)
+            .with_transparent(want_transparency);
+        let window_attrs = match load_window_size() {
+            Some((w, h)) => base_attrs.with_inner_size(winit::dpi::PhysicalSize::new(w, h)),
+            None => base_attrs.with_inner_size(winit::dpi::LogicalSize::new(
+                DEFAULT_COLS * APPROX_CELL_WIDTH,
+                DEFAULT_ROWS * APPROX_CELL_HEIGHT,
+            )),
+        };
         let window = Arc::new(
             event_loop
-                .create_window(
-                    WindowAttributes::default()
-                        .with_title("SpaceTerm")
-                        .with_decorations(decorated)
-                        .with_transparent(want_transparency)
-                        .with_inner_size(winit::dpi::LogicalSize::new(
-                            DEFAULT_COLS * APPROX_CELL_WIDTH,
-                            DEFAULT_ROWS * APPROX_CELL_HEIGHT,
-                        )),
-                )
+                .create_window(window_attrs)
                 .expect("create window"),
         );
 
@@ -152,9 +154,12 @@ impl App {
 
         self.window = Some(window);
         self.renderer = Some(renderer);
-        // Re-size now that the renderer/window exist so the pane accounts for the
-        // reserved top-chrome and status-bar rows, not just the status bar.
-        self.resize_all_panes();
+        // Restore previous session layout if a session file exists. This
+        // replaces the single bootstrap pane with the saved split tree.
+        if !self.restore_session_if_present() {
+            // No session: just re-size the single bootstrap pane.
+            self.resize_all_panes();
+        }
         self.dirty = true;
     }
 }
