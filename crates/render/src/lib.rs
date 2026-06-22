@@ -14,7 +14,8 @@ mod screen;
 mod theme;
 
 pub use chrome::{
-    chrome_rows, hit_test, ChromeHit, ControlsSide, Menu, MenuItem, MenuStyle, TabLabel, TopChrome,
+    chrome_rows, hit_test, ChromeHit, ContextMenu, ControlsSide, Menu, MenuItem, MenuStyle,
+    TabLabel, TopChrome,
 };
 pub use grid::{Cell, Color, CursorShape, EraseMode, Grid, RgbColor, Style};
 pub use image::ImagePlacement;

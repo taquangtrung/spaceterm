@@ -5,7 +5,7 @@
 //! [`App::run_command`]), so a menu item and a palette entry that do the same
 //! thing share one dispatch path.
 
-use spaceterm_render::{ChromeHit, Menu, MenuItem, MenuStyle, TabLabel, TopChrome};
+use spaceterm_render::{ChromeHit, ContextMenu, Menu, MenuItem, MenuStyle, TabLabel, TopChrome};
 
 use super::App;
 use crate::config::TitleBarStyle;
@@ -60,6 +60,7 @@ const SEPARATOR: ItemDef = leaf("-", "-", "");
 const LAYOUT_ITEMS: &[ItemDef] = &[
     leaf("split_vertical", "Split Vertical", ""),
     leaf("split_horizontal", "Split Horizontal", ""),
+    leaf("toggle_pane_zoom", "Zoom Pane", "Ctrl-Shift-M"),
     leaf("close_pane", "Close Pane", ""),
 ];
 
@@ -189,9 +190,30 @@ impl App {
                 title: menu.title.to_string(),
             })
             .collect();
+        let context_menu = self.context_menu_pos.map(|(x, y)| {
+            ContextMenu {
+                items: self
+                    .context_menu_actions
+                    .iter()
+                    .map(|a| MenuItem {
+                        children: vec![],
+                        label: match a {
+                            super::ContextAction::Copy => "Copy".into(),
+                            super::ContextAction::Paste => "Paste".into(),
+                            super::ContextAction::OpenLink(_) => "Open Link".into(),
+                        },
+                        shortcut: String::new(),
+                    })
+                    .collect(),
+                selected: self.context_menu_selected,
+                x,
+                y,
+            }
+        });
         TopChrome {
             active_tab: self.active_tab,
             bell_tooltip_tab: self.bell_dot_hover,
+            context_menu,
             controls_side: self.config.window_controls_side,
             menu_style: self.config.menu_style,
             menus,
@@ -201,6 +223,58 @@ impl App {
             selected_subitem: self.selected_subitem,
             tabs,
             window_controls: self.config.title_bar_style == TitleBarStyle::Modern,
+        }
+    }
+
+    /// Close the right-click context menu.
+    pub(crate) fn close_context_menu(&mut self) {
+        if self.context_menu_pos.is_some() {
+            self.context_menu_pos = None;
+            self.context_menu_url = None;
+            self.context_menu_actions.clear();
+            self.context_menu_selected = None;
+            self.dirty = true;
+        }
+    }
+
+    /// Open a right-click context menu at `(x, y)`.
+    pub(crate) fn open_context_menu(&mut self, x: f32, y: f32) {
+        use super::ContextAction;
+        let mut actions: Vec<ContextAction> = Vec::new();
+        if self.selection.is_some() {
+            actions.push(ContextAction::Copy);
+        }
+        actions.push(ContextAction::Paste);
+        if let Some(url) = &self.hovered_url {
+            actions.push(ContextAction::OpenLink(url.clone()));
+        }
+        self.context_menu_pos = Some((x, y));
+        self.context_menu_url = self.hovered_url.clone();
+        self.context_menu_actions = actions;
+        self.context_menu_selected = None;
+        self.close_menu();
+        self.dirty = true;
+    }
+
+    /// Update the hovered context menu item from the pointer position while the
+    /// context menu is open.
+    pub(crate) fn update_context_menu_hover(&mut self, x: f32, y: f32) {
+        if self.context_menu_pos.is_none() {
+            return;
+        }
+        let Some((cw, ch)) = self.renderer.as_ref().map(|r| r.cell_size()) else {
+            return;
+        };
+        let surface_w = self.viewport_rect().width;
+        let chrome = self.build_top_chrome();
+        let hit = spaceterm_render::hit_test(&chrome, surface_w, cw, ch, x, y);
+        let new_sel = match hit {
+            ChromeHit::ContextMenuItem(i) => Some(i),
+            _ => None,
+        };
+        if new_sel != self.context_menu_selected {
+            self.context_menu_selected = new_sel;
+            self.dirty = true;
         }
     }
 
@@ -290,10 +364,30 @@ impl App {
                     }
                 }
             }
+            ChromeHit::ContextMenuItem(i) => {
+                if let Some(action) = self.context_menu_actions.get(i).cloned() {
+                    self.close_context_menu();
+                    match action {
+                        super::ContextAction::Copy => self.copy_selection(),
+                        super::ContextAction::Paste => self.paste_from_clipboard(),
+                        super::ContextAction::OpenLink(url) => {
+                            let scheme =
+                                url.split(':').next().unwrap_or("").to_ascii_lowercase();
+                            if matches!(scheme.as_str(), "http" | "https" | "mailto") {
+                                let _ = open::that(&url);
+                            }
+                        }
+                    }
+                }
+            }
             ChromeHit::BellDot(i) => {
                 self.tab_bells.remove(&i);
             }
             ChromeHit::None => {
+                if self.context_menu_pos.is_some() {
+                    self.close_context_menu();
+                    return true;
+                }
                 if menu_was_open {
                     self.close_menu();
                 } else if y < self.top_chrome_height() {
@@ -425,7 +519,7 @@ mod tests {
             .iter()
             .find(|it| it.label == "Layout")
             .expect("Layout parent");
-        assert_eq!(layout.children.len(), 3);
+        assert_eq!(layout.children.len(), 4);
         assert_eq!(layout.children[0].command, "split_vertical");
     }
 
@@ -455,7 +549,7 @@ mod tests {
         assert_eq!(chrome.open_submenu, Some(layout_idx));
         assert_eq!(chrome.selected_subitem, Some(1));
         assert!(chrome.menus[0].items[layout_idx].has_children());
-        assert_eq!(chrome.menus[0].items[layout_idx].children.len(), 3);
+        assert_eq!(chrome.menus[0].items[layout_idx].children.len(), 4);
     }
 
     #[test]

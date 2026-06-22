@@ -12,6 +12,9 @@
 pub struct Tab {
     focused: PaneId,
     root: Node,
+    /// When true, `rects()` returns only the focused pane at the full viewport;
+    /// cleared when the user calls `toggle_zoom()` again.
+    zoomed: bool,
 }
 
 /// A node in the split tree: a pane leaf or a binary split.
@@ -76,6 +79,7 @@ impl Tab {
         Self {
             focused: root,
             root: Node::Leaf(root),
+            zoomed: false,
         }
     }
 
@@ -91,11 +95,25 @@ impl Tab {
         out
     }
 
-    /// Each pane paired with its area within `viewport`.
+    /// Each pane paired with its area within `viewport`. When zoomed, only the
+    /// focused pane is returned and it occupies the entire viewport.
     pub fn rects(&self, viewport: Rect) -> Vec<(PaneId, Rect)> {
+        if self.zoomed {
+            return vec![(self.focused, viewport)];
+        }
         let mut out = Vec::new();
         collect_rects(&self.root, viewport, &mut out);
         out
+    }
+
+    /// Toggle the focused pane between full-viewport zoom and normal split layout.
+    pub fn toggle_zoom(&mut self) {
+        self.zoomed = !self.zoomed;
+    }
+
+    /// Whether the focused pane is currently expanded to fill the full viewport.
+    pub fn is_zoomed(&self) -> bool {
+        self.zoomed
     }
 
     /// Split the focused pane in two, placing the caller-allocated `new_id` as
@@ -358,6 +376,24 @@ mod tests {
         assert_eq!(tab.focused(), right);
         tab.focus_next();
         assert_eq!(tab.focused(), PaneId(0));
+    }
+
+    #[test]
+    fn test_zoom_returns_full_viewport_for_focused_pane() {
+        let mut tab = Tab::new();
+        let right = PaneId(1);
+        tab.split(Direction::Vertical, 0.5, right);
+        tab.focus(PaneId(0));
+        assert!(!tab.is_zoomed());
+        tab.toggle_zoom();
+        assert!(tab.is_zoomed());
+        let rects = tab.rects(VIEWPORT);
+        assert_eq!(rects.len(), 1, "only focused pane when zoomed");
+        assert_eq!(rects[0], (PaneId(0), VIEWPORT));
+        tab.toggle_zoom();
+        assert!(!tab.is_zoomed());
+        let rects = tab.rects(VIEWPORT);
+        assert_eq!(rects.len(), 2, "both panes restored after unzoom");
     }
 
     #[test]

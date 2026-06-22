@@ -91,12 +91,24 @@ impl MenuItem {
     }
 }
 
+/// A right-click context menu anchored at a pixel position.
+#[derive(Clone, Debug)]
+pub struct ContextMenu {
+    pub items: Vec<MenuItem>,
+    pub selected: Option<usize>,
+    /// Surface-pixel position of the top-left corner of the panel.
+    pub x: f32,
+    pub y: f32,
+}
+
 /// The full top-chrome model the app hands the renderer each frame.
 #[derive(Clone, Debug)]
 pub struct TopChrome {
     pub active_tab: usize,
     /// Tab index whose bell dot is being hovered; drives tooltip rendering.
     pub bell_tooltip_tab: Option<usize>,
+    /// A right-click context menu, or `None` when closed.
+    pub context_menu: Option<ContextMenu>,
     /// Which edge the window controls occupy; the hamburger button (modern style
     /// only) is placed on the opposite edge.
     pub controls_side: ControlsSide,
@@ -147,6 +159,8 @@ pub(crate) struct ChromeLayout {
     /// The `[minimize, maximize, close]` window-control targets at the right edge,
     /// or `None` when the OS draws the decorations.
     pub controls: Option<[Region; 3]>,
+    /// The right-click context menu panel, or `None` when closed.
+    pub context_menu: Option<DropdownLayout>,
     pub dropdown: Option<DropdownLayout>,
     /// The modern hamburger button, or `None` in classic style.
     pub hamburger: Option<Region>,
@@ -170,6 +184,8 @@ pub enum ChromeHit {
     /// The window close (`✕`) control.
     Close,
     CloseTab(usize),
+    /// An item in the right-click context menu, by index.
+    ContextMenuItem(usize),
     /// An item in the open dropdown, by index into that menu's `items`.
     DropdownItem(usize),
     Hamburger,
@@ -224,6 +240,15 @@ pub fn hit_test(
     y: f32,
 ) -> ChromeHit {
     let layout = layout(chrome, surface_w, cell_w, cell_h);
+
+    // The context menu overlays everything else when open.
+    if let Some(cm_layout) = &layout.context_menu {
+        for i in 0..cm_layout.items {
+            if dropdown_item_region(cm_layout, i).contains(x, y) {
+                return ChromeHit::ContextMenuItem(i);
+            }
+        }
+    }
 
     if let Some(submenu) = &layout.submenu {
         for i in 0..submenu.items {
@@ -456,9 +481,23 @@ pub(crate) fn layout(chrome: &TopChrome, surface_w: f32, cw: f32, ch: f32) -> Ch
         })
         .collect();
 
+    let context_menu = chrome.context_menu.as_ref().map(|cm| {
+        let width = panel_width(&cm.items, cw).min(surface_w);
+        let origin_x = cm.x.min(surface_w - width).max(0.0);
+        DropdownLayout {
+            item_h: ch * DROPDOWN_ITEM_RATIO,
+            items: cm.items.len(),
+            origin_x,
+            pad: ch * DROPDOWN_PAD_Y_CELLS,
+            top: cm.y,
+            width,
+        }
+    });
+
     ChromeLayout {
         bell_dots,
         closes,
+        context_menu,
         controls,
         dropdown,
         hamburger,
@@ -539,6 +578,7 @@ mod tests {
         TopChrome {
             active_tab: 0,
             bell_tooltip_tab: None,
+            context_menu: None,
             controls_side: ControlsSide::Right,
             menu_style: style,
             menus,

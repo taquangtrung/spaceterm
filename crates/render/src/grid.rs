@@ -255,6 +255,55 @@ impl Grid {
         self.link_url(cell.style.link)
     }
 
+    /// Scan the live cell buffer for plain-text `http://` / `https://` patterns
+    /// and stamp matching cells with auto-detected link IDs. Cells that already
+    /// carry an OSC 8 link are left untouched. Only the live (non-scrollback)
+    /// rows are scanned; scrollback is read-only.
+    pub fn detect_urls(&mut self) {
+        // Phase 1: collect (cell_start_idx, span_len, url_string) triples by
+        // reading self.cells without taking any long-lived borrows.
+        let mut spans: Vec<(usize, usize, String)> = Vec::new();
+
+        for row in 0..self.rows {
+            let row_start = row * self.cols;
+            let mut col = 0;
+            while col < self.cols {
+                let prefix_len = url_prefix_len(&self.cells, row_start, col, self.cols);
+                if prefix_len == 0 {
+                    col += 1;
+                    continue;
+                }
+                let start = col;
+                let mut end = col + prefix_len;
+                while end < self.cols {
+                    let ch = self.cells[row_start + end].ch;
+                    if is_url_stop(ch) {
+                        break;
+                    }
+                    end += 1;
+                }
+                if end > start + prefix_len {
+                    let url: String =
+                        (start..end).map(|c| self.cells[row_start + c].ch).collect();
+                    spans.push((row_start + start, end - start, url));
+                }
+                col = end;
+            }
+        }
+
+        // Phase 2: intern collected URLs and stamp cells (link_table borrow ends
+        // before each cells access).
+        for (cell_start, len, url) in spans {
+            let link_id = self.intern_link(&url);
+            for i in 0..len {
+                let idx = cell_start + i;
+                if self.cells[idx].style.link == 0 {
+                    self.cells[idx].style.link = link_id;
+                }
+            }
+        }
+    }
+
     /// Print a character at the cursor and advance, wrapping and scrolling as
     /// needed.
     pub fn print(&mut self, ch: char) {
@@ -738,6 +787,39 @@ impl Grid {
 }
 
 // ========================================================================
+// URL detection helpers
+// ========================================================================
+
+/// Number of characters in the URL scheme+authority prefix starting at `col`,
+/// or 0 if the cell sequence does not begin `https://` or `http://`.
+fn url_prefix_len(cells: &[Cell], row_start: usize, col: usize, cols: usize) -> usize {
+    let matches = |pat: &[u8]| -> bool {
+        pat.iter().enumerate().all(|(i, &b)| {
+            cells.get(row_start + col + i).map_or(false, |c| c.ch as u8 == b && c.ch.is_ascii())
+        })
+    };
+    if col + 8 <= cols && matches(b"https://") {
+        8
+    } else if col + 7 <= cols && matches(b"http://") {
+        7
+    } else {
+        0
+    }
+}
+
+/// Returns true for characters that terminate a URL in plain terminal text.
+fn is_url_stop(ch: char) -> bool {
+    ch == '\0'
+        || ch == ' '
+        || ch == '\t'
+        || ch == '"'
+        || ch == '\''
+        || ch == '<'
+        || ch == '>'
+        || (ch as u32) < 0x20
+}
+
+// ========================================================================
 // Cell
 // ========================================================================
 
@@ -1216,5 +1298,64 @@ mod tests {
         let mut grid = Grid::new(5, 1);
         grid.print('x');
         assert_eq!(grid.cell_link(0, 0), None);
+    }
+
+    #[test]
+    fn test_detect_urls_stamps_https_link() {
+        let mut grid = Grid::new(40, 1);
+        for ch in "visit https://example.com/page here".chars() {
+            grid.print(ch);
+        }
+        grid.detect_urls();
+        // The 'h' of 'https' starts the link; every char until space gets the ID.
+        let link_id = grid.cells[6].style.link;
+        assert!(link_id > 0, "https:// cell should have a link ID");
+        let url = grid.link_url(link_id).unwrap();
+        assert_eq!(url, "https://example.com/page");
+        // Cells before and after the URL have no link.
+        assert_eq!(grid.cells[0].style.link, 0);
+        assert_eq!(grid.cells[30].style.link, 0);
+    }
+
+    #[test]
+    fn test_detect_urls_http_scheme() {
+        let mut grid = Grid::new(30, 1);
+        for ch in "http://foo.io end".chars() {
+            grid.print(ch);
+        }
+        grid.detect_urls();
+        let link_id = grid.cells[0].style.link;
+        assert!(link_id > 0);
+        assert_eq!(grid.link_url(link_id), Some("http://foo.io"));
+        // Space terminates the URL; "end" has no link.
+        assert_eq!(grid.cells[14].style.link, 0);
+    }
+
+    #[test]
+    fn test_detect_urls_does_not_override_osc8_link() {
+        let mut grid = Grid::new(40, 1);
+        grid.set_active_link(Some("https://osc8.io"));
+        for ch in "https://osc8.io".chars() {
+            grid.print(ch);
+        }
+        grid.set_active_link(None);
+        // Manually store the osc8 link id before calling detect_urls.
+        let osc8_id = grid.cells[0].style.link;
+        assert!(osc8_id > 0);
+        grid.detect_urls();
+        // detect_urls should not replace the existing osc8 link.
+        assert_eq!(grid.cells[0].style.link, osc8_id);
+    }
+
+    #[test]
+    fn test_detect_urls_plain_text_no_urls_unchanged() {
+        let mut grid = Grid::new(20, 1);
+        for ch in "no links here today".chars() {
+            grid.print(ch);
+        }
+        grid.detect_urls();
+        for i in 0..19 {
+            assert_eq!(grid.cells[i].style.link, 0);
+        }
     }
 }

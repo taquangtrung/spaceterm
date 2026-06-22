@@ -58,6 +58,7 @@ const MAX_SVG_DIM: u32 = 4096;
 /// top of the id space so they never collide with block image ids.
 const DROPDOWN_TEXTURE_ID: u64 = u64::MAX;
 const SUBMENU_TEXTURE_ID: u64 = u64::MAX - 1;
+const CONTEXT_MENU_TEXTURE_ID: u64 = u64::MAX - 5;
 /// Reserved id for the rasterized top-chrome strip (band + rounded-top tabs).
 const CHROME_STRIP_TEXTURE_ID: u64 = u64::MAX - 2;
 /// Reserved id for the rasterized command-palette overlay.
@@ -1588,8 +1589,20 @@ impl GpuRenderer {
             chrome,
             surface_w,
         );
+        let context_image = context_menu_rgba(
+            &mut self.font_system,
+            &mut self.swash_cache,
+            &ctx,
+            &self.theme,
+            chrome,
+            surface_w,
+        );
         let mut placements = Vec::new();
-        for (id, image) in [(DROPDOWN_TEXTURE_ID, parent), (SUBMENU_TEXTURE_ID, submenu)] {
+        for (id, image) in [
+            (DROPDOWN_TEXTURE_ID, parent),
+            (SUBMENU_TEXTURE_ID, submenu),
+            (CONTEXT_MENU_TEXTURE_ID, context_image),
+        ] {
             let Some(image) = image else { continue };
             self.image_pass.upload(
                 &self.device,
@@ -2405,6 +2418,29 @@ fn submenu_rgba(
     Some(panel)
 }
 
+/// Rasterize the right-click context menu panel, or `None` when none is open.
+fn context_menu_rgba(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    ctx: &FontCtx,
+    theme: &Theme,
+    chrome: &TopChrome,
+    surface_w: f32,
+) -> Option<DropdownImage> {
+    let cm = chrome.context_menu.as_ref()?;
+    let layout = chrome_layout(chrome, surface_w, ctx.cell_w, ctx.cell_h);
+    let panel = panel_rgba(
+        font_system,
+        swash_cache,
+        ctx,
+        theme,
+        &cm.items,
+        &layout.context_menu?,
+        cm.selected,
+    );
+    Some(panel)
+}
+
 /// Rasterize one menu panel (`items` at `layout`) into an elevated, rounded,
 /// shadowed card. `selected` is the hover-highlighted row. A submenu parent
 /// (an item with children) gets a `›` chevron instead of a shortcut.
@@ -2994,6 +3030,7 @@ mod tests {
                 bell: false,
                 title: "Terminal 1".into(),
             }],
+            context_menu: None,
             window_controls: false,
         }
     }

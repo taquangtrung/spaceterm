@@ -303,6 +303,22 @@ pub struct App {
     /// The URL of the hyperlinked cell currently under the pointer, if any.
     /// Drives the pointer-cursor icon and Ctrl+click to open.
     pub(crate) hovered_url: Option<String>,
+    /// Active right-click context menu: pixel position where it was opened.
+    pub(crate) context_menu_pos: Option<(f32, f32)>,
+    /// The URL (if any) that was under the pointer when the context menu opened.
+    pub(crate) context_menu_url: Option<String>,
+    /// The actions bound to each context-menu item, parallel to the rendered list.
+    pub(crate) context_menu_actions: Vec<ContextAction>,
+    /// The currently hovered item in the context menu (drives the hover highlight).
+    pub(crate) context_menu_selected: Option<usize>,
+}
+
+/// An action dispatched from a right-click context menu item.
+#[derive(Clone)]
+pub(crate) enum ContextAction {
+    Copy,
+    OpenLink(String),
+    Paste,
 }
 
 /// A block drawn natively via the GPU. `id` keys the renderer's texture cache;
@@ -420,6 +436,10 @@ impl App {
             window_keymap,
             window_title: String::new(),
             hovered_url: None,
+            context_menu_pos: None,
+            context_menu_url: None,
+            context_menu_actions: Vec::new(),
+            context_menu_selected: None,
         }
     }
 
@@ -797,6 +817,7 @@ impl App {
         for (id, pane) in self.panes.iter_mut() {
             let prev_count = pane.block_queue().entries().len();
             if pane.drain_output() {
+                pane.grid_mut().detect_urls();
                 any = true;
             }
             if pane.take_bell() {
@@ -1020,6 +1041,13 @@ impl App {
             }
             "open_settings" => {
                 self.open_settings();
+            }
+            "toggle_pane_zoom" => {
+                self.tab_mut().toggle_zoom();
+                if self.renderer.is_some() {
+                    self.resize_all_panes();
+                }
+                self.dirty = true;
             }
             "cd_recent" => {
                 let dirs = self
@@ -1482,6 +1510,21 @@ impl ApplicationHandler for App {
                 }
 
                 if mods_state.control_key() && mods_state.shift_key() {
+                    // Ctrl+Shift+Up/Down: jump to prev/next prompt boundary.
+                    if key.code == KeyCode::Up {
+                        self.run_command("prev_block", focused);
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                        return;
+                    }
+                    if key.code == KeyCode::Down {
+                        self.run_command("next_block", focused);
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                        return;
+                    }
                     if let Key::Character(c) = event.logical_key.as_ref() {
                         let lower = c.to_lowercase();
                         if lower == "v" {
@@ -1534,6 +1577,12 @@ impl ApplicationHandler for App {
                                 self.run_command("cd_recent", focused);
                             }
                             self.dirty = true;
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                            return;
+                        } else if lower == "m" {
+                            self.run_command("toggle_pane_zoom", focused);
                             if let Some(window) = &self.window {
                                 window.request_redraw();
                             }
@@ -1655,6 +1704,53 @@ impl ApplicationHandler for App {
                     return;
                 }
 
+                // Right-click opens the context menu (or replaces the current one).
+                if state == ElementState::Pressed && button == MouseButton::Right {
+                    let (x, y) = self.cursor_pos;
+                    self.open_context_menu(x, y);
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
+
+                // Any left-press dismisses an open context menu before other handling.
+                if state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && self.context_menu_pos.is_some()
+                {
+                    let (x, y) = self.cursor_pos;
+                    let surface_w = self.viewport_rect().width;
+                    if let Some((cw, ch)) = self.renderer.as_ref().map(|r| r.cell_size()) {
+                        let chrome = self.build_top_chrome();
+                        let hit = spaceterm_render::hit_test(&chrome, surface_w, cw, ch, x, y);
+                        if let spaceterm_render::ChromeHit::ContextMenuItem(i) = hit {
+                            if let Some(action) = self.context_menu_actions.get(i).cloned() {
+                                self.close_context_menu();
+                                match action {
+                                    ContextAction::Copy => self.copy_selection(),
+                                    ContextAction::Paste => self.paste_from_clipboard(),
+                                    ContextAction::OpenLink(url) => {
+                                        let scheme = url
+                                            .split(':')
+                                            .next()
+                                            .unwrap_or("")
+                                            .to_ascii_lowercase();
+                                        if matches!(scheme.as_str(), "http" | "https" | "mailto") {
+                                            let _ = open::that(&url);
+                                        }
+                                    }
+                                }
+                                if let Some(window) = &self.window {
+                                    window.request_redraw();
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    self.close_context_menu();
+                }
+
                 match (state, button) {
                     (ElementState::Pressed, MouseButton::Left) => {
                         self.mouse_down = true;
@@ -1696,6 +1792,9 @@ impl ApplicationHandler for App {
 
                 if self.open_menu.is_some() {
                     self.update_menu_hover(x, y);
+                }
+                if self.context_menu_pos.is_some() {
+                    self.update_context_menu_hover(x, y);
                 }
 
                 // Update bell-dot hover so the renderer can show a tooltip.
