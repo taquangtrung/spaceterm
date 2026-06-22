@@ -330,6 +330,8 @@ pub struct App {
     pub(crate) context_menu_actions: Vec<ContextAction>,
     /// The currently hovered item in the context menu (drives the hover highlight).
     pub(crate) context_menu_selected: Option<usize>,
+    /// The font size from config at startup; Ctrl+0 resets back to this value.
+    pub(crate) base_font_size: f32,
 }
 
 /// An action dispatched from a right-click context menu item.
@@ -404,6 +406,7 @@ impl App {
             .iter()
             .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
             .collect();
+        let base_font_size = config.font_size;
 
         Self {
             bell_dot_hover: None,
@@ -465,6 +468,7 @@ impl App {
             context_menu_url: None,
             context_menu_actions: Vec::new(),
             context_menu_selected: None,
+            base_font_size,
         }
     }
 
@@ -596,6 +600,24 @@ impl App {
     pub(crate) fn flash_bell(&mut self) {
         self.bell_until = Some(Instant::now() + BELL_FLASH_DURATION);
         self.dirty = true;
+    }
+
+    /// Adjust font size by `delta` points; returns true when actually changed.
+    pub(crate) fn change_font_size(&mut self, delta: f32) -> bool {
+        let new_size = (self.config.font_size + delta).clamp(6.0, 72.0);
+        self.change_font_size_to(new_size)
+    }
+
+    /// Set font size to `logical_size` points; returns true when actually changed.
+    pub(crate) fn change_font_size_to(&mut self, logical_size: f32) -> bool {
+        let Some(renderer) = &mut self.renderer else { return false };
+        if renderer.set_font_size(logical_size).is_none() {
+            return false;
+        }
+        self.config.font_size = logical_size;
+        self.resize_all_panes();
+        self.dirty = true;
+        true
     }
 
     pub(crate) fn is_bell_active(&self) -> bool {
@@ -889,10 +911,7 @@ impl App {
                 // Mark the active tab with a 3-second notification dot.
                 self.tab_bells
                     .insert(self.active_tab, Instant::now() + TAB_BELL_DURATION);
-                // Optional background flash (only when visual-bell color is set).
-                if self.config.colors.bell.is_some() {
-                    self.flash_bell();
-                }
+                self.flash_bell();
             }
         }
         if !new_titles.is_empty() {
@@ -1532,7 +1551,7 @@ impl App {
     /// Persist the session and exit the event loop. Shared by the native close
     /// request and the custom window-close control.
     fn quit(&mut self, event_loop: &ActiveEventLoop) {
-        Session::save(self.tab(), &self.panes);
+        Session::save(&self.tabs, self.active_tab, &self.panes);
         self.panes.clear();
         event_loop.exit();
     }
@@ -1698,6 +1717,28 @@ impl ApplicationHandler for App {
                     if let Key::Character(c) = event.logical_key.as_ref() {
                         if c == "," || c == "<" {
                             self.open_settings();
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                            return;
+                        }
+                    }
+                }
+
+                // Ctrl+= / Ctrl++ increase font size; Ctrl+- decreases; Ctrl+0 resets.
+                if mods_state.control_key() && !mods_state.alt_key() && !mods_state.shift_key() {
+                    if let Key::Character(c) = event.logical_key.as_ref() {
+                        let changed = if c == "=" || c == "+" {
+                            self.change_font_size(1.0)
+                        } else if c == "-" {
+                            self.change_font_size(-1.0)
+                        } else if c == "0" {
+                            let base = self.base_font_size;
+                            self.change_font_size_to(base)
+                        } else {
+                            false
+                        };
+                        if changed {
                             if let Some(window) = &self.window {
                                 window.request_redraw();
                             }

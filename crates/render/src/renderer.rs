@@ -65,6 +65,8 @@ const CHROME_STRIP_TEXTURE_ID: u64 = u64::MAX - 2;
 const PALETTE_TEXTURE_ID: u64 = u64::MAX - 3;
 /// Reserved id for the rasterized bell-dot hover tooltip.
 const BELL_TOOLTIP_TEXTURE_ID: u64 = u64::MAX - 4;
+/// Reserved id for the rasterized URL hover tooltip.
+const URL_TOOLTIP_TEXTURE_ID: u64 = u64::MAX - 6;
 /// Maximum number of command results visible in the palette at once.
 const PALETTE_MAX_ITEMS: usize = 8;
 /// Palette panel width as a fraction of the surface width.
@@ -651,6 +653,33 @@ impl GpuRenderer {
         (self.cell_width, self.cell_height)
     }
 
+    /// Change the logical font size and recompute cell dimensions. Returns
+    /// `Some((cols, rows))` if the size changed, `None` if already at that size.
+    pub fn set_font_size(&mut self, logical_size: f32) -> Option<(usize, usize)> {
+        let logical_size = logical_size.clamp(6.0, 72.0);
+        if (self.logical_font_size - logical_size).abs() < 0.01 {
+            return None;
+        }
+        self.logical_font_size = logical_size;
+        self.font_size = logical_size * self.scale_factor as f32;
+        self.line_height = (self.font_size * (DEFAULT_LINE_HEIGHT / DEFAULT_FONT_SIZE)).round();
+        let (cell_width, cell_height) = measure_cell(
+            &mut self.font_system,
+            self.font_size,
+            self.line_height,
+            self.font_family.as_deref(),
+            self.normal_weight.as_deref(),
+        );
+        self.cell_width = cell_width;
+        self.cell_height = cell_height;
+        self.text_buffers.clear();
+        self.status_buffer = None;
+        self.status_right_buffer = None;
+        self.cols = (self.config.width as f32 / cell_width).floor() as usize;
+        self.rows = (self.config.height as f32 / cell_height).floor() as usize;
+        Some((self.cols.max(1), self.rows.max(1)))
+    }
+
     /// Resize the surface and recompute grid dimensions. Returns `Some((cols, rows))`
     /// if the size or scale factor actually changed.
     pub fn resize(&mut self, width: u32, height: u32, scale_factor: f64) -> Option<(usize, usize)> {
@@ -1105,6 +1134,9 @@ impl GpuRenderer {
             if let Some(placement) = self.rasterize_bell_tooltip(c, surface_w) {
                 all_images.push(placement);
             }
+            if let Some(placement) = self.rasterize_url_tooltip(c, surface_w, surface_h) {
+                all_images.push(placement);
+            }
         }
         if let Some(p) = palette {
             all_images.extend(self.rasterize_palette(p, surface_w, surface_h));
@@ -1451,6 +1483,55 @@ impl GpuRenderer {
         })
     }
 
+    /// Rasterize a URL tooltip bubble near the cursor when a link is hovered.
+    /// Returns `None` when no URL tooltip is set.
+    fn rasterize_url_tooltip(
+        &mut self,
+        chrome: &TopChrome,
+        surface_w: f32,
+        surface_h: f32,
+    ) -> Option<ImagePlacement> {
+        let (url, cx, cy) = chrome.url_tooltip.as_ref()?;
+        let cw = self.cell_width;
+        let ch = self.cell_height;
+        let ctx = FontCtx {
+            cell_h: ch,
+            cell_w: cw,
+            family: self.font_family.as_deref(),
+            font_size: self.font_size,
+            line_height: self.line_height,
+            normal_weight: self.normal_weight.as_deref(),
+            bold_weight: self.bold_weight.as_deref(),
+        };
+        let anchor = Region { x: *cx, y: *cy, w: 1.0, h: ch };
+        let image = url_tooltip_rgba(
+            &mut self.font_system,
+            &mut self.swash_cache,
+            &ctx,
+            &self.theme,
+            url,
+            &anchor,
+            surface_w,
+            surface_h,
+        );
+        self.image_pass.upload(
+            &self.device,
+            &self.queue,
+            URL_TOOLTIP_TEXTURE_ID,
+            &image.rgba,
+            image.width,
+            image.height,
+        );
+        Some(ImagePlacement {
+            height: image.height as f32,
+            id: URL_TOOLTIP_TEXTURE_ID,
+            v_max: 1.0,
+            width: image.width as f32,
+            x: image.x,
+            y: image.y,
+        })
+    }
+
     /// Rasterize the top-chrome strip, the recessed band, the rounded-top tab
     /// cards, and the hairline border, into a texture composited under the chrome
     /// text. The active tab is filled with the terminal background so it merges
@@ -1459,7 +1540,7 @@ impl GpuRenderer {
         &mut self,
         chrome: &TopChrome,
         surface_w: f32,
-        _bell_active: bool,
+        bell_active: bool,
     ) -> Option<ImagePlacement> {
         let cw = self.cell_width;
         let ch = self.cell_height;
@@ -1468,7 +1549,12 @@ impl GpuRenderer {
         let width = surface_w.ceil().max(1.0) as u32;
         let height = chrome_h.ceil().max(1.0) as u32;
         let canvas = (width, height);
-        let band = self.theme.tabbar_bg;
+        let band = if bell_active {
+            let flash = self.theme.bell.unwrap_or(Rgb { r: 0xd0, g: 0x80, b: 0x20 });
+            mix_rgb(self.theme.tabbar_bg, flash, 0.4)
+        } else {
+            self.theme.tabbar_bg
+        };
         let active_bg = self.theme.tab_active_bg;
         let inactive_bg = mix_rgb(self.theme.tabbar_bg, self.theme.tab_active_bg, 0.5);
 
@@ -2427,6 +2513,114 @@ fn bell_tooltip_rgba(
     }
 }
 
+/// Rasterize a URL tooltip bubble near the cursor. `anchor` is the cursor cell
+/// rect; the tooltip floats below it, clamped within the surface bounds.
+fn url_tooltip_rgba(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    ctx: &FontCtx,
+    theme: &Theme,
+    url: &str,
+    anchor: &Region,
+    surface_w: f32,
+    surface_h: f32,
+) -> DropdownImage {
+    const PAD_X: f32 = 8.0;
+    const PAD_Y: f32 = 4.0;
+    const RADIUS: f32 = 4.0;
+    const SHADOW_MARGIN: f32 = 6.0;
+    const MAX_URL_CHARS: usize = 80;
+
+    let display_url = if url.len() > MAX_URL_CHARS {
+        format!("{}...", &url[..MAX_URL_CHARS])
+    } else {
+        url.to_string()
+    };
+
+    let label_buf = shape_chrome_line(
+        font_system,
+        ctx,
+        &display_url,
+        theme.foreground.to_glyphon(),
+        false,
+        true,
+    );
+    let text_w = buffer_width(&label_buf).ceil();
+    let text_h = ctx.line_height;
+
+    let panel_w = text_w + PAD_X * 2.0;
+    let panel_h = text_h + PAD_Y * 2.0;
+    let total_w = (panel_w + SHADOW_MARGIN * 2.0) as u32;
+    let total_h = (panel_h + SHADOW_MARGIN * 2.0) as u32;
+    let canvas = (total_w, total_h);
+
+    // Place tooltip below the cursor, then flip above if it would go off-screen.
+    let tip_x = (anchor.x - panel_w * 0.5 - SHADOW_MARGIN)
+        .max(0.0)
+        .min((surface_w - total_w as f32).max(0.0));
+    let below_y = anchor.y + anchor.h + 2.0 - SHADOW_MARGIN;
+    let tip_y = if below_y + total_h as f32 > surface_h {
+        (anchor.y - total_h as f32 - 2.0 + SHADOW_MARGIN).max(0.0)
+    } else {
+        below_y
+    };
+
+    let mut rgba = vec![0u8; (total_w * total_h * 4) as usize];
+
+    for py in 0..total_h {
+        for px in 0..total_w {
+            let sdf = rounded_rect_sdf(
+                px as f32 + 0.5,
+                py as f32 + 0.5,
+                (SHADOW_MARGIN, SHADOW_MARGIN, panel_w, panel_h),
+                RADIUS,
+            );
+            let falloff = (1.0 - sdf / SHADOW_MARGIN).clamp(0.0, 1.0);
+            if sdf <= 0.0 || falloff <= 0.0 {
+                continue;
+            }
+            let idx = ((py * total_w + px) * 4) as usize;
+            blend_px(&mut rgba, idx, SHADOW_COLOR, falloff * falloff * DROPDOWN_SHADOW_ALPHA);
+        }
+    }
+
+    let border = mix_rgb(theme.menu_bg, Rgb::new(255, 255, 255), MENU_BORDER_MIX);
+    fill_rounded_rect(
+        &mut rgba,
+        canvas,
+        (SHADOW_MARGIN, SHADOW_MARGIN, panel_w, panel_h),
+        RADIUS,
+        border,
+        1.0,
+    );
+    fill_rounded_rect(
+        &mut rgba,
+        canvas,
+        (SHADOW_MARGIN + 1.0, SHADOW_MARGIN + 1.0, panel_w - 2.0, panel_h - 2.0),
+        RADIUS - 1.0,
+        theme.menu_bg,
+        1.0,
+    );
+
+    composite_buffer(
+        font_system,
+        swash_cache,
+        &mut rgba,
+        canvas,
+        &label_buf,
+        ((SHADOW_MARGIN + PAD_X) as i32, (SHADOW_MARGIN + PAD_Y) as i32),
+        theme.foreground.to_glyphon(),
+    );
+
+    DropdownImage {
+        height: total_h,
+        rgba,
+        width: total_w,
+        x: tip_x,
+        y: tip_y,
+    }
+}
+
 /// Rasterize the open dropdown overlay (soft shadow, elevated rounded panel,
 /// rounded hover pill, and sans-serif item text) to an RGBA image without the
 /// GPU. Returns `None` when no menu is open.
@@ -3093,6 +3287,7 @@ mod tests {
                 title: "Terminal 1".into(),
             }],
             context_menu: None,
+            url_tooltip: None,
             window_controls: false,
         }
     }

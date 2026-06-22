@@ -16,8 +16,23 @@ use crate::model::layout::{Direction, LayoutTree, PaneId, Tab};
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Session {
+    /// Index of the tab that was active when the session was saved.
+    #[serde(default)]
+    pub active_tab: usize,
+    /// Focused pane id within the active tab (legacy single-tab field).
     pub focused: usize,
     pub panes: Vec<PaneSession>,
+    /// Layout of the active tab (legacy single-tab field).
+    pub layout: SessionTree,
+    /// All tabs. When non-empty this takes precedence over `focused`/`layout`.
+    #[serde(default)]
+    pub tabs: Vec<TabSnapshot>,
+}
+
+/// Snapshot of one tab for multi-tab session persistence.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TabSnapshot {
+    pub focused: usize,
     pub layout: SessionTree,
 }
 
@@ -46,8 +61,12 @@ pub enum SessionTree {
 // ========================================================================
 
 impl Session {
-    pub fn save(tab: &Tab, panes: &HashMap<PaneId, crate::terminal::pane::Pane>) {
-        let session = Self::capture(tab, panes);
+    pub fn save(
+        tabs: &[Tab],
+        active_tab: usize,
+        panes: &HashMap<PaneId, crate::terminal::pane::Pane>,
+    ) {
+        let session = Self::capture(tabs, active_tab, panes);
         if let Ok(json) = serde_json::to_string_pretty(&session) {
             let path = session_path();
             if let Some(parent) = path.parent() {
@@ -70,8 +89,20 @@ impl Session {
         }
     }
 
-    fn capture(tab: &Tab, panes: &HashMap<PaneId, crate::terminal::pane::Pane>) -> Self {
-        let focused = tab.focused().0 as usize;
+    fn capture(
+        tabs: &[Tab],
+        active_tab: usize,
+        panes: &HashMap<PaneId, crate::terminal::pane::Pane>,
+    ) -> Self {
+        let active = tabs.get(active_tab).or_else(|| tabs.first());
+        let (legacy_focused, legacy_layout) = if let Some(tab) = active {
+            (
+                tab.focused().0 as usize,
+                layout_tree_to_session(&tab.export_tree()),
+            )
+        } else {
+            (0, SessionTree::Pane { id: 0 })
+        };
         let pane_sessions: Vec<PaneSession> = panes
             .iter()
             .map(|(id, pane)| PaneSession {
@@ -80,23 +111,59 @@ impl Session {
                 cwd: pane.cwd(),
             })
             .collect();
-        let layout = layout_tree_to_session(&tab.export_tree());
-        Session { focused, panes: pane_sessions, layout }
+        let tab_snapshots: Vec<TabSnapshot> = tabs
+            .iter()
+            .map(|tab| TabSnapshot {
+                focused: tab.focused().0 as usize,
+                layout: layout_tree_to_session(&tab.export_tree()),
+            })
+            .collect();
+        Session {
+            active_tab,
+            focused: legacy_focused,
+            panes: pane_sessions,
+            layout: legacy_layout,
+            tabs: tab_snapshots,
+        }
     }
 
-    /// Reconstruct a `Tab` from this session snapshot. Returns the tab, the
-    /// focused `PaneId`, and a map of `PaneId -> (command, cwd)` so the caller
-    /// can spawn the right PTY for each pane.
-    pub fn into_tab(self) -> (Tab, PaneId, HashMap<PaneId, (Option<String>, Option<String>)>) {
-        let focused = PaneId(self.focused as u64);
-        let layout = session_to_layout_tree(&self.layout);
-        let tab = Tab::from_tree(layout, focused);
-        let pane_map = self
+    /// Reconstruct all tabs from this session snapshot. Returns the tabs vec,
+    /// the active tab index, and a map of `PaneId -> (command, cwd)`.
+    pub fn into_tabs(
+        self,
+    ) -> (Vec<Tab>, usize, HashMap<PaneId, (Option<String>, Option<String>)>) {
+        let pane_map: HashMap<PaneId, (Option<String>, Option<String>)> = self
             .panes
             .into_iter()
             .map(|p| (PaneId(p.id as u64), (p.command, p.cwd)))
             .collect();
-        (tab, focused, pane_map)
+
+        let tabs = if !self.tabs.is_empty() {
+            self.tabs
+                .into_iter()
+                .map(|snap| {
+                    let focused = PaneId(snap.focused as u64);
+                    let layout = session_to_layout_tree(&snap.layout);
+                    Tab::from_tree(layout, focused)
+                })
+                .collect()
+        } else {
+            // Legacy single-tab session.
+            let focused = PaneId(self.focused as u64);
+            let layout = session_to_layout_tree(&self.layout);
+            vec![Tab::from_tree(layout, focused)]
+        };
+
+        let active_tab = self.active_tab.min(tabs.len().saturating_sub(1));
+        (tabs, active_tab, pane_map)
+    }
+
+    /// Reconstruct a `Tab` from this session snapshot (single-tab compat).
+    pub fn into_tab(self) -> (Tab, PaneId, HashMap<PaneId, (Option<String>, Option<String>)>) {
+        let focused_id = PaneId(self.focused as u64);
+        let (mut tabs, _, pane_map) = self.into_tabs();
+        let tab = tabs.remove(0);
+        (tab, focused_id, pane_map)
     }
 }
 
@@ -152,6 +219,7 @@ mod tests {
     #[test]
     fn test_session_round_trip() {
         let session = Session {
+            active_tab: 0,
             focused: 1,
             panes: vec![
                 PaneSession {
@@ -171,6 +239,7 @@ mod tests {
                 first: Box::new(SessionTree::Pane { id: 0 }),
                 second: Box::new(SessionTree::Pane { id: 1 }),
             },
+            tabs: vec![],
         };
         let json = serde_json::to_string_pretty(&session).unwrap();
         let restored: Session = serde_json::from_str(&json).unwrap();
@@ -199,15 +268,56 @@ mod tests {
     #[test]
     fn test_into_tab_single_pane() {
         let session = Session {
+            active_tab: 0,
             focused: 0,
             panes: vec![PaneSession { id: 0, command: Some("/bin/zsh".into()), cwd: None }],
             layout: SessionTree::Pane { id: 0 },
+            tabs: vec![],
         };
         let (tab, focused, pane_map) = session.into_tab();
         assert_eq!(focused, PaneId(0));
         assert_eq!(tab.focused(), PaneId(0));
         assert_eq!(pane_map.len(), 1);
         assert_eq!(pane_map[&PaneId(0)].0.as_deref(), Some("/bin/zsh"));
+    }
+
+    #[test]
+    fn test_multi_tab_into_tabs() {
+        let session = Session {
+            active_tab: 1,
+            focused: 2,
+            panes: vec![
+                PaneSession { id: 1, command: Some("/bin/bash".into()), cwd: None },
+                PaneSession { id: 2, command: Some("/bin/zsh".into()), cwd: None },
+            ],
+            layout: SessionTree::Pane { id: 1 },
+            tabs: vec![
+                TabSnapshot { focused: 1, layout: SessionTree::Pane { id: 1 } },
+                TabSnapshot { focused: 2, layout: SessionTree::Pane { id: 2 } },
+            ],
+        };
+        let (tabs, active, pane_map) = session.into_tabs();
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(active, 1);
+        assert_eq!(tabs[0].focused(), PaneId(1));
+        assert_eq!(tabs[1].focused(), PaneId(2));
+        assert_eq!(pane_map.len(), 2);
+    }
+
+    #[test]
+    fn test_legacy_single_tab_into_tabs() {
+        let session = Session {
+            active_tab: 0,
+            focused: 5,
+            panes: vec![PaneSession { id: 5, command: None, cwd: None }],
+            layout: SessionTree::Pane { id: 5 },
+            tabs: vec![],
+        };
+        let (tabs, active, pane_map) = session.into_tabs();
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(active, 0);
+        assert_eq!(tabs[0].focused(), PaneId(5));
+        assert_eq!(pane_map.len(), 1);
     }
 
     #[test]

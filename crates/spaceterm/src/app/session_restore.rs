@@ -15,12 +15,12 @@ use super::{content_rows, App, APPROX_CELL_HEIGHT, APPROX_CELL_WIDTH, DEFAULT_CO
 // ========================================================================
 
 impl App {
-    /// If a saved session exists, replace the current single-pane layout with
-    /// the persisted split tree and reopen each pane at its saved cwd.
+    /// If a saved session exists, replace the current layout with the persisted
+    /// split tree (across all tabs) and reopen each pane at its saved cwd.
     /// Returns `true` when a session was applied.
     pub(crate) fn restore_session_if_present(&mut self) -> bool {
         let Some(session) = Session::load() else { return false };
-        let (tab, focused, pane_map) = session.into_tab();
+        let (restored_tabs, restored_active, pane_map) = session.into_tabs();
 
         let (cols, rows) = if let Some(r) = &self.renderer {
             r.grid_size()
@@ -40,33 +40,34 @@ impl App {
         self.modes.remove(&bootstrap_id);
 
         // Spawn a PTY for every pane in the session.
-        let max_scrollback = self.config.scrollback_lines.unwrap_or(spaceterm_render::MAX_SCROLLBACK);
+        let max_scrollback =
+            self.config.scrollback_lines.unwrap_or(spaceterm_render::MAX_SCROLLBACK);
         let shell = self.config.shell.clone();
         for (id, (cmd, cwd)) in &pane_map {
-            let executable = cmd
-                .as_deref()
-                .or(shell.as_deref())
-                .unwrap_or("/bin/sh");
+            let executable = cmd.as_deref().or(shell.as_deref()).unwrap_or("/bin/sh");
             let mut builder = CommandBuilder::new(executable);
             if let Some(dir) = cwd {
                 builder.cwd(dir);
             }
-            let mut pane = Pane::with_command(cols.max(1), want_rows.max(1), builder, max_scrollback);
+            let mut pane =
+                Pane::with_command(cols.max(1), want_rows.max(1), builder, max_scrollback);
             pane.set_cell_size(cw, ch);
             self.panes.insert(*id, pane);
             self.modes.insert(*id, Mode::default());
         }
 
-        // Replace the tab layout and update the focused pane counter so future
-        // alloc_pane_id() calls yield IDs that don't collide with restored ones.
-        self.tabs[self.active_tab] = tab;
+        // Replace all tabs and update pane-id counter so future alloc_pane_id()
+        // calls don't collide with restored pane ids.
+        self.tabs = restored_tabs;
+        self.active_tab = restored_active.min(self.tabs.len().saturating_sub(1));
         let max_id = pane_map.keys().map(|id| id.0).max().unwrap_or(0);
         if max_id >= self.next_pane_id {
             self.next_pane_id = max_id + 1;
         }
 
-        // Focus the restored pane (if it exists in the layout, else any pane).
+        // Focus the restored pane for the active tab (fallback to first pane).
         let all_panes = self.tabs[self.active_tab].panes();
+        let focused = self.tabs[self.active_tab].focused();
         let target = if all_panes.contains(&focused) {
             focused
         } else {

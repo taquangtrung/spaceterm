@@ -105,7 +105,7 @@ status-bar {
 //     selection-fg     "#000000"
 //     split            "#51554f"   // pane divider lines
 //     status-bar-border "#3b414f"  // 1px line above the status bar
-//     visual-bell      "#202020"   // background flash on bell (disabled when unset)
+//     visual-bell      "#e08020"   // tab-bar flash color on bell (uses built-in default when unset)
 //
 //     // 8 normal ANSI colors: black red green yellow blue magenta cyan white
 //     ansi    "#000000" "#c22727" "#71b312" "#faa213"

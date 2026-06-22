@@ -124,6 +124,9 @@ pub struct TopChrome {
     /// The highlighted submenu child (mouse hover), if any.
     pub selected_subitem: Option<usize>,
     pub tabs: Vec<TabLabel>,
+    /// URL of the hyperlink under the cursor, with the cursor position (surface
+    /// coordinates). When `Some`, the renderer draws a tooltip below the cursor.
+    pub url_tooltip: Option<(String, f32, f32)>,
     /// Whether to draw custom minimize/maximize/close controls (the borderless
     /// "modern" title bar); `false` lets the OS draw them.
     pub window_controls: bool,
@@ -592,6 +595,7 @@ mod tests {
                     title: format!("Tab {i}"),
                 })
                 .collect(),
+            url_tooltip: None,
             window_controls: false,
         }
     }

@@ -224,6 +224,10 @@ impl App {
                 y,
             }
         });
+        let url_tooltip = self.hovered_url.as_ref().map(|url| {
+            let (cx, cy) = self.cursor_pos;
+            (url.clone(), cx, cy)
+        });
         TopChrome {
             active_tab: self.active_tab,
             bell_tooltip_tab: self.bell_dot_hover,
@@ -236,6 +240,7 @@ impl App {
             selected_item: self.selected_item,
             selected_subitem: self.selected_subitem,
             tabs,
+            url_tooltip,
             window_controls: self.config.title_bar_style == TitleBarStyle::Modern,
         }
     }

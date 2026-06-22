@@ -19,8 +19,8 @@ pub struct Rgb {
 pub struct Theme {
     pub ansi: [Rgb; 16],
     pub background: Rgb,
-    /// When `Some`, tints the tab bar band briefly on a bell event. `None`
-    /// (the default) disables the visual bell entirely.
+    /// Color used to tint the tab bar briefly on a bell event and for the
+    /// bell-dot indicator. Falls back to `cursor_bg` for the dot when `None`.
     pub bell: Option<Rgb>,
     pub cursor_bg: Rgb,
     pub cursor_fg: Rgb,
@@ -107,7 +107,7 @@ impl Theme {
             selection_fg: Rgb::parse_hex("#000000").unwrap(),
             divider: Rgb::parse_hex("#51554f").unwrap(),
             status_bar_border: Rgb::parse_hex("#3b414f").unwrap(),
-            bell: None,
+            bell: Some(Rgb::parse_hex("#e08020").unwrap()),
             menu_bg: Rgb::parse_hex("#313841").unwrap(),
             menu_hover_bg: Rgb::parse_hex("#3b4a63").unwrap(),
             status_bar_fg: Rgb::parse_hex("#15181a").unwrap(),
@@ -147,7 +147,7 @@ impl Theme {
             selection_bg: Rgb::parse_hex("#b3b3d9").unwrap(),
             selection_fg: Rgb::parse_hex("#000000").unwrap(),
             divider: Rgb::parse_hex("#cccccc").unwrap(),
-            bell: None,
+            bell: Some(Rgb::parse_hex("#c85010").unwrap()),
             menu_bg: Rgb::parse_hex("#ffffff").unwrap(),
             menu_hover_bg: Rgb::parse_hex("#e6eefb").unwrap(),
             tab_active_bg: Rgb::parse_hex("#f2f2f2").unwrap(),
