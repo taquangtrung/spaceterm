@@ -162,6 +162,7 @@ impl App {
                 views.push(PaneView {
                     cursor_shape,
                     cursor_visible,
+                    focused: *id == focused,
                     grid: pane.grid(),
                     hovered_link,
                     labels,
@@ -348,6 +349,7 @@ impl App {
         let view = PaneView {
             cursor_shape: CursorShape::Block,
             cursor_visible: true,
+            focused: true,
             grid: &grid,
             hovered_link: 0,
             labels: None,

@@ -74,6 +74,8 @@ pub enum Action {
     GotoTab(usize),
     Ignore,
     MoveCursor(CursorMove),
+    MoveTabLeft,
+    MoveTabRight,
     NewTab,
     NextTab,
     Paste,
@@ -532,6 +534,8 @@ fn resolve_normal(key: &Key, pending: &mut PendingPrefix, window: &WindowKeymap)
         PendingPrefix::TillForward => find_char_action(key, true, true),
         PendingPrefix::TillBackward => find_char_action(key, false, true),
         PendingPrefix::G => match key.code {
+            KeyCode::Char('<') => Action::MoveTabLeft,
+            KeyCode::Char('>') => Action::MoveTabRight,
             KeyCode::Char('g') => Action::MoveCursor(CursorMove::Top),
             KeyCode::Char('t') => Action::NextTab,
             KeyCode::Char('T') => Action::PrevTab,
@@ -1695,5 +1699,20 @@ mod tests {
     fn test_kitty_shift_tab_backtab() {
         let shift_tab = kitty_key(Key { shift: true, ..key(KeyCode::Tab) });
         assert_eq!(shift_tab, Action::SendBytes(vec![ESCAPE, b'[', b'Z']));
+    }
+
+    #[test]
+    fn test_g_angle_bracket_moves_tab() {
+        let mut pending = PendingPrefix::None;
+        resolve(Mode::Normal, &key(KeyCode::Char('g')), &mut pending, 0);
+        assert_eq!(
+            resolve(Mode::Normal, &key(KeyCode::Char('<')), &mut pending, 0),
+            Action::MoveTabLeft,
+        );
+        resolve(Mode::Normal, &key(KeyCode::Char('g')), &mut pending, 0);
+        assert_eq!(
+            resolve(Mode::Normal, &key(KeyCode::Char('>')), &mut pending, 0),
+            Action::MoveTabRight,
+        );
     }
 }

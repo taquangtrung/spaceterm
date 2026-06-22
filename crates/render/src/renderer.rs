@@ -77,6 +77,8 @@ const PALETTE_TOP_RATIO: f32 = 0.15;
 const DROPDOWN_RADIUS: f32 = 12.0;
 /// Width of the soft drop shadow cast around the dropdown panel, in pixels.
 const DROPDOWN_SHADOW: f32 = 22.0;
+/// How far non-focused pane colors are lerped toward the background (0 = full, 1 = fully dimmed).
+const DIM_FACTOR: f32 = 0.4;
 /// Peak opacity of the dropdown drop shadow, fading to zero at its outer edge.
 const DROPDOWN_SHADOW_ALPHA: f32 = 0.3;
 /// Inset of the hover-highlight pill from the dropdown item-row edges, in pixels.
@@ -115,6 +117,9 @@ pub struct PaneView<'a> {
     /// "off" phase of cursor blink; the nav cursor and non-focused panes
     /// always use `true`.
     pub cursor_visible: bool,
+    /// Whether this pane is the focused (active) pane. Non-focused panes are
+    /// rendered with colors dimmed toward the background.
+    pub focused: bool,
     pub grid: &'a Grid,
     /// Link ID currently under the mouse pointer. Cells sharing this link get
     /// a highlighted underline color. 0 means no link is hovered.
@@ -827,6 +832,7 @@ impl GpuRenderer {
                     ch: self.cell_height,
                     cursor_shape: pane.cursor_shape,
                     cw: self.cell_width,
+                    dim: !pane.focused,
                     hide_cursor: !pane.cursor_visible || pane.nav_cursor.is_some(),
                     hovered_link: pane.hovered_link,
                     labels: pane.labels,
@@ -866,6 +872,19 @@ impl GpuRenderer {
                 .weight(parse_weight(self.normal_weight.as_deref(), glyphon::cosmic_text::Weight::NORMAL));
             let mut rows_data: Vec<(String, glyphon::AttrsList)> = Vec::with_capacity(pane_rows);
 
+            let theme_bg = self.theme.background;
+            let pane_focused = pane.focused;
+            let dim_text = |r: u8, g: u8, b: u8| -> Color {
+                if pane_focused {
+                    Color::rgba(r, g, b, 255)
+                } else {
+                    let lerp = |v: u8, bv: u8| -> u8 {
+                        (v as f32 + (bv as f32 - v as f32) * DIM_FACTOR).round() as u8
+                    };
+                    Color::rgba(lerp(r, theme_bg.r), lerp(g, theme_bg.g), lerp(b, theme_bg.b), 255)
+                }
+            };
+
             let sel = pane.selection;
             let sel_norm = sel.map(|(r1, c1, r2, c2)| {
                 if (r1, c1) > (r2, c2) {
@@ -902,9 +921,10 @@ impl GpuRenderer {
                     } else if sel_norm.is_some_and(|(sr1, sc1, sr2, sc2)| {
                         (row, col) >= (sr1, sc1) && (row, col) <= (sr2, sc2)
                     }) {
+                        let sel_fg = self.theme.selection_fg;
                         let span_attrs = Attrs::new()
                             .family(base_family(fam))
-                            .color(self.theme.selection_fg.to_glyphon());
+                            .color(dim_text(sel_fg.r, sel_fg.g, sel_fg.b));
                         attrs_list.add_span(start..start + ch.len_utf8(), &span_attrs);
                     } else if let Some(cell) = cell {
                         let mut attrs = Attrs::new().family(base_family(fam));
@@ -920,11 +940,11 @@ impl GpuRenderer {
 
                         match cell.style.foreground {
                             GridColor::Rgb(rgb) => {
-                                attrs = attrs.color(Color::rgba(rgb.r, rgb.g, rgb.b, 255));
+                                attrs = attrs.color(dim_text(rgb.r, rgb.g, rgb.b));
                             }
                             GridColor::Indexed(idx) => {
                                 let (r, g, b) = theme_indexed_color(&self.theme, idx);
-                                attrs = attrs.color(Color::rgba(r, g, b, 255));
+                                attrs = attrs.color(dim_text(r, g, b));
                             }
                             GridColor::Default => {}
                         }
@@ -1165,19 +1185,31 @@ impl GpuRenderer {
         let mut text_areas: Vec<TextArea> = text_buffers
             .iter()
             .zip(panes.iter())
-            .map(|(buffer, pane)| TextArea {
-                buffer,
-                left: pane.rect.x.round(),
-                top: pane.rect.y.round(),
-                bounds: TextBounds {
-                    left: pane.rect.x.round() as i32,
-                    top: pane.rect.y.round() as i32,
-                    right: (pane.rect.x + pane.rect.width).round() as i32,
-                    bottom: (pane.rect.y + pane.rect.height).round() as i32,
-                },
-                default_color: self.theme.foreground.to_glyphon(),
-                scale: 1.0,
-                custom_glyphs: &[],
+            .map(|(buffer, pane)| {
+                let fg = self.theme.foreground;
+                let bg = self.theme.background;
+                let default_color = if pane.focused {
+                    fg.to_glyphon()
+                } else {
+                    let lerp = |v: u8, bv: u8| -> u8 {
+                        (v as f32 + (bv as f32 - v as f32) * DIM_FACTOR).round() as u8
+                    };
+                    Color::rgba(lerp(fg.r, bg.r), lerp(fg.g, bg.g), lerp(fg.b, bg.b), 255)
+                };
+                TextArea {
+                    buffer,
+                    left: pane.rect.x.round(),
+                    top: pane.rect.y.round(),
+                    bounds: TextBounds {
+                        left: pane.rect.x.round() as i32,
+                        top: pane.rect.y.round() as i32,
+                        right: (pane.rect.x + pane.rect.width).round() as i32,
+                        bottom: (pane.rect.y + pane.rect.height).round() as i32,
+                    },
+                    default_color,
+                    scale: 1.0,
+                    custom_glyphs: &[],
+                }
             })
             .collect();
 
@@ -1785,6 +1817,8 @@ struct BgParams<'a> {
     ch: f32,
     cursor_shape: CursorShape,
     cw: f32,
+    /// When `true`, lerp all drawn colors toward the background to dim this pane.
+    dim: bool,
     hide_cursor: bool,
     hovered_link: u16,
     labels: Option<&'a [(usize, usize, char)]>,
@@ -1804,6 +1838,7 @@ fn build_bg_vertices_offset(grid: &Grid, params: BgParams) -> Vec<BgVertex> {
         ch,
         cursor_shape,
         cw,
+        dim,
         hide_cursor,
         hovered_link,
         labels,
@@ -1819,6 +1854,7 @@ fn build_bg_vertices_offset(grid: &Grid, params: BgParams) -> Vec<BgVertex> {
     } = params;
     let mut verts = Vec::new();
     let (cursor_row, cursor_col) = grid.cursor();
+    let bg_lin = theme.background.as_linear();
 
     let sel_norm = selection.map(|(r1, c1, r2, c2)| {
         if (r1, c1) > (r2, c2) {
@@ -1850,16 +1886,19 @@ fn build_bg_vertices_offset(grid: &Grid, params: BgParams) -> Vec<BgVertex> {
             let is_search_match = match_set.contains(&(row, col));
 
             if draw_bg || is_selected || is_label || is_search_match {
-                let (r, g, b) = if is_label {
-                    QUICK_SELECT_BG
-                } else if is_selected {
-                    theme.selection_bg.as_linear()
-                } else if is_search_match {
-                    theme.search_match_bg.as_linear()
-                } else if is_cursor {
-                    theme.cursor_bg.as_linear()
-                } else {
-                    grid_color_to_rgb(&bg, theme)
+                let (r, g, b) = {
+                    let c = if is_label {
+                        QUICK_SELECT_BG
+                    } else if is_selected {
+                        theme.selection_bg.as_linear()
+                    } else if is_search_match {
+                        theme.search_match_bg.as_linear()
+                    } else if is_cursor {
+                        theme.cursor_bg.as_linear()
+                    } else {
+                        grid_color_to_rgb(&bg, theme)
+                    };
+                    if dim { lerp_to_bg(c, bg_lin) } else { c }
                 };
 
                 let px0 = offset_x + col as f32 * cw;
@@ -1929,7 +1968,7 @@ fn build_bg_vertices_offset(grid: &Grid, params: BgParams) -> Vec<BgVertex> {
                     } else {
                         grid_color_to_rgb(&cell.style.foreground, theme)
                     };
-                    let (ur, ug, ub) = ul_color;
+                    let (ur, ug, ub) = if dim { lerp_to_bg(ul_color, bg_lin) } else { ul_color };
                     let px0 = offset_x + col as f32 * cw;
                     let py_top = offset_y + row as f32 * ch + ch - UNDERLINE_BOTTOM_OFFSET - UNDERLINE_THICKNESS;
                     let py_bot = py_top + UNDERLINE_THICKNESS;
@@ -1991,6 +2030,14 @@ const DIVIDER_THICKNESS: f32 = 1.0;
 const UNDERLINE_THICKNESS: f32 = 1.0;
 /// Distance from the bottom of a cell to the top of its underline bar.
 const UNDERLINE_BOTTOM_OFFSET: f32 = 2.0;
+
+fn lerp_to_bg(c: (f32, f32, f32), bg: (f32, f32, f32)) -> (f32, f32, f32) {
+    (
+        c.0 + (bg.0 - c.0) * DIM_FACTOR,
+        c.1 + (bg.1 - c.1) * DIM_FACTOR,
+        c.2 + (bg.2 - c.2) * DIM_FACTOR,
+    )
+}
 
 fn compute_divider(
     a: PaneRect,
@@ -3483,6 +3530,7 @@ mod tests {
                 ch: 20.0,
                 cursor_shape: CursorShape::Block,
                 cw: 10.0,
+                dim: false,
                 hide_cursor: false,
                 hovered_link: 0,
                 labels: None,
@@ -3510,6 +3558,7 @@ mod tests {
                 ch: 20.0,
                 cursor_shape: CursorShape::Block,
                 cw: 10.0,
+                dim: false,
                 hide_cursor: false,
                 hovered_link: 0,
                 labels: None,
@@ -3537,6 +3586,7 @@ mod tests {
                 ch: 20.0,
                 cursor_shape: CursorShape::Block,
                 cw: 10.0,
+                dim: false,
                 hide_cursor: false,
                 hovered_link: 0,
                 labels: None,
@@ -3557,6 +3607,7 @@ mod tests {
                 ch: 20.0,
                 cursor_shape: CursorShape::Block,
                 cw: 10.0,
+                dim: false,
                 hide_cursor: false,
                 hovered_link: 0,
                 labels: None,
@@ -3584,6 +3635,7 @@ mod tests {
                 ch: 20.0,
                 cursor_shape: CursorShape::Block,
                 cw: 10.0,
+                dim: false,
                 hide_cursor: false,
                 hovered_link: 0,
                 labels: None,
@@ -3612,6 +3664,7 @@ mod tests {
                 ch: 20.0,
                 cursor_shape: CursorShape::Block,
                 cw: 10.0,
+                dim: false,
                 hide_cursor: false,
                 hovered_link: 0,
                 labels: Some(labels),

@@ -90,6 +90,19 @@ impl App {
             Action::CloseOtherPanes => {
                 self.close_other_panes(focused);
             }
+            Action::MoveTabLeft => {
+                if self.active_tab > 0 {
+                    let dst = self.active_tab - 1;
+                    self.swap_tabs(self.active_tab, dst);
+                }
+            }
+            Action::MoveTabRight => {
+                let last = self.tabs.len().saturating_sub(1);
+                if self.active_tab < last {
+                    let dst = self.active_tab + 1;
+                    self.swap_tabs(self.active_tab, dst);
+                }
+            }
             Action::NewTab => {
                 self.new_tab();
             }
