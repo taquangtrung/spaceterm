@@ -326,7 +326,7 @@ pub(crate) fn layout(chrome: &TopChrome, surface_w: f32, cw: f32, ch: f32) -> Ch
         closes.push(Region {
             h: bar_h,
             w: CLOSE_CELLS * cw,
-            x: x + tab_w - CLOSE_CELLS * cw,
+            x,
             y: tab_row_top,
         });
     }
@@ -547,14 +547,17 @@ mod tests {
     fn test_hit_test_picks_tab_then_new_tab() {
         let c = chrome(MenuStyle::Modern, 2, None);
         // The modern hamburger occupies the first 3 cells; tabs follow it.
+        // Each tab has a CLOSE_CELLS-wide close button at its left edge, then
+        // the title area. Click in the title area to hit the tab, not the close button.
         let tabs_left = 3.0 * CW;
+        let title_offset = CLOSE_CELLS * CW + CW; // past the left close button
         assert_eq!(
-            hit_test(&c, SURFACE_W, CW, CH, tabs_left + 5.0, 5.0),
+            hit_test(&c, SURFACE_W, CW, CH, tabs_left + title_offset, 5.0),
             ChromeHit::Tab(0)
         );
         // Second tab.
         assert_eq!(
-            hit_test(&c, SURFACE_W, CW, CH, tabs_left + 18.0 * CW + 5.0, 5.0),
+            hit_test(&c, SURFACE_W, CW, CH, tabs_left + 18.0 * CW + title_offset, 5.0),
             ChromeHit::Tab(1)
         );
         // The new-tab button sits just past the last tab.
@@ -572,14 +575,21 @@ mod tests {
     }
 
     #[test]
-    fn test_close_target_beats_tab_at_right_edge() {
+    fn test_close_target_at_left_edge_of_tab() {
         let c = chrome(MenuStyle::Modern, 1, None);
-        // Far right of the first tab (past the hamburger offset) is the close
-        // target, not the tab body.
-        let x = 3.0 * CW + 18.0 * CW - 5.0;
+        // Close button sits at the left edge of the first tab (right after the
+        // hamburger), spanning CLOSE_CELLS * CW wide.
+        let tab_left = 3.0 * CW; // hamburger width
+        let inside_close = tab_left + CW; // within the 2-cell close region
         assert_eq!(
-            hit_test(&c, SURFACE_W, CW, CH, x, 5.0),
+            hit_test(&c, SURFACE_W, CW, CH, inside_close, 5.0),
             ChromeHit::CloseTab(0)
+        );
+        // The far right of the tab is now the title area, not the close button.
+        let right_of_tab = tab_left + 18.0 * CW - 5.0;
+        assert_eq!(
+            hit_test(&c, SURFACE_W, CW, CH, right_of_tab, 5.0),
+            ChromeHit::Tab(0)
         );
     }
 
@@ -663,7 +673,6 @@ mod tests {
         c.window_controls = true;
         c.controls_side = ControlsSide::Left;
         let w = CONTROL_CELLS * CW;
-        let hb_w = HAMBURGER_CELLS * CW;
 
         // Left edge is now Minimize (slot 0), then Maximize, then Close.
         assert_eq!(
@@ -689,9 +698,12 @@ mod tests {
         assert_eq!(hamburger.x + hamburger.w, SURFACE_W);
 
         // Tabs start after the three controls, not at the hamburger's old left slot.
+        // Close button is now at the left of each tab, spanning CLOSE_CELLS * CW;
+        // the title area begins after it.
         let tabs_left = 3.0 * w;
+        let title_area = tabs_left + CLOSE_CELLS * CW + CW;
         assert_eq!(
-            hit_test(&c, SURFACE_W, CW, CH, tabs_left + 5.0, 5.0),
+            hit_test(&c, SURFACE_W, CW, CH, title_area, 5.0),
             ChromeHit::Tab(0)
         );
         // The first cell is no longer the hamburger (it became Minimize).

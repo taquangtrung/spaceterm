@@ -1248,10 +1248,11 @@ impl GpuRenderer {
         // The band, rounded-top tab cards, and chrome border are rasterized into a
         // texture by `rasterize_chrome_strip` and composited under this text.
 
-        // Tab titles and their close glyphs.
+        // Tab titles and their close glyphs. Close button is on the left edge.
         for (i, tab) in layout.tabs.iter().enumerate() {
             let close = layout.closes[i];
-            let avail = (close.x - (tab.x + pad)).max(cw);
+            let title_x = close.x + close.w;
+            let avail = ((tab.x + tab.w) - (title_x + pad)).max(cw);
             let max_chars = (avail / cw).floor() as usize;
             let title = truncate_label(&chrome.tabs[i].title, max_chars);
             let active = i == chrome.active_tab;
@@ -1262,10 +1263,10 @@ impl GpuRenderer {
             };
             let buffer = self.chrome_line_buffer(&title, color, active, false);
             texts.push(ChromeText {
-                bounds: text_bounds(tab.x, tab.y, close.x, tab.y + tab.h),
+                bounds: text_bounds(title_x, tab.y, tab.x + tab.w, tab.y + tab.h),
                 buffer,
                 color,
-                left: tab.x + pad,
+                left: title_x + pad,
                 top: vcenter(tab.y, tab.h),
             });
 
@@ -1354,8 +1355,6 @@ impl GpuRenderer {
         let width = surface_w.ceil().max(1.0) as u32;
         let height = chrome_h.ceil().max(1.0) as u32;
         let canvas = (width, height);
-        let radius = ch * TAB_CORNER_RADIUS_RATIO;
-
         let band = self.theme.tabbar_bg;
         let active_bg = self.theme.tab_active_bg;
         let inactive_bg = mix_rgb(self.theme.tabbar_bg, self.theme.tab_active_bg, 0.5);
@@ -1387,28 +1386,34 @@ impl GpuRenderer {
             );
         }
 
-        // Inactive tabs first (recessed), then the active tab on top so its
-        // rounded corners win where they meet a neighbor.
+        // Tabs and hamburger share the same pill geometry: inset from the band
+        // edges so they read as floating buttons rather than full-bleed cards.
+        let tab_hpad = cw * 0.25;
+        let tab_vpad = ch * 0.2;
+        let pill_radius = ch * TAB_CORNER_RADIUS_RATIO;
+
         for (i, tab) in layout.tabs.iter().enumerate() {
-            if i == chrome.active_tab {
-                continue;
-            }
-            fill_rounded_top_rect(
+            let color = if i == chrome.active_tab { active_bg } else { inactive_bg };
+            fill_rounded_rect(
                 &mut rgba,
                 canvas,
-                (tab.x, tab.y, tab.w, tab.h),
-                radius,
-                inactive_bg,
+                (tab.x + tab_hpad, tab.y + tab_vpad, tab.w - tab_hpad * 2.0, tab.h - tab_vpad * 2.0),
+                pill_radius,
+                color,
                 1.0,
             );
         }
-        if let Some(tab) = layout.tabs.get(chrome.active_tab) {
-            fill_rounded_top_rect(
+
+        // Hamburger pill uses the same vertical inset and radius as tabs.
+        if let Some(hb) = layout.hamburger {
+            let hpad = cw * 0.3;
+            let btn_color = mix_rgb(band, self.theme.foreground, 0.12);
+            fill_rounded_rect(
                 &mut rgba,
                 canvas,
-                (tab.x, tab.y, tab.w, tab.h),
-                radius,
-                active_bg,
+                (hb.x + hpad, hb.y + tab_vpad, hb.w - hpad * 2.0, hb.h - tab_vpad * 2.0),
+                pill_radius,
+                btn_color,
                 1.0,
             );
         }
@@ -1983,6 +1988,7 @@ fn fill_rounded_rect(
 /// Fill a rectangle whose top corners are rounded but whose bottom edge stays
 /// flush. Achieved by rounding a rect extended `radius` below the real bottom, so
 /// the bottom corners curve off the drawn region (the canvas clips them away).
+#[cfg(test)]
 fn fill_rounded_top_rect(
     rgba: &mut [u8],
     canvas: (u32, u32),
