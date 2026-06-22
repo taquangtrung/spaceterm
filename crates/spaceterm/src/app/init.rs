@@ -43,7 +43,11 @@ impl App {
         // renderer's precise cell grid after the GPU is ready.
         let pane_init_cols = DEFAULT_COLS as usize;
         let pane_init_rows = content_rows(DEFAULT_ROWS as usize);
-        let pane_handle = std::thread::spawn(move || Pane::new(pane_init_cols, pane_init_rows));
+        let configured_shell = self.config.shell.clone();
+        let max_scrollback = self.config.scrollback_lines.unwrap_or(spaceterm_render::MAX_SCROLLBACK);
+        let pane_handle = std::thread::spawn(move || {
+            Pane::new(pane_init_cols, pane_init_rows, configured_shell.as_deref(), max_scrollback)
+        });
 
         #[cfg(target_os = "linux")]
         {

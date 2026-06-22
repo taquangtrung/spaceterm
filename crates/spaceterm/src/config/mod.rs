@@ -133,6 +133,11 @@ pub struct Config {
     pub opacity: f32,
     /// Draw an underline under fuzzy-matched characters in the command palette.
     pub palette_match_underline: bool,
+    /// Maximum scrollback rows per pane. `None` uses the compiled-in default (10 000).
+    pub scrollback_lines: Option<usize>,
+    /// Path or name of the shell to launch in new panes. Overrides `SHELL` and
+    /// `SPACETERM_SHELL`. `None` falls back to the environment-variable chain.
+    pub shell: Option<String>,
     pub status_bar: StatusBarConfig,
     pub theme: ThemeSetting,
     pub title_bar_style: TitleBarStyle,
@@ -314,6 +319,10 @@ struct KdlConfig {
     keybindings: Option<KdlKeybindings>,
     #[knuffel(child, unwrap(argument))]
     menu_style: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    scrollback_lines: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    shell: Option<String>,
     #[knuffel(child, unwrap(argument))]
     title_bar_style: Option<String>,
     #[knuffel(child, unwrap(argument))]
@@ -626,6 +635,8 @@ impl Config {
                 .unwrap_or(1.0f32)
                 .clamp(0.1, 1.0),
             palette_match_underline: parse_bool(kdl.palette_match_underline.as_deref(), false),
+            scrollback_lines: kdl.scrollback_lines.as_deref().and_then(|s| s.parse::<usize>().ok()).filter(|&n| n > 0),
+            shell: kdl.shell.filter(|s| !s.trim().is_empty()),
             status_bar,
             theme,
             title_bar_style,
@@ -644,6 +655,12 @@ impl Config {
 
         let mut out = String::new();
         out.push_str(&format!("theme {}\n", kdl_string(self.theme.as_value())));
+        if let Some(n) = self.scrollback_lines {
+            out.push_str(&format!("scrollback-lines \"{n}\"\n"));
+        }
+        if let Some(shell) = &self.shell {
+            out.push_str(&format!("shell {}\n", kdl_string(shell)));
+        }
         if let Some(font) = &self.font_family {
             out.push_str(&format!("font {}\n", kdl_string(font)));
         }
@@ -801,6 +818,8 @@ impl Default for Config {
             menu_style: MenuStyle::default(),
             opacity: 1.0,
             palette_match_underline: false,
+            scrollback_lines: None,
+            shell: None,
             status_bar: StatusBarConfig::default(),
             theme: ThemeSetting::default(),
             title_bar_style: TitleBarStyle::default(),
@@ -1128,6 +1147,44 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_scrollback_lines() {
+        let config = Config::parse("scrollback-lines \"50000\"");
+        assert_eq!(config.scrollback_lines, Some(50_000));
+    }
+
+    #[test]
+    fn test_scrollback_lines_zero_is_ignored() {
+        let config = Config::parse("scrollback-lines \"0\"");
+        assert_eq!(config.scrollback_lines, None);
+    }
+
+    #[test]
+    fn test_to_kdl_roundtrips_scrollback_lines() {
+        let mut config = Config::default();
+        config.scrollback_lines = Some(20_000);
+        let parsed = Config::parse(&config.to_kdl());
+        assert_eq!(parsed.scrollback_lines, Some(20_000));
+    }
+
+    #[test]
+    fn test_parse_shell() {
+        let config = Config::parse("shell \"/usr/bin/fish\"");
+        assert_eq!(config.shell.as_deref(), Some("/usr/bin/fish"));
+    }
+
+    #[test]
+    fn test_default_shell_is_none() {
+        assert_eq!(Config::default().shell, None);
+        assert_eq!(Config::parse("font-size \"12\"").shell, None);
+    }
+
+    #[test]
+    fn test_shell_whitespace_ignored() {
+        let config = Config::parse("shell \"   \"");
+        assert_eq!(config.shell, None);
+    }
+
+    #[test]
     fn test_parse_colors_block() {
         let config = Config::parse(
             r##"
@@ -1383,6 +1440,20 @@ cursor {
         assert!(!parsed.status_bar.enabled);
         assert!(!parsed.status_bar.show_branding);
         assert!(parsed.status_bar.show_mode);
+    }
+
+    #[test]
+    fn test_to_kdl_roundtrips_shell() {
+        let mut config = Config::default();
+        config.shell = Some("/usr/bin/fish".to_string());
+        let parsed = Config::parse(&config.to_kdl());
+        assert_eq!(parsed.shell.as_deref(), Some("/usr/bin/fish"));
+    }
+
+    #[test]
+    fn test_to_kdl_omits_shell_when_none() {
+        let kdl = Config::default().to_kdl();
+        assert!(!kdl.contains("shell"), "shell should not appear when None");
     }
 
     #[test]

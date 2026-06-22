@@ -17,7 +17,7 @@ pub use chrome::{
     chrome_rows, hit_test, ChromeHit, ContextMenu, ControlsSide, Menu, MenuItem, MenuStyle,
     TabLabel, TopChrome,
 };
-pub use grid::{Cell, Color, CursorShape, EraseMode, Grid, RgbColor, Style};
+pub use grid::{Cell, Color, CursorShape, EraseMode, Grid, RgbColor, Style, MAX_SCROLLBACK};
 pub use image::ImagePlacement;
 pub use renderer::{start_font_load, FontConfig, FontLoad, PaletteItem, PaletteView, PaneRect, PaneView, StatusBar};
 pub use screen::Screen;

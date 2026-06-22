@@ -2,6 +2,18 @@
 //! leaves are panes. Pure geometry and tree surgery, independent of any renderer.
 
 // ========================================================================
+// Constants
+// ========================================================================
+
+/// Pixel half-width of the invisible hit zone on each side of a split divider.
+/// A pointer within this distance triggers the resize cursor and starts a drag.
+pub const DIVIDER_HIT_MARGIN: f32 = 4.0;
+
+/// Minimum and maximum split ratio, preventing a pane from being squeezed to zero.
+const RATIO_MIN: f32 = 0.1;
+const RATIO_MAX: f32 = 0.9;
+
+// ========================================================================
 // Data Structures
 // ========================================================================
 
@@ -104,6 +116,34 @@ impl Tab {
         let mut out = Vec::new();
         collect_rects(&self.root, viewport, &mut out);
         out
+    }
+
+    /// Return the `Direction` of any split divider that (px, py) is within
+    /// [`DIVIDER_HIT_MARGIN`] pixels of, or `None`. Used to choose the resize
+    /// cursor icon. Returns `None` when zoomed (no dividers are visible).
+    pub fn divider_at(&self, px: f32, py: f32, viewport: Rect) -> Option<Direction> {
+        if self.zoomed || self.panes().len() <= 1 {
+            return None;
+        }
+        divider_hit_in(&self.root, viewport, px, py)
+    }
+
+    /// Find the split divider that contains `(start_x, start_y)` and shift its
+    /// ratio by `(dx, dy)`. Call once per mouse-move event with the delta from
+    /// the previous cursor position. Returns `true` when a divider was found and
+    /// adjusted. No-op when zoomed.
+    pub fn drag_divider(
+        &mut self,
+        start_x: f32,
+        start_y: f32,
+        dx: f32,
+        dy: f32,
+        viewport: Rect,
+    ) -> bool {
+        if self.zoomed {
+            return false;
+        }
+        drag_in(&mut self.root, viewport, start_x, start_y, dx, dy)
     }
 
     /// Toggle the focused pane between full-viewport zoom and normal split layout.
@@ -292,6 +332,82 @@ fn close_in(node: &mut Node, target: PaneId) -> bool {
     };
     *node = replacement;
     true
+}
+
+/// Return the direction of the first split divider within `DIVIDER_HIT_MARGIN`
+/// of `(px, py)` inside `area`, or `None`.
+fn divider_hit_in(node: &Node, area: Rect, px: f32, py: f32) -> Option<Direction> {
+    let Node::Split(split) = node else {
+        return None;
+    };
+    let (first_area, second_area) = area.split(split.direction, split.ratio);
+    let on_divider = match split.direction {
+        Direction::Vertical => {
+            let div_x = area.x + first_area.width;
+            px >= div_x - DIVIDER_HIT_MARGIN
+                && px <= div_x + DIVIDER_HIT_MARGIN
+                && py >= area.y
+                && py < area.y + area.height
+        }
+        Direction::Horizontal => {
+            let div_y = area.y + first_area.height;
+            py >= div_y - DIVIDER_HIT_MARGIN
+                && py <= div_y + DIVIDER_HIT_MARGIN
+                && px >= area.x
+                && px < area.x + area.width
+        }
+    };
+    if on_divider {
+        return Some(split.direction);
+    }
+    divider_hit_in(&split.first, first_area, px, py)
+        .or_else(|| divider_hit_in(&split.second, second_area, px, py))
+}
+
+/// Find the split containing `(start_x, start_y)` and adjust its ratio by
+/// `dx/dy` relative to the node's pixel area. Returns `true` when found.
+fn drag_in(
+    node: &mut Node,
+    area: Rect,
+    start_x: f32,
+    start_y: f32,
+    dx: f32,
+    dy: f32,
+) -> bool {
+    let Node::Split(split) = node else {
+        return false;
+    };
+    let (first_area, second_area) = area.split(split.direction, split.ratio);
+    let on_divider = match split.direction {
+        Direction::Vertical => {
+            let div_x = area.x + first_area.width;
+            start_x >= div_x - DIVIDER_HIT_MARGIN
+                && start_x <= div_x + DIVIDER_HIT_MARGIN
+                && start_y >= area.y
+                && start_y < area.y + area.height
+        }
+        Direction::Horizontal => {
+            let div_y = area.y + first_area.height;
+            start_y >= div_y - DIVIDER_HIT_MARGIN
+                && start_y <= div_y + DIVIDER_HIT_MARGIN
+                && start_x >= area.x
+                && start_x < area.x + area.width
+        }
+    };
+    if on_divider {
+        let delta = match split.direction {
+            Direction::Vertical => {
+                if area.width > 0.0 { dx / area.width } else { 0.0 }
+            }
+            Direction::Horizontal => {
+                if area.height > 0.0 { dy / area.height } else { 0.0 }
+            }
+        };
+        split.ratio = (split.ratio + delta).clamp(RATIO_MIN, RATIO_MAX);
+        return true;
+    }
+    drag_in(&mut split.first, first_area, start_x, start_y, dx, dy)
+        || drag_in(&mut split.second, second_area, start_x, start_y, dx, dy)
 }
 
 fn leaf_is(node: &Node, target: PaneId) -> bool {

@@ -127,12 +127,14 @@ impl App {
                 if let Some(q) = &mut self.search_query {
                     q.push(c);
                 }
+                self.search_in_pane(focused, input::BlockNav::Next);
                 self.dirty = true;
             }
             Action::SearchBackspace => {
                 if let Some(q) = &mut self.search_query {
                     q.pop();
                 }
+                self.search_in_pane(focused, input::BlockNav::Next);
                 self.dirty = true;
             }
             Action::SearchExecute => {

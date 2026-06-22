@@ -70,12 +70,15 @@ fn run_once(renderer: &mut GpuRenderer, corpus: &[u8]) -> RunResult {
     for chunk in corpus.chunks(CHUNK_BYTES) {
         screen.feed(chunk);
         let view = PaneView {
+            cursor_shape: spaceterm_render::CursorShape::Block,
             grid: screen.grid(),
             labels: None,
             nav_cursor: None,
             rect,
+            scroll_offset: 0,
+            scrollback_len: 0,
+            search_matches: &[],
             selection: None,
-            cursor_shape: spaceterm_render::CursorShape::Block,
         };
         let frame_start = Instant::now();
         renderer.render(std::slice::from_ref(&view), None, None, false, &[], None);

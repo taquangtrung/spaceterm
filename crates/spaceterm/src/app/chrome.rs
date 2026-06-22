@@ -73,6 +73,7 @@ const SEARCH_ITEMS: &[ItemDef] = &[
 const MODERN_ITEMS: &[ItemDef] = &[
     leaf("new_tab", "New Tab", "Ctrl-Shift-T"),
     leaf("close_tab", "Close Tab", "Ctrl-Shift-W"),
+    leaf("rename_tab", "Rename Tab", ""),
     SEPARATOR,
     parent("Layout", LAYOUT_ITEMS),
     parent("Search & Fold", SEARCH_ITEMS),
@@ -91,6 +92,7 @@ const CLASSIC_MENUS: &[MenuDef] = &[
         items: &[
             leaf("new_tab", "New Tab", "Ctrl-Shift-T"),
             leaf("close_tab", "Close Tab", "Ctrl-Shift-W"),
+            leaf("rename_tab", "Rename Tab", ""),
             SEPARATOR,
             leaf("close_pane", "Close Pane", ""),
             SEPARATOR,
@@ -149,7 +151,11 @@ fn menu_item(item: &ItemDef) -> MenuItem {
 
 impl App {
     /// The tab title from its focused pane, or a `Terminal N` fallback.
+    /// A user-set name (via rename) takes priority over the OSC-set process title.
     fn tab_title(&self, tab_index: usize) -> String {
+        if let Some(name) = self.tab_names.get(&tab_index) {
+            return name.clone();
+        }
         let focused = self.tabs[tab_index].focused();
         match self.pane_titles.get(&focused) {
             Some(title) if !title.is_empty() => title.clone(),
@@ -180,7 +186,15 @@ impl App {
         let tabs = (0..self.tabs.len())
             .map(|i| TabLabel {
                 bell: self.tab_bells.get(&i).is_some_and(|&exp| now < exp),
-                title: self.tab_title(i),
+                title: if i == self.active_tab {
+                    if let Some(input) = &self.tab_rename_input {
+                        format!("{input}\u{2502}")
+                    } else {
+                        self.tab_title(i)
+                    }
+                } else {
+                    self.tab_title(i)
+                },
             })
             .collect();
         let menus = menu_defs(self.config.menu_style)

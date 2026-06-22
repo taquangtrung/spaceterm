@@ -66,6 +66,8 @@ const FOCUS_CHANGE_BELL_WINDOW: Duration = Duration::from_millis(150);
 
 /// Bounds and step for the settings page's font-size and opacity rows. The
 /// opacity range matches the clamp in [`App::apply_setting`].
+/// Pixel width of the scrollbar hit region at the right edge of each pane.
+const SCROLLBAR_CLICK_WIDTH: f32 = 8.0;
 const MIN_FONT_SIZE: f32 = 6.0;
 const MAX_FONT_SIZE: f32 = 72.0;
 const FONT_SIZE_STEP: f32 = 1.0;
@@ -231,6 +233,9 @@ pub struct App {
     pub(crate) insert_esc_pending: bool,
     pub(crate) cursor_pos: (f32, f32),
     pub(crate) dirty: bool,
+    /// Previous cursor pixel position during a split-divider drag, or `None`
+    /// when no drag is in progress. Cleared on mouse release.
+    pub(crate) divider_drag: Option<(f32, f32)>,
     /// A transient error notice and the instant it expires, shown in the status
     /// bar (e.g. a Vim edit aimed at the non-editable scrollback area).
     pub(crate) error_notice: Option<(String, Instant)>,
@@ -258,6 +263,11 @@ pub struct App {
     pub(crate) panes: HashMap<PaneId, Pane>,
     pub(crate) palette: Option<Palette>,
     pub(crate) pane_titles: HashMap<PaneId, String>,
+    /// User-set custom names for tabs, keyed by tab index. Take priority over
+    /// OSC-set titles. Indices are shifted down when a tab before them is closed.
+    pub(crate) tab_names: HashMap<usize, String>,
+    /// In-progress tab rename input, set while the user is typing a new name.
+    pub(crate) tab_rename_input: Option<String>,
     pub(crate) pending: PendingPrefix,
     pub(crate) quick_select: Option<Vec<QuickLabel>>,
     pub(crate) renderer: Option<GpuRenderer>,
@@ -395,6 +405,7 @@ impl App {
             config_next_check: Instant::now() + CONFIG_CHECK_INTERVAL,
             cursor_pos: (0.0, 0.0),
             dirty: true,
+            divider_drag: None,
             error_notice: None,
             folded_blocks: HashMap::new(),
             last_click: None,
@@ -412,6 +423,8 @@ impl App {
             panes: HashMap::new(),
             palette: None,
             pane_titles: HashMap::new(),
+            tab_names: HashMap::new(),
+            tab_rename_input: None,
             insert_esc_pending: false,
             pending: PendingPrefix::None,
             quick_select: None,
@@ -605,7 +618,7 @@ impl App {
             Direction::Vertical => (cols / 2, rows),
             Direction::Horizontal => (cols, rows / 2),
         };
-        let pane = Pane::new(pane_cols.max(1), pane_rows.max(1));
+        let pane = Pane::new(pane_cols.max(1), pane_rows.max(1), self.config.shell.as_deref(), self.config.scrollback_lines.unwrap_or(spaceterm_render::MAX_SCROLLBACK));
         self.panes.insert(new_id, pane);
         self.modes.insert(new_id, Mode::default());
 
@@ -665,7 +678,7 @@ impl App {
             .map(|r| r.grid_size())
             .unwrap_or((DEFAULT_COLS as usize, DEFAULT_ROWS as usize));
         // Sized roughly now; resize_all_panes fixes the exact grid once placed.
-        let pane = Pane::new(cols.max(1), rows.max(1));
+        let pane = Pane::new(cols.max(1), rows.max(1), self.config.shell.as_deref(), self.config.scrollback_lines.unwrap_or(spaceterm_render::MAX_SCROLLBACK));
         self.panes.insert(id, pane);
         self.modes.insert(id, Mode::default());
         self.tabs.push(Tab::with_root(id));
@@ -779,6 +792,14 @@ impl App {
                 *i -= 1;
             }
         }
+        // Shift custom tab names: remove the closed tab's name, shift those above it.
+        self.tab_names = self.tab_names.iter()
+            .filter_map(|(&i, name)| match i.cmp(&index) {
+                std::cmp::Ordering::Less => Some((i, name.clone())),
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Greater => Some((i - 1, name.clone())),
+            })
+            .collect();
         self.touch_mru(self.active_tab);
         self.close_menu();
         self.last_tile_layout = None;
@@ -819,6 +840,11 @@ impl App {
             if pane.drain_output() {
                 pane.grid_mut().detect_urls();
                 any = true;
+            }
+            if let Some(text) = pane.take_clipboard_write() {
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    let _ = cb.set_text(&text);
+                }
             }
             if pane.take_bell() {
                 any_bell = true;
@@ -962,6 +988,13 @@ impl App {
             }
             "close_tab" => {
                 self.close_tab(self.active_tab);
+            }
+            "rename_tab" => {
+                self.tab_rename_input = Some(
+                    self.tab_names.get(&self.active_tab)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
             }
             "next_tab" => {
                 self.cycle_tab(true);
@@ -1429,6 +1462,40 @@ impl ApplicationHandler for App {
                     shift: mods_state.shift_key(),
                 };
 
+                // While a tab rename is in progress, intercept all keyboard
+                // input: Enter confirms, Escape cancels, other keys edit the name.
+                if self.tab_rename_input.is_some() {
+                    match key.code {
+                        KeyCode::Enter => {
+                            let name = self.tab_rename_input.take().unwrap();
+                            if name.is_empty() {
+                                self.tab_names.remove(&self.active_tab);
+                            } else {
+                                self.tab_names.insert(self.active_tab, name);
+                            }
+                        }
+                        KeyCode::Escape => {
+                            self.tab_rename_input = None;
+                        }
+                        KeyCode::Backspace => {
+                            if let Some(input) = &mut self.tab_rename_input {
+                                input.pop();
+                            }
+                        }
+                        KeyCode::Char(c) if !key.ctrl && !key.alt => {
+                            if let Some(input) = &mut self.tab_rename_input {
+                                input.push(c);
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.dirty = true;
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
+
                 // While the settings page is up it owns all input: edits apply
                 // live, Enter/Escape close it, and every key is swallowed so none
                 // reaches the PTY.
@@ -1757,25 +1824,68 @@ impl ApplicationHandler for App {
                         self.selection = None;
 
                         let (x, y) = self.cursor_pos;
-                        if let Some((pane_id, pane_rect)) = self.pane_at_pixel(x, y) {
-                            self.tab_mut().focus(pane_id);
-                            let (row, col) = self.pixel_to_cell(x, y, pane_rect);
-                            let now = Instant::now();
-                            if let Some((prev_time, prev_x, prev_y)) = self.last_click {
-                                let dist = ((x - prev_x).powi(2) + (y - prev_y).powi(2)).sqrt();
-                                if now.duration_since(prev_time) < Duration::from_millis(400)
-                                    && dist < 5.0
-                                {
-                                    self.select_word_at(pane_id, row, col);
+
+                        // Divider click: start a drag; skip scrollbar/focus changes.
+                        let on_divider = {
+                            let viewport = self.content_viewport();
+                            self.tab().divider_at(x, y, viewport).is_some()
+                        };
+                        if on_divider {
+                            self.divider_drag = Some((x, y));
+                        } else {
+                            // Scrollbar click: right-edge strip of a pane navigates scrollback.
+                            if let Some((cw, ch)) = self.renderer.as_ref().map(|r| r.cell_size()) {
+                                let vp = self.viewport_rect();
+                                let layout_vp = crate::model::layout::Rect::new(vp.x, vp.y, vp.width, vp.height);
+                                'scroll: for (id, rect) in self.tab().rects(layout_vp) {
+                                    let pr = Self::layout_rect_to_pane(rect);
+                                    let sb_x = pr.x + pr.width - SCROLLBAR_CLICK_WIDTH;
+                                    if x >= sb_x && x <= pr.x + pr.width
+                                        && y >= pr.y && y < pr.y + pr.height
+                                    {
+                                        if let Some(pane) = self.panes.get_mut(&id) {
+                                            let sbl = pane.grid().scrollback_len();
+                                            if sbl > 0 {
+                                                let rows = pane.grid().rows();
+                                                let total = (rows + sbl) as f32;
+                                                let frac = ((y - pr.y) / pr.height).clamp(0.0, 1.0);
+                                                let top_virtual = (frac * total) as usize;
+                                                let new_offset = sbl.saturating_sub(top_virtual);
+                                                let _ = cw;
+                                                let _ = ch;
+                                                pane.grid_mut().set_scroll_offset(new_offset);
+                                                if let Some(window) = &self.window {
+                                                    window.request_redraw();
+                                                }
+                                                break 'scroll;
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                            self.last_click = Some((now, x, y));
+
+                            if let Some((pane_id, pane_rect)) = self.pane_at_pixel(x, y) {
+                                self.tab_mut().focus(pane_id);
+                                let (row, col) = self.pixel_to_cell(x, y, pane_rect);
+                                let now = Instant::now();
+                                if let Some((prev_time, prev_x, prev_y)) = self.last_click {
+                                    let dist =
+                                        ((x - prev_x).powi(2) + (y - prev_y).powi(2)).sqrt();
+                                    if now.duration_since(prev_time) < Duration::from_millis(400)
+                                        && dist < 5.0
+                                    {
+                                        self.select_word_at(pane_id, row, col);
+                                    }
+                                }
+                                self.last_click = Some((now, x, y));
+                            }
                         }
 
                         self.dirty = true;
                     }
                     (ElementState::Released, MouseButton::Left) => {
                         self.mouse_down = false;
+                        self.divider_drag = None;
                         self.copy_selection();
                     }
                     (ElementState::Pressed, MouseButton::Middle) => {
@@ -1789,6 +1899,24 @@ impl ApplicationHandler for App {
                 let x = position.x as f32;
                 let y = position.y as f32;
                 self.cursor_pos = (x, y);
+
+                // Divider drag: highest priority, blocks selection and PTY forwarding.
+                if self.mouse_down {
+                    if let Some((prev_x, prev_y)) = self.divider_drag {
+                        let dx = x - prev_x;
+                        let dy = y - prev_y;
+                        let viewport = self.content_viewport();
+                        if self.tab_mut().drag_divider(prev_x, prev_y, dx, dy, viewport) {
+                            self.divider_drag = Some((x, y));
+                            self.resize_all_panes();
+                            self.dirty = true;
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                        }
+                        return;
+                    }
+                }
 
                 if self.open_menu.is_some() {
                     self.update_menu_hover(x, y);
@@ -1848,18 +1976,23 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // Update hovered hyperlink and change the pointer cursor.
+                // Update hovered hyperlink and cursor icon (divider resize or pointer).
                 let new_url = self.hovered_link_at(x, y);
-                if new_url != self.hovered_url {
-                    self.hovered_url = new_url;
-                    if let Some(window) = &self.window {
-                        let icon = if self.hovered_url.is_some() {
+                self.hovered_url = new_url;
+                let vp = self.content_viewport();
+                let icon = match self.tab().divider_at(x, y, vp) {
+                    Some(crate::model::layout::Direction::Vertical) => CursorIcon::EwResize,
+                    Some(crate::model::layout::Direction::Horizontal) => CursorIcon::NsResize,
+                    None => {
+                        if self.hovered_url.is_some() {
                             CursorIcon::Pointer
                         } else {
                             CursorIcon::Default
-                        };
-                        window.set_cursor(icon);
+                        }
                     }
+                };
+                if let Some(window) = &self.window {
+                    window.set_cursor(icon);
                 }
             }
 

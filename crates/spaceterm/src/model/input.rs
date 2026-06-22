@@ -1555,4 +1555,94 @@ mod tests {
         );
         assert_eq!(pending, PendingPrefix::None);
     }
+
+    // ---- Kitty keyboard protocol encoding -----------------------------------
+
+    fn kitty(code: KeyCode) -> Action {
+        let mut pending = PendingPrefix::None;
+        resolve(Mode::Insert, &key(code), &mut pending, 1)
+    }
+
+    fn kitty_key(k: Key) -> Action {
+        let mut pending = PendingPrefix::None;
+        resolve(Mode::Insert, &k, &mut pending, 1)
+    }
+
+    #[test]
+    fn test_xterm_ctrl_i_equals_tab_ambiguity() {
+        // In legacy xterm mode, Ctrl+I and Tab produce the same bytes.
+        let tab = resolve_simple(Mode::Insert, &key(KeyCode::Tab));
+        let ctrl_i = resolve_simple(
+            Mode::Insert,
+            &Key { ctrl: true, ..key(KeyCode::Char('i')) },
+        );
+        assert_eq!(tab, ctrl_i);
+    }
+
+    #[test]
+    fn test_kitty_ctrl_i_differs_from_tab() {
+        // In Kitty mode, Tab still produces \t but Ctrl+I is disambiguated.
+        let tab = kitty(KeyCode::Tab);
+        let ctrl_i = kitty_key(Key { ctrl: true, ..key(KeyCode::Char('i')) });
+        assert_ne!(tab, ctrl_i);
+        assert_eq!(tab, Action::SendBytes(vec![b'\t']));
+        // Ctrl+I: codepoint 105 ('i'), modifier 5 (ctrl=4, +1 base).
+        assert_eq!(ctrl_i, Action::SendBytes(b"\x1b[105;5u".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_shift_enter() {
+        let shift_enter = kitty_key(Key { shift: true, ..key(KeyCode::Enter) });
+        // Codepoint 13 (CR), modifier 2 (shift).
+        assert_eq!(shift_enter, Action::SendBytes(b"\x1b[13;2u".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_bare_enter_unchanged() {
+        assert_eq!(kitty(KeyCode::Enter), Action::SendBytes(vec![b'\r']));
+    }
+
+    #[test]
+    fn test_kitty_ctrl_escape() {
+        let ctrl_esc = kitty_key(Key { ctrl: true, ..key(KeyCode::Escape) });
+        // Codepoint 27 (ESC), modifier 5 (ctrl).
+        assert_eq!(ctrl_esc, Action::SendBytes(b"\x1b[27;5u".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_bare_escape_unchanged() {
+        assert_eq!(kitty(KeyCode::Escape), Action::SendBytes(vec![ESCAPE]));
+    }
+
+    #[test]
+    fn test_kitty_ctrl_left_arrow() {
+        let ctrl_left = kitty_key(Key { ctrl: true, ..key(KeyCode::Left) });
+        // KP_LEFT = 57350, modifier 5 (ctrl).
+        assert_eq!(ctrl_left, Action::SendBytes(b"\x1b[57350;5u".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_printable_no_modifier_passthrough() {
+        assert_eq!(kitty(KeyCode::Char('a')), Action::SendBytes(vec![b'a']));
+        assert_eq!(kitty(KeyCode::Char('Z')), Action::SendBytes(vec![b'Z']));
+    }
+
+    #[test]
+    fn test_kitty_ctrl_printable() {
+        // Ctrl+A: codepoint 97 ('a'), modifier 5 (ctrl).
+        let ctrl_a = kitty_key(Key { ctrl: true, ..key(KeyCode::Char('a')) });
+        assert_eq!(ctrl_a, Action::SendBytes(b"\x1b[97;5u".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_f1_through_f4() {
+        assert_eq!(kitty(KeyCode::F(1)), Action::SendBytes(b"\x1b[57364u".to_vec()));
+        assert_eq!(kitty(KeyCode::F(4)), Action::SendBytes(b"\x1b[57367u".to_vec()));
+    }
+
+    #[test]
+    fn test_kitty_shift_tab_backtab() {
+        let shift_tab = kitty_key(Key { shift: true, ..key(KeyCode::Tab) });
+        assert_eq!(shift_tab, Action::SendBytes(vec![ESCAPE, b'[', b'Z']));
+    }
 }

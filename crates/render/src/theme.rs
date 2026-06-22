@@ -32,6 +32,7 @@ pub struct Theme {
     pub menu_bg: Rgb,
     /// Highlight behind a hovered dropdown menu item.
     pub menu_hover_bg: Rgb,
+    pub search_match_bg: Rgb,
     pub selection_bg: Rgb,
     pub selection_fg: Rgb,
     /// Color of the 1px separator line between the status bar and terminal content.
@@ -101,6 +102,7 @@ impl Theme {
             foreground: Rgb::parse_hex("#d8d8d8").unwrap(),
             cursor_bg: Rgb::parse_hex("#52ad70").unwrap(),
             cursor_fg: Rgb::parse_hex("#000000").unwrap(),
+            search_match_bg: Rgb::parse_hex("#d3a838").unwrap(),
             selection_bg: Rgb::parse_hex("#fffacd").unwrap(),
             selection_fg: Rgb::parse_hex("#000000").unwrap(),
             divider: Rgb::parse_hex("#51554f").unwrap(),

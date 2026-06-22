@@ -19,6 +19,7 @@ pub struct Grid {
     focus_event: bool,
     /// Intern table for OSC 8 URLs; index 0 is always the empty string (no link).
     link_table: Vec<String>,
+    max_scrollback: usize,
     mouse_button: bool,
     mouse_drag: bool,
     mouse_sgr: bool,
@@ -136,7 +137,7 @@ struct AltBuffer {
 // ========================================================================
 
 const TAB_WIDTH: usize = 8;
-const MAX_SCROLLBACK: usize = 10_000;
+pub const MAX_SCROLLBACK: usize = 10_000;
 
 const MODE_ALT_SCREEN: u16 = 1049;
 const MODE_BRACKETED_PASTE: u16 = 2004;
@@ -164,6 +165,7 @@ impl Grid {
             focus_event: false,
             // Index 0 is the sentinel "no link" entry so id 0 always means none.
             link_table: vec![String::new()],
+            max_scrollback: MAX_SCROLLBACK,
             mouse_button: false,
             mouse_drag: false,
             mouse_sgr: false,
@@ -175,6 +177,13 @@ impl Grid {
             scrollback: Vec::new(),
             style: Style::default(),
         }
+    }
+
+    /// Set the maximum number of scrollback rows retained. Must be called before
+    /// any output is produced; existing scrollback is not retroactively trimmed.
+    pub fn with_max_scrollback(mut self, max: usize) -> Self {
+        self.max_scrollback = max.max(1);
+        self
     }
 
     pub fn cols(&self) -> usize {
@@ -408,8 +417,8 @@ impl Grid {
                 let scrolled: Vec<Cell> = self.cells[start..end].to_vec();
                 self.scrollback.push(scrolled);
             }
-            if self.scrollback.len() > MAX_SCROLLBACK {
-                let excess = self.scrollback.len() - MAX_SCROLLBACK;
+            if self.scrollback.len() > self.max_scrollback {
+                let excess = self.scrollback.len() - self.max_scrollback;
                 self.scrollback.drain(0..excess);
             }
         }

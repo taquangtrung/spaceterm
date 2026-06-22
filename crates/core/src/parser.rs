@@ -243,6 +243,16 @@ impl Performer {
         })
     }
 
+    /// Emit a pre-built content block directly into the scrollback.
+    pub fn emit(&mut self, block: EmitBlock) {
+        self.scrollback.emit(block);
+    }
+
+    /// Allocate a unique synthetic block ID (increments the internal counter).
+    pub fn alloc_block_id(&mut self) -> BlockId {
+        self.next_synthetic_id()
+    }
+
     fn next_synthetic_id(&mut self) -> BlockId {
         self.synthetic_id += 1;
         BlockId(self.synthetic_id)

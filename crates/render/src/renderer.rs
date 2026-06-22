@@ -108,17 +108,21 @@ pub struct PaneRect {
 
 /// One pane's rendering input: where to draw and what grid to draw.
 pub struct PaneView<'a> {
+    pub cursor_shape: CursorShape,
     pub grid: &'a Grid,
     pub labels: Option<&'a [(usize, usize, char)]>,
     /// The Normal-mode traversal cursor, in viewport `(row, col)`, drawn in
     /// [`Self::cursor_shape`]. `None` when the pane is not being navigated.
     pub nav_cursor: Option<(usize, usize)>,
     pub rect: PaneRect,
+    /// Active search query matches as `(row, col)` pairs; empty when no search
+    /// is active. Highlighted in the background pass.
+    pub search_matches: &'a [(usize, usize)],
     pub selection: Option<(usize, usize, usize, usize)>,
-    /// The shape used to draw whichever cursor is active: the in-grid shell
-    /// cursor when `nav_cursor` is `None`, or the traversal cursor otherwise.
-    /// Hosts pick this per pane from the active mode's configured shape.
-    pub cursor_shape: CursorShape,
+    /// How many rows the pane is currently scrolled up from the live bottom.
+    pub scroll_offset: usize,
+    /// Total rows in the scrollback buffer above the live grid.
+    pub scrollback_len: usize,
 }
 
 /// A Vim-style bottom status bar: the `label` (e.g. " NORMAL ") is drawn over a
@@ -770,16 +774,19 @@ impl GpuRenderer {
             let bg_verts = build_bg_vertices_offset(
                 grid,
                 BgParams {
-                    cw: self.cell_width,
                     ch: self.cell_height,
                     cursor_shape: pane.cursor_shape,
+                    cw: self.cell_width,
                     hide_cursor: pane.nav_cursor.is_some(),
-                    surface_w,
-                    surface_h,
+                    labels: pane.labels,
                     offset_x: rect.x,
                     offset_y: rect.y,
+                    scroll_offset: pane.scroll_offset,
+                    scrollback_len: pane.scrollback_len,
+                    search_matches: pane.search_matches,
                     selection: pane.selection,
-                    labels: pane.labels,
+                    surface_h,
+                    surface_w,
                     theme: &self.theme,
                 },
             );
@@ -1667,13 +1674,16 @@ impl BgVertex {
 
 /// Parameters for building background vertices for one pane.
 struct BgParams<'a> {
-    cw: f32,
     ch: f32,
     cursor_shape: CursorShape,
+    cw: f32,
     hide_cursor: bool,
     labels: Option<&'a [(usize, usize, char)]>,
     offset_x: f32,
     offset_y: f32,
+    scroll_offset: usize,
+    scrollback_len: usize,
+    search_matches: &'a [(usize, usize)],
     selection: Option<(usize, usize, usize, usize)>,
     surface_h: f32,
     surface_w: f32,
@@ -1682,16 +1692,19 @@ struct BgParams<'a> {
 
 fn build_bg_vertices_offset(grid: &Grid, params: BgParams) -> Vec<BgVertex> {
     let BgParams {
-        cw,
         ch,
         cursor_shape,
+        cw,
         hide_cursor,
-        surface_w,
-        surface_h,
+        labels,
         offset_x,
         offset_y,
+        scroll_offset,
+        scrollback_len,
+        search_matches,
         selection,
-        labels,
+        surface_h,
+        surface_w,
         theme,
     } = params;
     let mut verts = Vec::new();
@@ -1709,6 +1722,9 @@ fn build_bg_vertices_offset(grid: &Grid, params: BgParams) -> Vec<BgVertex> {
         .map(|l| l.iter().map(|&(r, c, _)| (r, c)).collect())
         .unwrap_or_default();
 
+    let match_set: std::collections::HashSet<(usize, usize)> =
+        search_matches.iter().copied().collect();
+
     for row in 0..grid.rows() {
         for col in 0..grid.cols() {
             let cell = grid.cell(row, col);
@@ -1721,12 +1737,15 @@ fn build_bg_vertices_offset(grid: &Grid, params: BgParams) -> Vec<BgVertex> {
             });
 
             let is_label = label_set.contains(&(row, col));
+            let is_search_match = match_set.contains(&(row, col));
 
-            if draw_bg || is_selected || is_label {
+            if draw_bg || is_selected || is_label || is_search_match {
                 let (r, g, b) = if is_label {
                     QUICK_SELECT_BG
                 } else if is_selected {
                     theme.selection_bg.as_linear()
+                } else if is_search_match {
+                    theme.search_match_bg.as_linear()
                 } else if is_cursor {
                     theme.cursor_bg.as_linear()
                 } else {
@@ -1817,8 +1836,43 @@ fn build_bg_vertices_offset(grid: &Grid, params: BgParams) -> Vec<BgVertex> {
         }
     }
 
+    // Scrollbar: shown only when there is scrollback to navigate.
+    if scrollback_len > 0 {
+        let total = (grid.rows() + scrollback_len) as f32;
+        let visible = grid.rows() as f32;
+        let thumb_h_frac = (visible / total).max(0.0);
+        let top_virtual = scrollback_len.saturating_sub(scroll_offset) as f32;
+        let thumb_top_frac = (top_virtual / total).clamp(0.0, 1.0 - thumb_h_frac);
+
+        let sb_x0 = offset_x + grid.cols() as f32 * cw - SCROLLBAR_WIDTH;
+        let sb_x1 = offset_x + grid.cols() as f32 * cw;
+        let track_y0 = offset_y;
+        let track_y1 = offset_y + grid.rows() as f32 * ch;
+        let track_h = track_y1 - track_y0;
+
+        let thumb_y0 = track_y0 + thumb_top_frac * track_h;
+        let thumb_y1 = (thumb_y0 + thumb_h_frac * track_h)
+            .max(thumb_y0 + SCROLLBAR_MIN_THUMB)
+            .min(track_y1);
+
+        let (bg_r, bg_g, bg_b) = theme.background.as_linear();
+        let (dv_r, dv_g, dv_b) = theme.divider.as_linear();
+        let track_color = (
+            bg_r * 0.7 + dv_r * 0.3,
+            bg_g * 0.7 + dv_g * 0.3,
+            bg_b * 0.7 + dv_b * 0.3,
+        );
+        let thumb_color = theme.cursor_bg.as_linear();
+
+        verts.extend_from_slice(&quad_vertices(sb_x0, track_y0, sb_x1, track_y1, track_color, surface_w, surface_h));
+        verts.extend_from_slice(&quad_vertices(sb_x0, thumb_y0, sb_x1, thumb_y1, thumb_color, surface_w, surface_h));
+    }
+
     verts
 }
+
+const SCROLLBAR_WIDTH: f32 = 3.0;
+const SCROLLBAR_MIN_THUMB: f32 = 6.0;
 
 const DIVIDER_THICKNESS: f32 = 1.0;
 /// Height of the underline bar drawn for SGR 4 and OSC 8 hyperlink cells.
@@ -3205,16 +3259,19 @@ mod tests {
         let verts = build_bg_vertices_offset(
             &grid,
             BgParams {
-                cw: 10.0,
                 ch: 20.0,
                 cursor_shape: CursorShape::Block,
+                cw: 10.0,
                 hide_cursor: false,
-                surface_w: 800.0,
-                surface_h: 600.0,
+                labels: None,
                 offset_x: 0.0,
                 offset_y: 0.0,
+                scroll_offset: 0,
+                scrollback_len: 0,
+                search_matches: &[],
                 selection: None,
-                labels: None,
+                surface_h: 600.0,
+                surface_w: 800.0,
                 theme: &Theme::default(),
             },
         );
@@ -3228,16 +3285,19 @@ mod tests {
         let verts = build_bg_vertices_offset(
             &grid,
             BgParams {
-                cw: 10.0,
                 ch: 20.0,
                 cursor_shape: CursorShape::Block,
+                cw: 10.0,
                 hide_cursor: false,
-                surface_w: 800.0,
-                surface_h: 600.0,
+                labels: None,
                 offset_x: 0.0,
                 offset_y: 0.0,
+                scroll_offset: 0,
+                scrollback_len: 0,
+                search_matches: &[],
                 selection: None,
-                labels: None,
+                surface_h: 600.0,
+                surface_w: 800.0,
                 theme: &Theme::default(),
             },
         );
@@ -3251,32 +3311,38 @@ mod tests {
         let with_offset = build_bg_vertices_offset(
             &grid,
             BgParams {
-                cw: 10.0,
                 ch: 20.0,
                 cursor_shape: CursorShape::Block,
+                cw: 10.0,
                 hide_cursor: false,
-                surface_w: 800.0,
-                surface_h: 600.0,
+                labels: None,
                 offset_x: 100.0,
                 offset_y: 50.0,
+                scroll_offset: 0,
+                scrollback_len: 0,
+                search_matches: &[],
                 selection: None,
-                labels: None,
+                surface_h: 600.0,
+                surface_w: 800.0,
                 theme: &Theme::default(),
             },
         );
         let without_offset = build_bg_vertices_offset(
             &grid,
             BgParams {
-                cw: 10.0,
                 ch: 20.0,
                 cursor_shape: CursorShape::Block,
+                cw: 10.0,
                 hide_cursor: false,
-                surface_w: 800.0,
-                surface_h: 600.0,
+                labels: None,
                 offset_x: 0.0,
                 offset_y: 0.0,
+                scroll_offset: 0,
+                scrollback_len: 0,
+                search_matches: &[],
                 selection: None,
-                labels: None,
+                surface_h: 600.0,
+                surface_w: 800.0,
                 theme: &Theme::default(),
             },
         );
@@ -3290,16 +3356,19 @@ mod tests {
         let verts = build_bg_vertices_offset(
             &grid,
             BgParams {
-                cw: 10.0,
                 ch: 20.0,
                 cursor_shape: CursorShape::Block,
+                cw: 10.0,
                 hide_cursor: false,
-                surface_w: 800.0,
-                surface_h: 600.0,
+                labels: None,
                 offset_x: 0.0,
                 offset_y: 0.0,
+                scroll_offset: 0,
+                scrollback_len: 0,
+                search_matches: &[],
                 selection: Some((0, 0, 0, 1)),
-                labels: None,
+                surface_h: 600.0,
+                surface_w: 800.0,
                 theme: &Theme::default(),
             },
         );
@@ -3314,16 +3383,19 @@ mod tests {
         let verts = build_bg_vertices_offset(
             &grid,
             BgParams {
-                cw: 10.0,
                 ch: 20.0,
                 cursor_shape: CursorShape::Block,
+                cw: 10.0,
                 hide_cursor: false,
-                surface_w: 800.0,
-                surface_h: 600.0,
+                labels: Some(labels),
                 offset_x: 0.0,
                 offset_y: 0.0,
+                scroll_offset: 0,
+                scrollback_len: 0,
+                search_matches: &[],
                 selection: None,
-                labels: Some(labels),
+                surface_h: 600.0,
+                surface_w: 800.0,
                 theme: &Theme::default(),
             },
         );

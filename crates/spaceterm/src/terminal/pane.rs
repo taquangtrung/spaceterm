@@ -12,7 +12,7 @@ use std::io::Cursor;
 use base64::Engine;
 use spaceterm_core::spaceterm_proto::EmitBlock;
 use spaceterm_core::{Performer, Scrollback, Segment};
-use spaceterm_render::Grid;
+use spaceterm_render::{Grid, MAX_SCROLLBACK};
 use vte::{Params, Perform};
 
 use super::block_queue::BlockQueue;
@@ -33,6 +33,10 @@ const HORIZONTAL_TAB: u8 = b'\t';
 /// escape) so the shell's subsequent output flows below the block instead of
 /// under it, without desyncing the shell's cursor.
 pub(crate) const BLOCK_RESERVE_ROWS: usize = 12;
+
+/// Maximum APC payload size to accumulate before aborting (guards against
+/// malformed or unterminated sequences bloating memory).
+const APC_MAX_PAYLOAD: usize = 4 * 1024 * 1024;
 
 /// Upper bound on rows an image block may reserve, so a tall image cannot eat
 /// the whole screen. Raster images reserve exactly the rows they occupy, capped
@@ -109,6 +113,18 @@ fn image_reserve_rows(
 // Data Structures
 // ========================================================================
 
+/// What a call to [`CombinedPerformer::apc_filter`] wants the drain loop to do
+/// with the current byte.
+enum ApcDecision {
+    /// Byte was consumed by the APC state machine; do not forward to vte.
+    Drop,
+    /// Byte was not APC-related; forward it to vte as-is.
+    Pass,
+    /// The APC filter had buffered an ESC that turned out not to start an APC
+    /// sequence. Forward ESC followed by the current byte to vte.
+    ReplayEscThenByte(u8),
+}
+
 /// Kitty keyboard protocol flag stack. Apps push a flags bitmask to opt in to
 /// progressive keyboard enhancement, then pop it on exit. The current top of
 /// the stack is the active mode; an empty stack means legacy xterm encoding.
@@ -131,6 +147,23 @@ impl KittyStack {
     fn current(&self) -> u32 {
         self.0.last().copied().unwrap_or(0)
     }
+
+    /// Mode-based modification (`CSI = flags ; mode u`):
+    /// mode 1 = set (replace current), 2 = unset (AND NOT), 3 = OR.
+    /// If the stack is empty, a new entry is pushed; otherwise the top is updated.
+    fn modify(&mut self, flags: u32, mode: u32) {
+        let current = self.0.last().copied().unwrap_or(0);
+        let new = match mode {
+            1 => flags,
+            2 => current & !flags,
+            3 => current | flags,
+            _ => return,
+        };
+        match self.0.last_mut() {
+            Some(top) => *top = new,
+            None => self.0.push(new),
+        }
+    }
 }
 
 impl Default for KittyStack {
@@ -143,6 +176,15 @@ impl Default for KittyStack {
 /// (visual cell grid) and a core [`Performer`] (block parser). This replaces
 /// the previous dual-parser setup where every PTY byte was parsed twice.
 struct CombinedPerformer {
+    /// APC (Application Program Command) payload bytes accumulated between
+    /// `ESC _` and the String Terminator `ESC \\` / `\x9c`. Used to parse the
+    /// Kitty graphics protocol (`APC G ... ST`) which vte 0.13 silently drops.
+    apc_buf: Vec<u8>,
+    /// True while we are inside an `ESC _ ... ST` APC string.
+    apc_in: bool,
+    /// True when the last byte was `ESC` (0x1b) — used for lookahead so we can
+    /// intercept `ESC _` without consuming unrelated escape sequences.
+    apc_pending_esc: bool,
     bell: bool,
     /// Grid rows (one per emitted block, in emission order) where the block was
     /// anchored, drained by [`Pane::drain_output`] into the block queue.
@@ -153,6 +195,13 @@ struct CombinedPerformer {
     cell_height: f32,
     cell_width: f32,
     grid: Grid,
+    /// Accumulated base64 payload across Kitty graphics chunks (`m=1` packets).
+    kitty_b64: Vec<u8>,
+    /// Pixel dimensions from the first Kitty chunk header (`s=`, `v=`).
+    kitty_px_h: u32,
+    kitty_px_w: u32,
+    /// Format code from the first Kitty chunk header (`f=`).
+    kitty_format: u32,
     /// Active Kitty keyboard protocol flags (stack top), updated via
     /// `CSI > flags u` (push) and `CSI < n u` (pop).
     kitty_stack: KittyStack,
@@ -160,6 +209,9 @@ struct CombinedPerformer {
     /// Response bytes queued by `CSI ? u` queries, drained into the PTY
     /// writer by [`Pane::drain_output`] after each parse batch.
     pending_responses: Vec<u8>,
+    /// Text written via `OSC 52 ; c ; <base64>`, drained into the host
+    /// clipboard by [`Pane::take_clipboard_write`] after each parse batch.
+    pending_clipboard_write: Option<String>,
 }
 
 // ========================================================================
@@ -167,16 +219,24 @@ struct CombinedPerformer {
 // ========================================================================
 
 impl CombinedPerformer {
-    fn new(cols: usize, rows: usize) -> Self {
+    fn new(cols: usize, rows: usize, max_scrollback: usize) -> Self {
         Self {
+            apc_buf: Vec::new(),
+            apc_in: false,
+            apc_pending_esc: false,
             bell: false,
             block_anchors: Vec::new(),
             // Approximate defaults until the app sets the real cell size.
             cell_height: 20.0,
             cell_width: 9.0,
-            grid: Grid::new(cols, rows),
+            grid: Grid::new(cols, rows).with_max_scrollback(max_scrollback),
+            kitty_b64: Vec::new(),
+            kitty_format: 100,
+            kitty_px_h: 0,
+            kitty_px_w: 0,
             kitty_stack: KittyStack::default(),
             performer: Performer::new(),
+            pending_clipboard_write: None,
             pending_responses: Vec::new(),
         }
     }
@@ -187,6 +247,35 @@ impl CombinedPerformer {
 
     fn take_pending_responses(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending_responses)
+    }
+
+    /// Take the decoded clipboard text from a pending `OSC 52 ; c ; <base64>`
+    /// write, if any. Called by [`Pane::take_clipboard_write`] after each
+    /// parse batch so the app layer can write it to the OS clipboard.
+    fn take_clipboard_write(&mut self) -> Option<String> {
+        self.pending_clipboard_write.take()
+    }
+
+    /// Handle `OSC 52 ; <selection> ; <data>` clipboard write.
+    /// Only the write direction (base64-encoded text) is supported. Read
+    /// queries (`<data>` = `?`) are intentionally ignored: responding would
+    /// let any process running in the terminal silently exfiltrate the host
+    /// clipboard without user confirmation.
+    fn handle_osc52(&mut self, params: &[&[u8]]) {
+        let data = match params.get(2) {
+            Some(d) => *d,
+            None => return,
+        };
+        if data == b"?" {
+            // Read queries are dropped for security: clipboard exfiltration
+            // would be silent and unconditional.
+            return;
+        }
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
+            if let Ok(text) = String::from_utf8(bytes) {
+                self.pending_clipboard_write = Some(text);
+            }
+        }
     }
 
     /// Anchor rows of blocks emitted since the last call, in emission order.
@@ -208,6 +297,173 @@ impl CombinedPerformer {
                     .unwrap_or(BLOCK_RESERVE_ROWS)
             }
             None => BLOCK_RESERVE_ROWS,
+        }
+    }
+
+    /// Pre-filter one PTY byte for the Kitty graphics protocol. vte 0.13
+    /// silently discards APC sequences (`ESC _ ... ST`), so we intercept them
+    /// before the vte parser sees them.
+    ///
+    /// The caller must act on the returned [`ApcDecision`] to know what (if
+    /// anything) to forward to the vte parser.
+    fn apc_filter(&mut self, byte: u8) -> ApcDecision {
+        if self.apc_in {
+            if self.apc_pending_esc {
+                self.apc_pending_esc = false;
+                if byte == b'\\' {
+                    self.finalize_apc();
+                } else {
+                    // ESC inside APC not followed by '\\': keep both bytes.
+                    self.apc_buf.push(b'\x1b');
+                    self.apc_buf.push(byte);
+                }
+                return ApcDecision::Drop;
+            }
+            match byte {
+                0x9c | 0x07 => self.finalize_apc(),
+                b'\x1b' => self.apc_pending_esc = true,
+                _ => {
+                    if self.apc_buf.len() < APC_MAX_PAYLOAD {
+                        self.apc_buf.push(byte);
+                    } else {
+                        self.apc_buf.clear();
+                        self.apc_in = false;
+                    }
+                }
+            }
+            return ApcDecision::Drop;
+        }
+        if self.apc_pending_esc {
+            self.apc_pending_esc = false;
+            if byte == b'_' {
+                self.apc_in = true;
+                self.apc_buf.clear();
+                return ApcDecision::Drop;
+            }
+            // Not APC: replay the buffered ESC then the current byte.
+            return ApcDecision::ReplayEscThenByte(byte);
+        }
+        if byte == b'\x1b' {
+            self.apc_pending_esc = true;
+            return ApcDecision::Drop; // buffer ESC until we see the next byte
+        }
+        ApcDecision::Pass
+    }
+
+    fn finalize_apc(&mut self) {
+        self.apc_in = false;
+        self.apc_pending_esc = false;
+        if self.apc_buf.first() == Some(&b'G') {
+            let payload = std::mem::take(&mut self.apc_buf);
+            self.handle_kitty_apc(&payload[1..]);
+        } else {
+            self.apc_buf.clear();
+        }
+    }
+
+    fn handle_kitty_apc(&mut self, payload: &[u8]) {
+        let Ok(text) = std::str::from_utf8(payload) else {
+            return;
+        };
+        let (ctrl_str, b64_data) = text.split_once(';').unwrap_or((text, ""));
+
+        let mut format: u32 = 100;
+        let mut more: u32 = 0;
+        let mut px_w: u32 = 0;
+        let mut px_h: u32 = 0;
+
+        for kv in ctrl_str.split(',') {
+            if let Some((k, v)) = kv.split_once('=') {
+                match k.trim() {
+                    "f" => format = v.trim().parse().unwrap_or(100),
+                    "m" => more = v.trim().parse().unwrap_or(0),
+                    "s" => px_w = v.trim().parse().unwrap_or(0),
+                    "v" => px_h = v.trim().parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
+        }
+
+        if self.kitty_b64.is_empty() {
+            self.kitty_format = format;
+            self.kitty_px_w = px_w;
+            self.kitty_px_h = px_h;
+        }
+        self.kitty_b64.extend_from_slice(b64_data.as_bytes());
+
+        if more == 0 {
+            let b64 = std::mem::take(&mut self.kitty_b64);
+            self.finalize_kitty_image(&b64);
+        }
+    }
+
+    fn finalize_kitty_image(&mut self, b64: &[u8]) {
+        use base64::Engine;
+        use spaceterm_core::spaceterm_proto::{EmitBlock, MimeBundle, TrustTier, TEXT_PLAIN};
+
+        let decoded = match base64::engine::general_purpose::STANDARD.decode(b64) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        let (mime, bytes): (&str, Vec<u8>) = match self.kitty_format {
+            100 => ("image/png", decoded),
+            1 => ("image/jpeg", decoded),
+            32 => {
+                let (w, h) = (self.kitty_px_w, self.kitty_px_h);
+                if w == 0 || h == 0 {
+                    return;
+                }
+                let Some(img) = image::RgbaImage::from_raw(w, h, decoded) else {
+                    return;
+                };
+                let mut png: Vec<u8> = Vec::new();
+                if image::DynamicImage::ImageRgba8(img)
+                    .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+                    .is_err()
+                {
+                    return;
+                }
+                ("image/png", png)
+            }
+            24 => {
+                let (w, h) = (self.kitty_px_w, self.kitty_px_h);
+                if w == 0 || h == 0 {
+                    return;
+                }
+                let Some(img) = image::RgbImage::from_raw(w, h, decoded) else {
+                    return;
+                };
+                let mut png: Vec<u8> = Vec::new();
+                if image::DynamicImage::ImageRgb8(img)
+                    .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+                    .is_err()
+                {
+                    return;
+                }
+                ("image/png", png)
+            }
+            _ => return,
+        };
+
+        let data_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let mut bundle = MimeBundle::new();
+        bundle.insert(mime, serde_json::Value::from(data_b64.as_str()));
+        bundle.insert(TEXT_PLAIN, serde_json::Value::from("[image]"));
+        let block = EmitBlock {
+            bundle,
+            id: self.performer.alloc_block_id(),
+            trust: TrustTier::default(),
+        };
+        let before = content_segment_count(self.performer.scrollback());
+        self.performer.emit(block);
+        let after = content_segment_count(self.performer.scrollback());
+        let rows = self.reserve_rows_for_last_block();
+        for _ in before..after {
+            self.block_anchors.push(self.grid.cursor().0);
+            for _ in 0..rows {
+                self.grid.line_feed();
+            }
         }
     }
 
@@ -279,6 +535,14 @@ impl Perform for CombinedPerformer {
                     self.pending_responses.extend_from_slice(response.as_bytes());
                     return;
                 }
+                // CSI = flags ; mode u — mode-based set/unset/or (no stack change).
+                [b'='] => {
+                    let mut iter = params.iter();
+                    let flags = iter.next().and_then(|p| p.first()).map(|&v| v as u32).unwrap_or(0);
+                    let mode = iter.next().and_then(|p| p.first()).map(|&v| v as u32).unwrap_or(1);
+                    self.kitty_stack.modify(flags, mode);
+                    return;
+                }
                 _ => {}
             }
         }
@@ -286,6 +550,13 @@ impl Perform for CombinedPerformer {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        // OSC 52 — clipboard read/write. Handled here because it needs arboard
+        // access (the core Performer crate does not depend on arboard).
+        if params.first() == Some(&b"52".as_slice()) {
+            self.handle_osc52(params);
+            return;
+        }
+
         // OSC 8 ; params ; URI — open/close a hyperlink on the visual grid.
         // Only store URLs whose scheme is on the allowlist so that rogue
         // sequences cannot cause Ctrl+click to invoke arbitrary OS handlers
@@ -348,21 +619,19 @@ pub struct Pane {
 
 impl Pane {
     /// Spawn the default shell under a PTY with the given grid dimensions.
-    pub fn new(cols: usize, rows: usize) -> Self {
-        let shell = if let Ok(s) = std::env::var("SPACETERM_SHELL") {
-            s
-        } else if let Ok(s) = std::env::var("SHELL") {
-            s
-        } else {
-            "/bin/bash".to_string()
-        };
+    pub fn new(cols: usize, rows: usize, configured_shell: Option<&str>, max_scrollback: usize) -> Self {
+        let shell = configured_shell
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("SPACETERM_SHELL").ok())
+            .or_else(|| std::env::var("SHELL").ok())
+            .unwrap_or_else(|| "/bin/bash".to_string());
 
         let command = CommandBuilder::new(shell);
-        Self::with_command(cols, rows, command)
+        Self::with_command(cols, rows, command, max_scrollback)
     }
 
     /// Spawn `command` under a PTY with the given grid dimensions.
-    pub fn with_command(cols: usize, rows: usize, mut command: CommandBuilder) -> Self {
+    pub fn with_command(cols: usize, rows: usize, mut command: CommandBuilder, max_scrollback: usize) -> Self {
         // Advertise SpaceTerm to the child so capability-detecting tools (e.g.
         // `spacecat`, `clients/client.sh`) emit rich blocks instead of the
         // plain-text fallback.
@@ -412,7 +681,7 @@ impl Pane {
         Self {
             block_queue: BlockQueue::new(),
             child,
-            combined: CombinedPerformer::new(cols, rows),
+            combined: CombinedPerformer::new(cols, rows, max_scrollback),
             master: pair.master,
             parser: vte::Parser::new(),
             writer,
@@ -427,7 +696,16 @@ impl Pane {
         let mut got_any = false;
         while let Ok(chunk) = self.rx.try_recv() {
             for &byte in &chunk {
-                self.parser.advance(&mut self.combined, byte);
+                match self.combined.apc_filter(byte) {
+                    ApcDecision::Drop => {}
+                    ApcDecision::Pass => {
+                        self.parser.advance(&mut self.combined, byte);
+                    }
+                    ApcDecision::ReplayEscThenByte(b) => {
+                        self.parser.advance(&mut self.combined, b'\x1b');
+                        self.parser.advance(&mut self.combined, b);
+                    }
+                }
             }
             got_any = true;
         }
@@ -537,6 +815,11 @@ impl Pane {
         self.combined.take_title()
     }
 
+    /// Take the clipboard text from a pending `OSC 52` write, if any.
+    pub fn take_clipboard_write(&mut self) -> Option<String> {
+        self.combined.take_clipboard_write()
+    }
+
     /// Whether a bell character was received since the last check.
     pub fn take_bell(&mut self) -> bool {
         self.combined.take_bell()
@@ -583,7 +866,7 @@ mod tests {
 
     #[test]
     fn test_pane_echo() {
-        let mut pane = Pane::with_command(40, 10, CommandBuilder::new("bash"));
+        let mut pane = Pane::with_command(40, 10, CommandBuilder::new("bash"), MAX_SCROLLBACK);
         pane.write(b"echo hello\n");
         thread::sleep(std::time::Duration::from_millis(100));
         pane.drain_output();
@@ -596,7 +879,7 @@ mod tests {
 
     #[test]
     fn test_pane_resize_signals_pty() {
-        let mut pane = Pane::with_command(20, 5, CommandBuilder::new("bash"));
+        let mut pane = Pane::with_command(20, 5, CommandBuilder::new("bash"), MAX_SCROLLBACK);
         pane.resize(40, 10);
         thread::sleep(std::time::Duration::from_millis(50));
         assert!(pane.is_alive());
@@ -604,7 +887,7 @@ mod tests {
 
     #[test]
     fn test_combined_performer_print_feeds_both() {
-        let mut cp = CombinedPerformer::new(10, 2);
+        let mut cp = CombinedPerformer::new(10, 2, MAX_SCROLLBACK);
         cp.print('x');
         assert_eq!(cp.grid().cell(0, 0).map(|c| c.ch), Some('x'));
         assert!(cp.scrollback().plain_text().contains('x'));
@@ -612,7 +895,7 @@ mod tests {
 
     #[test]
     fn test_combined_performer_csi_moves_cursor() {
-        let mut cp = CombinedPerformer::new(5, 2);
+        let mut cp = CombinedPerformer::new(5, 2, MAX_SCROLLBACK);
         cp.print('a');
         cp.print('b');
         cp.print('c');
@@ -626,9 +909,69 @@ mod tests {
 
     #[test]
     fn test_combined_performer_bell() {
-        let mut cp = CombinedPerformer::new(10, 1);
+        let mut cp = CombinedPerformer::new(10, 1, MAX_SCROLLBACK);
         cp.execute(BELL);
         assert!(cp.take_bell());
         assert!(!cp.take_bell());
+    }
+
+    #[test]
+    fn test_kitty_stack_empty_returns_zero() {
+        let stack = KittyStack::default();
+        assert_eq!(stack.current(), 0);
+    }
+
+    #[test]
+    fn test_kitty_stack_push_pop() {
+        let mut stack = KittyStack::default();
+        stack.push(1);
+        stack.push(3);
+        assert_eq!(stack.current(), 3);
+        stack.pop(1);
+        assert_eq!(stack.current(), 1);
+        stack.pop(1);
+        assert_eq!(stack.current(), 0);
+        // Pop on empty stack is a no-op.
+        stack.pop(1);
+        assert_eq!(stack.current(), 0);
+    }
+
+    #[test]
+    fn test_kitty_stack_modify_set_replaces_top() {
+        let mut stack = KittyStack::default();
+        stack.push(3);
+        stack.modify(5, 1); // mode 1 = set
+        assert_eq!(stack.current(), 5);
+    }
+
+    #[test]
+    fn test_kitty_stack_modify_unset_clears_bits() {
+        let mut stack = KittyStack::default();
+        stack.push(7); // 0b111
+        stack.modify(2, 2); // mode 2 = AND NOT: 7 & !2 = 5
+        assert_eq!(stack.current(), 5);
+    }
+
+    #[test]
+    fn test_kitty_stack_modify_or_adds_bits() {
+        let mut stack = KittyStack::default();
+        stack.push(1);
+        stack.modify(6, 3); // mode 3 = OR: 1 | 6 = 7
+        assert_eq!(stack.current(), 7);
+    }
+
+    #[test]
+    fn test_kitty_stack_modify_on_empty_stack_pushes_entry() {
+        let mut stack = KittyStack::default();
+        stack.modify(3, 1); // set on empty: pushes 3
+        assert_eq!(stack.current(), 3);
+    }
+
+    #[test]
+    fn test_kitty_stack_modify_unknown_mode_is_noop() {
+        let mut stack = KittyStack::default();
+        stack.push(1);
+        stack.modify(99, 99); // unknown mode
+        assert_eq!(stack.current(), 1); // unchanged
     }
 }

@@ -94,8 +94,23 @@ impl App {
             .map(|labels| labels.iter().map(|ql| (ql.row, ql.col, ql.label)).collect())
             .unwrap_or_default();
 
+        // Precompute search match cell positions per pane so PaneView can borrow
+        // them as slices. Built before the view loop to satisfy the borrow checker.
+        let query_chars: Option<Vec<char>> = self
+            .search_query
+            .as_deref()
+            .filter(|q| !q.is_empty())
+            .map(|q| q.to_lowercase().chars().collect());
+        let search_match_data: Vec<Vec<(usize, usize)>> = rects
+            .iter()
+            .map(|(id, _)| match (&query_chars, self.panes.get(id)) {
+                (Some(qc), Some(pane)) => search_grid_matches(pane.grid(), qc),
+                _ => vec![],
+            })
+            .collect();
+
         let mut views: Vec<PaneView> = Vec::new();
-        for (id, rect) in &rects {
+        for (i, (id, rect)) in rects.iter().enumerate() {
             if let Some(pane) = self.panes.get(id) {
                 let sel_tuple = sel.and_then(|(pid, sr, sc, er, ec)| {
                     if pid == *id {
@@ -129,12 +144,15 @@ impl App {
                     self.config.cursor.insert
                 };
                 views.push(PaneView {
+                    cursor_shape,
                     grid: pane.grid(),
                     labels,
                     nav_cursor,
                     rect: Self::layout_rect_to_pane(*rect),
+                    scroll_offset: pane.grid().scroll_offset(),
+                    scrollback_len: pane.grid().scrollback_len(),
+                    search_matches: &search_match_data[i],
                     selection: sel_tuple,
-                    cursor_shape,
                 });
             }
         }
@@ -303,6 +321,7 @@ impl App {
         let (cw, ch) = renderer.cell_size();
         let grid = build_settings_grid(page, renderer.theme(), cols, rows);
         let view = PaneView {
+            cursor_shape: CursorShape::Block,
             grid: &grid,
             labels: None,
             // An out-of-bounds nav cursor suppresses the terminal cursor (the
@@ -314,8 +333,10 @@ impl App {
                 x: 0.0,
                 y: 0.0,
             },
+            scroll_offset: 0,
+            scrollback_len: 0,
+            search_matches: &[],
             selection: None,
-            cursor_shape: CursorShape::Block,
         };
         renderer.render(std::slice::from_ref(&view), None, None, false, &[], None);
     }
@@ -839,4 +860,32 @@ fn json_to_text(value: &Value) -> String {
         .and_then(|s| serde_json::from_str::<Value>(s).ok());
     let target = parsed.as_ref().unwrap_or(value);
     serde_json::to_string_pretty(target).unwrap_or_else(|_| value.to_string())
+}
+
+/// Scan every row of `grid`'s visible area for occurrences of `query_chars`
+/// (already lowercased) and return matching `(row, col)` cell positions.
+fn search_grid_matches(grid: &Grid, query_chars: &[char]) -> Vec<(usize, usize)> {
+    let qlen = query_chars.len();
+    if qlen == 0 {
+        return vec![];
+    }
+    let mut matches = Vec::new();
+    for row in 0..grid.rows() {
+        let row_chars: Vec<char> = (0..grid.cols())
+            .filter_map(|c| grid.visible_cell(row, c))
+            .map(|cell| cell.ch.to_ascii_lowercase())
+            .collect();
+        let row_len = row_chars.len();
+        if row_len < qlen {
+            continue;
+        }
+        for start in 0..=row_len - qlen {
+            if row_chars[start..start + qlen] == *query_chars {
+                for k in 0..qlen {
+                    matches.push((row, start + k));
+                }
+            }
+        }
+    }
+    matches
 }
