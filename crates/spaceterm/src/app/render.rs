@@ -156,8 +156,12 @@ impl App {
                 } else {
                     0
                 };
+                let cursor_visible = *id != focused
+                    || !self.config.cursor.blink
+                    || self.blink_phase;
                 views.push(PaneView {
                     cursor_shape,
+                    cursor_visible,
                     grid: pane.grid(),
                     hovered_link,
                     labels,
@@ -343,6 +347,7 @@ impl App {
         let grid = build_settings_grid(page, renderer.theme(), cols, rows);
         let view = PaneView {
             cursor_shape: CursorShape::Block,
+            cursor_visible: true,
             grid: &grid,
             hovered_link: 0,
             labels: None,

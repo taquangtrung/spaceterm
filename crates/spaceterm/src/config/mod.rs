@@ -128,6 +128,8 @@ pub struct Config {
     pub font_weight: Option<String>,
     pub font_weight_bold: Option<String>,
     pub keybindings: HashMap<String, HashMap<String, String>>,
+    /// Enable OpenType ligatures in the font renderer. Defaults to `true`.
+    pub ligatures: bool,
     /// Tabbar menu presentation: a modern hamburger dropdown or a classic menubar.
     pub menu_style: MenuStyle,
     pub opacity: f32,
@@ -153,6 +155,9 @@ pub struct Config {
 /// convention (a bar for insert-like modes, a block for navigation).
 #[derive(Clone, Copy, Debug)]
 pub struct CursorConfig {
+    /// Whether the cursor blinks. Applies only to the focused pane; non-focused
+    /// panes always show a static cursor.
+    pub blink: bool,
     pub block_focus: CursorShape,
     pub insert: CursorShape,
     pub normal: CursorShape,
@@ -162,6 +167,7 @@ pub struct CursorConfig {
 impl Default for CursorConfig {
     fn default() -> Self {
         Self {
+            blink: true,
             block_focus: CursorShape::Bar,
             insert: CursorShape::Bar,
             normal: CursorShape::Block,
@@ -328,6 +334,8 @@ struct KdlConfig {
     #[knuffel(child, unwrap(argument))]
     title_bar_style: Option<String>,
     #[knuffel(child, unwrap(argument))]
+    ligatures: Option<String>,
+    #[knuffel(child, unwrap(argument))]
     palette_match_underline: Option<String>,
     #[knuffel(child, unwrap(argument))]
     paste_on_right_click: Option<String>,
@@ -344,13 +352,15 @@ struct KdlConfig {
 #[derive(knuffel::Decode)]
 struct KdlCursor {
     #[knuffel(child, unwrap(argument))]
+    blink: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    block_focus: Option<String>,
+    #[knuffel(child, unwrap(argument))]
     insert: Option<String>,
     #[knuffel(child, unwrap(argument))]
     normal: Option<String>,
     #[knuffel(child, unwrap(argument))]
     visual: Option<String>,
-    #[knuffel(child, unwrap(argument))]
-    block_focus: Option<String>,
 }
 
 #[derive(knuffel::Decode)]
@@ -638,6 +648,7 @@ impl Config {
                 .and_then(|o| o.value.parse().ok())
                 .unwrap_or(1.0f32)
                 .clamp(0.1, 1.0),
+            ligatures: parse_bool(kdl.ligatures.as_deref(), true),
             palette_match_underline: parse_bool(kdl.palette_match_underline.as_deref(), false),
             paste_on_right_click: parse_bool(kdl.paste_on_right_click.as_deref(), false),
             scrollback_lines: kdl.scrollback_lines.as_deref().and_then(|s| s.parse::<usize>().ok()).filter(|&n| n > 0),
@@ -689,6 +700,10 @@ impl Config {
             kdl_bool(self.palette_match_underline)
         ));
         out.push_str(&format!(
+            "ligatures {}\n",
+            kdl_bool(self.ligatures)
+        ));
+        out.push_str(&format!(
             "paste-on-right-click {}\n",
             kdl_bool(self.paste_on_right_click)
         ));
@@ -720,6 +735,7 @@ impl Config {
     fn cursor_kdl(&self) -> String {
         let c = &self.cursor;
         let mut out = String::from("cursor {\n");
+        out.push_str(&format!("    blink {}\n", kdl_bool(c.blink)));
         out.push_str(&format!(
             "    insert {}\n",
             kdl_string(c.insert.as_value())
@@ -824,6 +840,7 @@ impl Default for Config {
             font_weight: None,
             font_weight_bold: None,
             keybindings: HashMap::new(),
+            ligatures: true,
             menu_style: MenuStyle::default(),
             opacity: 1.0,
             palette_match_underline: false,
@@ -1001,6 +1018,7 @@ fn controls_side_as_value(side: ControlsSide) -> &'static str {
 fn cursor_config_from_kdl(kdl: KdlCursor) -> CursorConfig {
     let defaults = CursorConfig::default();
     CursorConfig {
+        blink: parse_bool(kdl.blink.as_deref(), defaults.blink),
         block_focus: kdl
             .block_focus
             .as_deref()
@@ -1580,5 +1598,32 @@ status-bar {
         // Unspecified element flags keep their default (shown).
         assert!(config.status_bar.show_mode);
         assert!(config.status_bar.show_title);
+    }
+
+    #[test]
+    fn test_cursor_blink_parses_and_round_trips() {
+        let c = Config::default();
+        assert!(c.cursor.blink, "blink defaults to true");
+
+        let no_blink = Config::parse("cursor {\n    blink \"false\"\n}");
+        assert!(!no_blink.cursor.blink);
+
+        // Round-trip via to_kdl / parse.
+        let kdl = no_blink.to_kdl();
+        let restored = Config::parse(&kdl);
+        assert!(!restored.cursor.blink);
+    }
+
+    #[test]
+    fn test_ligatures_parses_and_round_trips() {
+        let c = Config::default();
+        assert!(c.ligatures, "ligatures defaults to true");
+
+        let no_lig = Config::parse(r#"ligatures "false""#);
+        assert!(!no_lig.ligatures);
+
+        let kdl = no_lig.to_kdl();
+        let restored = Config::parse(&kdl);
+        assert!(!restored.ligatures);
     }
 }

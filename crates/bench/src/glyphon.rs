@@ -71,6 +71,7 @@ fn run_once(renderer: &mut GpuRenderer, corpus: &[u8]) -> RunResult {
         screen.feed(chunk);
         let view = PaneView {
             cursor_shape: spaceterm_render::CursorShape::Block,
+            cursor_visible: true,
             grid: screen.grid(),
             hovered_link: 0,
             labels: None,

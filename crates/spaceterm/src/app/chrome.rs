@@ -324,6 +324,7 @@ impl App {
             ChromeHit::Tab(i) => {
                 self.close_menu();
                 self.switch_tab(i);
+                self.tab_drag_start = Some((i, x));
             }
             ChromeHit::CloseTab(i) => {
                 self.close_menu();
@@ -487,6 +488,30 @@ impl App {
             self.selected_item = None;
             self.selected_subitem = None;
             self.dirty = true;
+        }
+    }
+
+    /// On mouse release, check whether the pointer moved far enough from the
+    /// drag start to count as a reorder (>= 10 px). If so, hit-test the release
+    /// position and swap the source tab with the target tab.
+    pub(crate) fn finalize_tab_drag(&mut self) {
+        let Some((src, start_x)) = self.tab_drag_start.take() else {
+            return;
+        };
+        let (x, y) = self.cursor_pos;
+        if (x - start_x).abs() < 10.0 {
+            return;
+        }
+        let Some((cw, ch)) = self.renderer.as_ref().map(|r| r.cell_size()) else {
+            return;
+        };
+        let surface_w = self.viewport_rect().width;
+        let chrome = self.build_top_chrome();
+        let hit = spaceterm_render::hit_test(&chrome, surface_w, cw, ch, x, y);
+        if let ChromeHit::Tab(dst) = hit {
+            if dst != src {
+                self.swap_tabs(src, dst);
+            }
         }
     }
 }

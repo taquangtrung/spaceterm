@@ -49,6 +49,8 @@ use spaceterm_render::{ControlsSide, CursorShape, MenuStyle, StatusBar, Theme};
 
 const PTY_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const CONFIG_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// Period of one cursor blink phase (on or off). Two phases = one full blink cycle.
+const CURSOR_BLINK_PERIOD: Duration = Duration::from_millis(530);
 const TAB_BELL_DURATION: Duration = Duration::from_secs(3);
 const SPLIT_RATIO: f32 = 0.5;
 /// Cell rows reserved at the bottom of the surface for the status bar.
@@ -332,6 +334,15 @@ pub struct App {
     pub(crate) context_menu_selected: Option<usize>,
     /// The font size from config at startup; Ctrl+0 resets back to this value.
     pub(crate) base_font_size: f32,
+    /// Whether the cursor is in its "visible" blink phase. Toggled by the blink
+    /// timer; always `true` while blink is disabled.
+    pub(crate) blink_phase: bool,
+    /// When the next blink phase flip is due. Updated on every flip and on key
+    /// press (which resets the cursor to visible to give feedback).
+    pub(crate) blink_next_flip: Instant,
+    /// Source tab index and the pointer x position when a tab drag began. `None`
+    /// when no drag is in progress. Cleared on mouse release.
+    pub(crate) tab_drag_start: Option<(usize, f32)>,
 }
 
 /// An action dispatched from a right-click context menu item.
@@ -469,6 +480,9 @@ impl App {
             context_menu_actions: Vec::new(),
             context_menu_selected: None,
             base_font_size,
+            blink_phase: true,
+            blink_next_flip: Instant::now() + CURSOR_BLINK_PERIOD,
+            tab_drag_start: None,
         }
     }
 
@@ -503,6 +517,13 @@ impl App {
         self.config_mtimes = new_mtimes;
         self.config = Config::load();
         self.window_keymap = WindowKeymap::from_config(self.config.keybindings.get("window"));
+        let ligatures = self.config.ligatures;
+        if let Some(r) = &mut self.renderer {
+            r.set_ligatures(ligatures);
+        }
+        if !self.config.cursor.blink {
+            self.blink_phase = true;
+        }
         true
     }
 
@@ -842,6 +863,52 @@ impl App {
         }
         self.dirty = true;
         self.update_window_title();
+    }
+
+    /// Swap tabs at positions `a` and `b`, keeping the active tab index pointing
+    /// to the same content, and updating the MRU order and custom names.
+    pub(crate) fn swap_tabs(&mut self, a: usize, b: usize) {
+        if a == b || a >= self.tabs.len() || b >= self.tabs.len() {
+            return;
+        }
+        self.tabs.swap(a, b);
+        if self.active_tab == a {
+            self.active_tab = b;
+        } else if self.active_tab == b {
+            self.active_tab = a;
+        }
+        for idx in &mut self.tab_mru {
+            if *idx == a {
+                *idx = b;
+            } else if *idx == b {
+                *idx = a;
+            }
+        }
+        let a_name = self.tab_names.remove(&a);
+        let b_name = self.tab_names.remove(&b);
+        if let Some(n) = a_name {
+            self.tab_names.insert(b, n);
+        }
+        if let Some(n) = b_name {
+            self.tab_names.insert(a, n);
+        }
+        let a_bell = self.tab_bells.remove(&a);
+        let b_bell = self.tab_bells.remove(&b);
+        if let Some(exp) = a_bell {
+            self.tab_bells.insert(b, exp);
+        }
+        if let Some(exp) = b_bell {
+            self.tab_bells.insert(a, exp);
+        }
+        if let Some(hover) = self.bell_dot_hover {
+            if hover == a {
+                self.bell_dot_hover = Some(b);
+            } else if hover == b {
+                self.bell_dot_hover = Some(a);
+            }
+        }
+        self.last_tile_layout = None;
+        self.dirty = true;
     }
 
     pub(crate) fn reap_dead_panes(&mut self) {
@@ -1516,6 +1583,20 @@ impl App {
                 self.config.cursor.block_focus = CursorShape::from_value(value);
                 self.dirty = true;
             }
+            "cursor.blink" => {
+                self.config.cursor.blink = value == "true";
+                if !self.config.cursor.blink {
+                    self.blink_phase = true;
+                }
+                self.dirty = true;
+            }
+            "ligatures" => {
+                self.config.ligatures = value == "true";
+                if let Some(r) = &mut self.renderer {
+                    r.set_ligatures(self.config.ligatures);
+                }
+                self.dirty = true;
+            }
             "palette_match_underline" => {
                 self.config.palette_match_underline = value == "true";
                 self.dirty = true;
@@ -1647,6 +1728,13 @@ impl ApplicationHandler for App {
                         }
                     }
                     return;
+                }
+
+                // Reset blink to the "visible" phase on every key press so the
+                // cursor is immediately shown as feedback for the action.
+                if self.config.cursor.blink {
+                    self.blink_phase = true;
+                    self.blink_next_flip = Instant::now() + CURSOR_BLINK_PERIOD;
                 }
 
                 let mode = self.modes.get(&focused).copied().unwrap_or_default();
@@ -2099,6 +2187,7 @@ impl ApplicationHandler for App {
                         self.mouse_down = false;
                         self.divider_drag = None;
                         self.scrollbar_drag = None;
+                        self.finalize_tab_drag();
                         self.copy_selection();
                         self.copy_selection_to_primary();
                     }
@@ -2385,7 +2474,27 @@ impl ApplicationHandler for App {
             }
         }
 
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + PTY_POLL_INTERVAL));
+        // Flip cursor blink phase when the timer fires, requesting a redraw to
+        // show the updated state.
+        if self.config.cursor.blink {
+            let now = Instant::now();
+            if now >= self.blink_next_flip {
+                self.blink_phase = !self.blink_phase;
+                self.blink_next_flip = now + CURSOR_BLINK_PERIOD;
+                self.dirty = true;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+        }
+
+        let next_poll = Instant::now() + PTY_POLL_INTERVAL;
+        let wakeup = if self.config.cursor.blink {
+            next_poll.min(self.blink_next_flip)
+        } else {
+            next_poll
+        };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(wakeup));
     }
 }
 
@@ -2620,5 +2729,38 @@ mod tests {
         // The closed index is gone and 1->0, 2->1; current tab re-seeded to front.
         assert_eq!(app.tab_mru, vec![1, 0]);
         assert_eq!(app.mru_walk, None);
+    }
+
+    #[test]
+    fn test_swap_tabs_updates_active_tab_and_mru() {
+        let mut app = app_with_tabs(3);
+        app.switch_tab(1); // active = 1, MRU [1, 0, 2]
+        let tab0_id = app.tabs[0].focused();
+        let tab1_id = app.tabs[1].focused();
+        app.swap_tabs(0, 1);
+        // Content moved: tab1_id is now at index 0, tab0_id at index 1.
+        assert_eq!(app.tabs[0].focused(), tab1_id);
+        assert_eq!(app.tabs[1].focused(), tab0_id);
+        // active_tab follows the dragged content (was 1, src was 0, so active goes 0→nope:
+        // we were on tab 1, swapping 0 and 1 → active was 1 → now 0).
+        assert_eq!(app.active_tab, 0);
+        // MRU: [1,0,2] → indices swapped → [0,1,2]
+        assert_eq!(app.tab_mru[0], 0);
+    }
+
+    #[test]
+    fn test_swap_tabs_is_noop_for_same_index() {
+        let mut app = app_with_tabs(2);
+        let tab0_id = app.tabs[0].focused();
+        app.swap_tabs(0, 0);
+        assert_eq!(app.tabs[0].focused(), tab0_id);
+        assert_eq!(app.active_tab, 0);
+    }
+
+    #[test]
+    fn test_blink_defaults_on() {
+        let app = App::new();
+        assert!(app.config.cursor.blink);
+        assert!(app.blink_phase);
     }
 }

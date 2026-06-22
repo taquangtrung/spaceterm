@@ -111,6 +111,10 @@ pub struct PaneRect {
 /// One pane's rendering input: where to draw and what grid to draw.
 pub struct PaneView<'a> {
     pub cursor_shape: CursorShape,
+    /// Whether the cursor should be drawn this frame. Set to `false` on the
+    /// "off" phase of cursor blink; the nav cursor and non-focused panes
+    /// always use `true`.
+    pub cursor_visible: bool,
     pub grid: &'a Grid,
     /// Link ID currently under the mouse pointer. Cells sharing this link get
     /// a highlighted underline color. 0 means no link is hovered.
@@ -264,6 +268,9 @@ pub struct GpuRenderer {
     scale_factor: f64,
     normal_weight: Option<String>,
     bold_weight: Option<String>,
+    /// When `false`, text buffers use `Shaping::Basic` (no ligatures); when
+    /// `true`, `Shaping::Advanced` is used (default).
+    ligatures: bool,
     theme: Theme,
     /// Persistent per-pane text buffers, reused across frames so cosmic-text
     /// only re-shapes lines whose content changed (one line per keystroke
@@ -428,6 +435,7 @@ impl GpuRenderer {
             scale_factor,
             normal_weight,
             bold_weight,
+            ligatures: true,
             theme: Theme::default(),
             text_buffers: Vec::new(),
             status_buffer: None,
@@ -680,6 +688,16 @@ impl GpuRenderer {
         Some((self.cols.max(1), self.rows.max(1)))
     }
 
+    /// Enable or disable OpenType ligatures. Clears the text-buffer cache when
+    /// the setting changes so the new shaping mode takes effect immediately.
+    pub fn set_ligatures(&mut self, enabled: bool) {
+        if self.ligatures == enabled {
+            return;
+        }
+        self.ligatures = enabled;
+        self.text_buffers.clear();
+    }
+
     /// Resize the surface and recompute grid dimensions. Returns `Some((cols, rows))`
     /// if the size or scale factor actually changed.
     pub fn resize(&mut self, width: u32, height: u32, scale_factor: f64) -> Option<(usize, usize)> {
@@ -809,7 +827,7 @@ impl GpuRenderer {
                     ch: self.cell_height,
                     cursor_shape: pane.cursor_shape,
                     cw: self.cell_width,
-                    hide_cursor: pane.nav_cursor.is_some(),
+                    hide_cursor: !pane.cursor_visible || pane.nav_cursor.is_some(),
                     hovered_link: pane.hovered_link,
                     labels: pane.labels,
                     offset_x: rect.x,
@@ -880,14 +898,14 @@ impl GpuRenderer {
                             .family(base_family(fam))
                             .weight(parse_weight(self.bold_weight.as_deref(), DEFAULT_BOLD_WEIGHT))
                             .color(label_color);
-                        attrs_list.add_span(start..start + 1, &label_attrs);
+                        attrs_list.add_span(start..start + ch.len_utf8(), &label_attrs);
                     } else if sel_norm.is_some_and(|(sr1, sc1, sr2, sc2)| {
                         (row, col) >= (sr1, sc1) && (row, col) <= (sr2, sc2)
                     }) {
                         let span_attrs = Attrs::new()
                             .family(base_family(fam))
                             .color(self.theme.selection_fg.to_glyphon());
-                        attrs_list.add_span(start..start + 1, &span_attrs);
+                        attrs_list.add_span(start..start + ch.len_utf8(), &span_attrs);
                     } else if let Some(cell) = cell {
                         let mut attrs = Attrs::new().family(base_family(fam));
 
@@ -915,7 +933,7 @@ impl GpuRenderer {
                             || cell.style.bold
                             || cell.style.italic
                         {
-                            attrs_list.add_span(start..start + 1, &attrs);
+                            attrs_list.add_span(start..start + ch.len_utf8(), &attrs);
                         }
                     }
                 }
@@ -942,7 +960,7 @@ impl GpuRenderer {
                         &text,
                         ending,
                         attrs_list,
-                        Shaping::Advanced,
+                        if self.ligatures { Shaping::Advanced } else { Shaping::Basic },
                     ));
                 }
             }

@@ -33,6 +33,9 @@ font-size "15"
 // Named weight for bold text. Falls back to font-weight when not set.
 // font-weight-bold "bold"
 
+// Enable OpenType ligatures (e.g. -> and => rendered as arrows). Default: true.
+// ligatures true
+
 // ── Window ────────────────────────────────────────────────────────────────────
 // Background opacity. 1.0 is fully opaque; lower values require a compositor.
 opacity "1"
@@ -62,6 +65,8 @@ paste-on-right-click false
 // ── Cursor ────────────────────────────────────────────────────────────────────
 // Per-mode cursor shapes: "block", "bar" (vertical beam), or "underline".
 cursor {
+    // Blink the cursor in the focused pane. Default: true.
+    blink true
     insert "bar"
     normal "block"
     visual "block"

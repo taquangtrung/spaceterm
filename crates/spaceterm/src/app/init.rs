@@ -140,6 +140,7 @@ impl App {
         };
         self.config.colors.apply(&mut initial_theme);
         renderer.set_theme(initial_theme);
+        renderer.set_ligatures(self.config.ligatures);
 
         let (cols, rows) = renderer.grid_size();
         let want_rows = content_rows(rows);
