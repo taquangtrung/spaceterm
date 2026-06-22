@@ -131,6 +131,8 @@ pub struct Config {
     /// Tabbar menu presentation: a modern hamburger dropdown or a classic menubar.
     pub menu_style: MenuStyle,
     pub opacity: f32,
+    /// Draw an underline under fuzzy-matched characters in the command palette.
+    pub palette_match_underline: bool,
     pub status_bar: StatusBarConfig,
     pub theme: ThemeSetting,
     pub title_bar_style: TitleBarStyle,
@@ -173,6 +175,7 @@ pub struct ColorOverrides {
     pub cursor_fg: Option<ThemeRgb>,
     pub divider: Option<ThemeRgb>,
     pub foreground: Option<ThemeRgb>,
+    pub status_bar_border: Option<ThemeRgb>,
     pub indexed: Vec<(u8, ThemeRgb)>,
     pub selection_bg: Option<ThemeRgb>,
     pub selection_fg: Option<ThemeRgb>,
@@ -202,8 +205,11 @@ impl ColorOverrides {
         if let Some(c) = self.divider {
             theme.divider = c;
         }
+        if let Some(c) = self.status_bar_border {
+            theme.status_bar_border = c;
+        }
         if let Some(c) = self.bell {
-            theme.bell = c;
+            theme.bell = Some(c);
         }
         for (i, c) in self.ansi.iter().enumerate().take(8) {
             theme.ansi[i] = *c;
@@ -311,6 +317,8 @@ struct KdlConfig {
     #[knuffel(child, unwrap(argument))]
     title_bar_style: Option<String>,
     #[knuffel(child, unwrap(argument))]
+    palette_match_underline: Option<String>,
+    #[knuffel(child, unwrap(argument))]
     window_controls_side: Option<String>,
     #[knuffel(child)]
     opacity: Option<KdlOpacity>,
@@ -368,6 +376,8 @@ struct KdlColors {
     selection_fg: Option<String>,
     #[knuffel(child, unwrap(argument))]
     split: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    status_bar_border: Option<String>,
     #[knuffel(child, unwrap(argument))]
     visual_bell: Option<String>,
     #[knuffel(child)]
@@ -615,6 +625,7 @@ impl Config {
                 .and_then(|o| o.value.parse().ok())
                 .unwrap_or(1.0f32)
                 .clamp(0.1, 1.0),
+            palette_match_underline: parse_bool(kdl.palette_match_underline.as_deref(), false),
             status_bar,
             theme,
             title_bar_style,
@@ -651,6 +662,10 @@ impl Config {
             kdl_string(&self.opacity.to_string())
         ));
         out.push_str(&format!("menu-style {}\n", kdl_string(menu_style)));
+        out.push_str(&format!(
+            "palette-match-underline {}\n",
+            kdl_bool(self.palette_match_underline)
+        ));
         out.push_str(&format!(
             "title-bar-style {}\n",
             kdl_string(self.title_bar_style.as_value())
@@ -731,7 +746,7 @@ impl Config {
     /// untouched config keeps the preset and writes no block).
     fn colors_kdl(&self) -> Option<String> {
         let c = &self.colors;
-        let scalars: [(&str, Option<ThemeRgb>); 8] = [
+        let scalars: [(&str, Option<ThemeRgb>); 9] = [
             ("background", c.background),
             ("foreground", c.foreground),
             ("cursor-bg", c.cursor_bg),
@@ -739,6 +754,7 @@ impl Config {
             ("selection-bg", c.selection_bg),
             ("selection-fg", c.selection_fg),
             ("split", c.divider),
+            ("status-bar-border", c.status_bar_border),
             ("visual-bell", c.bell),
         ];
         let any = scalars.iter().any(|(_, v)| v.is_some())
@@ -784,6 +800,7 @@ impl Default for Config {
             keybindings: HashMap::new(),
             menu_style: MenuStyle::default(),
             opacity: 1.0,
+            palette_match_underline: false,
             status_bar: StatusBarConfig::default(),
             theme: ThemeSetting::default(),
             title_bar_style: TitleBarStyle::default(),
@@ -839,6 +856,17 @@ fn themes_dir() -> PathBuf {
     config_dir().join("themes")
 }
 
+/// Paths of all config files that trigger a reload when modified. Callers can
+/// poll their modification times to implement hot-reload.
+pub fn config_file_paths() -> Vec<PathBuf> {
+    let dir = config_dir();
+    vec![
+        dir.join("settings.kdl"),
+        dir.join("keys.kdl"),
+        dir.join("spaceterm.kdl"),
+    ]
+}
+
 /// Parse a KDL boolean-ish string (`"true"`/`"false"`), falling back to `default`.
 fn parse_bool(value: Option<&str>, default: bool) -> bool {
     match value {
@@ -892,6 +920,7 @@ fn color_overrides_from_kdl(kdl: KdlColors) -> ColorOverrides {
         selection_bg: hex(kdl.selection_bg),
         selection_fg: hex(kdl.selection_fg),
         divider: hex(kdl.split),
+        status_bar_border: hex(kdl.status_bar_border),
         bell: hex(kdl.visual_bell),
         ansi: hex_list(kdl.ansi),
         brights: hex_list(kdl.brights),
@@ -903,12 +932,12 @@ fn color_overrides_from_kdl(kdl: KdlColors) -> ColorOverrides {
     }
 }
 
-/// Interpret a `window-controls-side` config value: `"left"` or `"right"`
-/// (the default). Unknown values fall back to the default right side.
+/// Interpret a `window-controls-side` config value: `"left"` (the default)
+/// or `"right"`. Unknown values fall back to the default left side.
 fn controls_side_from_value(value: &str) -> ControlsSide {
     match value.trim().to_ascii_lowercase().as_str() {
-        "left" => ControlsSide::Left,
-        _ => ControlsSide::Right,
+        "right" => ControlsSide::Right,
+        _ => ControlsSide::Left,
     }
 }
 
@@ -1294,15 +1323,15 @@ cursor {
     }
 
     #[test]
-    fn test_window_controls_side_defaults_right_parses_left() {
-        assert_eq!(Config::default().window_controls_side, ControlsSide::Right);
+    fn test_window_controls_side_defaults_left_parses_right() {
+        assert_eq!(Config::default().window_controls_side, ControlsSide::Left);
 
-        let config = Config::parse("window-controls-side \"left\"");
-        assert_eq!(config.window_controls_side, ControlsSide::Left);
-
-        // Unknown values fall back to the right-side default.
-        let config = Config::parse("window-controls-side \"sideways\"");
+        let config = Config::parse("window-controls-side \"right\"");
         assert_eq!(config.window_controls_side, ControlsSide::Right);
+
+        // Unknown values fall back to the left-side default.
+        let config = Config::parse("window-controls-side \"sideways\"");
+        assert_eq!(config.window_controls_side, ControlsSide::Left);
     }
 
     #[test]

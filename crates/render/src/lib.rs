@@ -18,7 +18,7 @@ pub use chrome::{
 };
 pub use grid::{Cell, Color, CursorShape, EraseMode, Grid, RgbColor, Style};
 pub use image::ImagePlacement;
-pub use renderer::{start_font_load, FontConfig, FontLoad, PaneRect, PaneView, StatusBar};
+pub use renderer::{start_font_load, FontConfig, FontLoad, PaletteItem, PaletteView, PaneRect, PaneView, StatusBar};
 pub use screen::Screen;
 pub use theme::{Rgb as ThemeRgb, Theme};
 

@@ -67,6 +67,12 @@ impl Scrollback {
         &self.blocks
     }
 
+    /// True when the shell is waiting for user input (OSC 133 prompt or command
+    /// phase). False when a process is running or shell integration is absent.
+    pub fn is_at_prompt(&self) -> bool {
+        matches!(self.phase, Phase::Prompt | Phase::Input)
+    }
+
     /// For each block, the starting row offset assuming the first block starts at
     /// row 0. Used by the app layer to scroll to a specific block boundary.
     pub fn block_row_offsets(&self, cols: usize) -> Vec<usize> {

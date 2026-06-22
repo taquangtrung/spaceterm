@@ -101,6 +101,36 @@ fn image_reserve_rows(
 // Data Structures
 // ========================================================================
 
+/// Kitty keyboard protocol flag stack. Apps push a flags bitmask to opt in to
+/// progressive keyboard enhancement, then pop it on exit. The current top of
+/// the stack is the active mode; an empty stack means legacy xterm encoding.
+struct KittyStack(Vec<u32>);
+
+impl KittyStack {
+    fn push(&mut self, flags: u32) {
+        self.0.push(flags);
+    }
+
+    fn pop(&mut self, n: u32) {
+        for _ in 0..n {
+            if self.0.is_empty() {
+                break;
+            }
+            self.0.pop();
+        }
+    }
+
+    fn current(&self) -> u32 {
+        self.0.last().copied().unwrap_or(0)
+    }
+}
+
+impl Default for KittyStack {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
 /// A single `vte::Perform` that fans out every callback to both a [`Grid`]
 /// (visual cell grid) and a core [`Performer`] (block parser). This replaces
 /// the previous dual-parser setup where every PTY byte was parsed twice.
@@ -115,7 +145,13 @@ struct CombinedPerformer {
     cell_height: f32,
     cell_width: f32,
     grid: Grid,
+    /// Active Kitty keyboard protocol flags (stack top), updated via
+    /// `CSI > flags u` (push) and `CSI < n u` (pop).
+    kitty_stack: KittyStack,
     performer: Performer,
+    /// Response bytes queued by `CSI ? u` queries, drained into the PTY
+    /// writer by [`Pane::drain_output`] after each parse batch.
+    pending_responses: Vec<u8>,
 }
 
 // ========================================================================
@@ -131,8 +167,18 @@ impl CombinedPerformer {
             cell_height: 20.0,
             cell_width: 9.0,
             grid: Grid::new(cols, rows),
+            kitty_stack: KittyStack::default(),
             performer: Performer::new(),
+            pending_responses: Vec::new(),
         }
+    }
+
+    fn kitty_flags(&self) -> u32 {
+        self.kitty_stack.current()
+    }
+
+    fn take_pending_responses(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending_responses)
     }
 
     /// Anchor rows of blocks emitted since the last call, in emission order.
@@ -203,6 +249,31 @@ impl Perform for CombinedPerformer {
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        // Kitty keyboard protocol negotiation (final byte 'u').
+        if action == 'u' {
+            match intermediates {
+                // CSI > flags u — push flags onto the stack.
+                [b'>'] => {
+                    let flags = params.iter().next().and_then(|p| p.first()).map(|&v| v as u32).unwrap_or(0);
+                    self.kitty_stack.push(flags);
+                    return;
+                }
+                // CSI < n u — pop n entries (default 1).
+                [b'<'] => {
+                    let n = params.iter().next().and_then(|p| p.first()).map(|&v| v as u32).unwrap_or(1);
+                    self.kitty_stack.pop(n);
+                    return;
+                }
+                // CSI ? u — query: respond with current flags.
+                [b'?'] => {
+                    let flags = self.kitty_stack.current();
+                    let response = format!("\x1b[?{flags}u");
+                    self.pending_responses.extend_from_slice(response.as_bytes());
+                    return;
+                }
+                _ => {}
+            }
+        }
         Perform::csi_dispatch(&mut self.grid, params, intermediates, ignore, action);
     }
 
@@ -273,6 +344,8 @@ impl Pane {
         // plain-text fallback.
         command.env("TERM_PROGRAM", "spaceterm");
         command.env("SPACETERM", "1");
+        command.env("TERM", "xterm-256color");
+        command.env("COLORTERM", "truecolor");
 
         let pty_system = NativePtySystem::default();
         let pair = pty_system
@@ -340,7 +413,17 @@ impl Pane {
             self.block_queue
                 .update(self.combined.scrollback(), row, &anchors);
         }
+        let responses = self.combined.take_pending_responses();
+        if !responses.is_empty() {
+            let _ = self.writer.write_all(&responses);
+            let _ = self.writer.flush();
+        }
         got_any
+    }
+
+    /// Current Kitty keyboard protocol flags active in this pane (0 = legacy).
+    pub fn kitty_flags(&self) -> u32 {
+        self.combined.kitty_flags()
     }
 
     /// Write bytes to the PTY (keyboard input).
@@ -387,6 +470,12 @@ impl Pane {
     /// The scrollback parsed so far.
     pub fn scrollback(&self) -> &Scrollback {
         self.combined.scrollback()
+    }
+
+    /// True when no full-screen process is running. Uses the alternate screen as
+    /// a proxy: full-screen apps (vim, fzf, less) enter it; the shell prompt does not.
+    pub fn is_at_prompt(&self) -> bool {
+        !self.combined.grid().is_alt_screen()
     }
 
     /// Whether bracketed paste mode (CSI ?2004h) is active.

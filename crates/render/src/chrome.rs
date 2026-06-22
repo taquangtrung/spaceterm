@@ -52,15 +52,17 @@ pub enum MenuStyle {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ControlsSide {
     /// Window controls hug the left edge; hamburger (if any) on the right.
+    #[default]
     Left,
     /// Window controls hug the right edge; hamburger (if any) on the left.
-    #[default]
     Right,
 }
 
 /// One tab's label in the tabbar.
 #[derive(Clone, Debug)]
 pub struct TabLabel {
+    /// When true, a small bell dot is drawn on the tab to signal an unread notification.
+    pub bell: bool,
     pub title: String,
 }
 
@@ -93,6 +95,8 @@ impl MenuItem {
 #[derive(Clone, Debug)]
 pub struct TopChrome {
     pub active_tab: usize,
+    /// Tab index whose bell dot is being hovered; drives tooltip rendering.
+    pub bell_tooltip_tab: Option<usize>,
     /// Which edge the window controls occupy; the hamburger button (modern style
     /// only) is placed on the opposite edge.
     pub controls_side: ControlsSide,
@@ -136,6 +140,8 @@ pub(crate) struct DropdownLayout {
 
 /// Concrete pixel geometry of the whole chrome for one frame.
 pub(crate) struct ChromeLayout {
+    /// Bell-dot hit targets, parallel to `tabs`; only present for tabs with `bell: true`.
+    pub bell_dots: Vec<Option<Region>>,
     /// Per-tab close (`×`) targets, parallel to `tabs`.
     pub closes: Vec<Region>,
     /// The `[minimize, maximize, close]` window-control targets at the right edge,
@@ -159,6 +165,8 @@ pub(crate) struct ChromeLayout {
 /// What a click landed on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChromeHit {
+    /// A bell-notification dot on a tab, by tab index.
+    BellDot(usize),
     /// The window close (`✕`) control.
     Close,
     CloseTab(usize),
@@ -247,6 +255,11 @@ pub fn hit_test(
     for (i, region) in layout.closes.iter().enumerate() {
         if region.contains(x, y) {
             return ChromeHit::CloseTab(i);
+        }
+    }
+    for (i, dot) in layout.bell_dots.iter().enumerate() {
+        if dot.is_some_and(|r| r.contains(x, y)) {
+            return ChromeHit::BellDot(i);
         }
     }
     for (i, region) in layout.tabs.iter().enumerate() {
@@ -429,7 +442,22 @@ pub(crate) fn layout(chrome: &TopChrome, surface_w: f32, cw: f32, ch: f32) -> Ch
         })
     });
 
+    // Bell-dot hit regions: top-right quadrant of each tab that has bell active.
+    let bell_dots = tabs
+        .iter()
+        .enumerate()
+        .map(|(i, tab)| {
+            chrome.tabs.get(i).filter(|t| t.bell).map(|_| Region {
+                h: tab.h * 0.45,
+                w: tab.w * 0.35,
+                x: tab.x + tab.w * 0.65,
+                y: tab.y,
+            })
+        })
+        .collect();
+
     ChromeLayout {
+        bell_dots,
         closes,
         controls,
         dropdown,
@@ -510,6 +538,7 @@ mod tests {
         };
         TopChrome {
             active_tab: 0,
+            bell_tooltip_tab: None,
             controls_side: ControlsSide::Right,
             menu_style: style,
             menus,
@@ -519,6 +548,7 @@ mod tests {
             selected_subitem: None,
             tabs: (0..tabs)
                 .map(|i| TabLabel {
+                    bell: false,
                     title: format!("Tab {i}"),
                 })
                 .collect(),

@@ -23,7 +23,7 @@ use wgpu::{
     VertexState, VertexStepMode,
 };
 
-use crate::chrome::{self, layout as chrome_layout, DropdownLayout, MenuItem, TopChrome};
+use crate::chrome::{self, layout as chrome_layout, DropdownLayout, MenuItem, Region, TopChrome};
 use crate::grid::{Color as GridColor, CursorShape, Grid, RgbColor};
 use crate::image::{ImagePass, ImagePlacement};
 use crate::theme::{Rgb, Theme};
@@ -60,6 +60,16 @@ const DROPDOWN_TEXTURE_ID: u64 = u64::MAX;
 const SUBMENU_TEXTURE_ID: u64 = u64::MAX - 1;
 /// Reserved id for the rasterized top-chrome strip (band + rounded-top tabs).
 const CHROME_STRIP_TEXTURE_ID: u64 = u64::MAX - 2;
+/// Reserved id for the rasterized command-palette overlay.
+const PALETTE_TEXTURE_ID: u64 = u64::MAX - 3;
+/// Reserved id for the rasterized bell-dot hover tooltip.
+const BELL_TOOLTIP_TEXTURE_ID: u64 = u64::MAX - 4;
+/// Maximum number of command results visible in the palette at once.
+const PALETTE_MAX_ITEMS: usize = 8;
+/// Palette panel width as a fraction of the surface width.
+const PALETTE_WIDTH_RATIO: f32 = 0.62;
+/// Palette panel top edge as a fraction of the surface height (VS Code style).
+const PALETTE_TOP_RATIO: f32 = 0.15;
 /// Corner radius of the dropdown menu panel and its hover highlight, in pixels.
 const DROPDOWN_RADIUS: f32 = 12.0;
 /// Width of the soft drop shadow cast around the dropdown panel, in pixels.
@@ -157,6 +167,25 @@ struct DropdownImage {
     y: f32,
 }
 
+/// One entry shown in the command palette results list.
+pub struct PaletteItem {
+    pub action: String,
+    pub label: String,
+    /// Char indices in `label` that matched the query, used to highlight them.
+    pub match_positions: Vec<usize>,
+}
+
+/// The command palette state the renderer needs to draw its overlay.
+pub struct PaletteView {
+    /// Text shown when the filtered list is empty.
+    pub empty_message: String,
+    pub items: Vec<PaletteItem>,
+    /// Draw an underline under highlighted match characters.
+    pub match_underline: bool,
+    pub query: String,
+    pub selected: usize,
+}
+
 /// Font selection for the renderer. `family` is the primary family name (e.g.
 /// "FiraCode Nerd Font"); `None` falls back to the bundled [`DEFAULT_FONT_FAMILY`].
 /// Glyphs missing from the primary font are filled in from the system font
@@ -230,9 +259,10 @@ pub struct GpuRenderer {
     /// only re-shapes lines whose content changed (one line per keystroke
     /// instead of the whole screen).
     text_buffers: Vec<glyphon::Buffer>,
-    /// Persistent one-line buffer for the bottom status bar, reused like the
-    /// pane buffers so its glyphs are only reshaped when the label changes.
+    /// Persistent one-line buffer for the bottom status bar left segment.
     status_buffer: Option<glyphon::Buffer>,
+    /// Persistent one-line buffer for the status bar right segment (right-aligned).
+    status_right_buffer: Option<glyphon::Buffer>,
     /// Textured-quad pass for image blocks rendered natively (no webview).
     image_pass: ImagePass,
     /// Image pass for the rasterized top-chrome strip. Rendered between the bg
@@ -391,6 +421,7 @@ impl GpuRenderer {
             theme: Theme::default(),
             text_buffers: Vec::new(),
             status_buffer: None,
+            status_right_buffer: None,
             image_pass,
             chrome_strip_pass,
             svg_fontdb: None,
@@ -652,6 +683,7 @@ impl GpuRenderer {
             // Clear existing buffers so they are re-allocated with updated physical metrics next frame
             self.text_buffers.clear();
             self.status_buffer = None;
+            self.status_right_buffer = None;
         }
         
         let phys_cell_w = self.cell_width;
@@ -701,6 +733,7 @@ impl GpuRenderer {
         chrome: Option<&TopChrome>,
         bell_active: bool,
         images: &[ImagePlacement],
+        palette: Option<&PaletteView>,
     ) {
         let surface_texture = match self.acquire_surface_texture() {
             Some(texture) => texture,
@@ -896,15 +929,20 @@ impl GpuRenderer {
                 glyphon::Metrics::new(self.font_size, self.line_height),
             )
         });
+        let mut status_right_buffer = self.status_right_buffer.take().unwrap_or_else(|| {
+            glyphon::Buffer::new(
+                &mut self.font_system,
+                glyphon::Metrics::new(self.font_size, self.line_height),
+            )
+        });
         let status_top = surface_h - self.cell_height;
         if let Some(status) = status {
-            // Draw a thin 1px top border divider using the theme's divider color
             all_bg_verts.extend_from_slice(&quad_vertices(
                 0.0,
                 status_top,
                 surface_w,
                 status_top + 1.0,
-                self.theme.divider.as_linear(),
+                self.theme.status_bar_border.as_linear(),
                 surface_w,
                 surface_h,
             ));
@@ -917,17 +955,6 @@ impl GpuRenderer {
                 surface_w,
                 surface_h,
                 self.theme.background.as_linear(),
-                surface_w,
-                surface_h,
-            ));
-
-            // Draw a subtle vertical accent bar on the left edge (4px wide)
-            all_bg_verts.extend_from_slice(&quad_vertices(
-                0.0,
-                status_top + 1.0,
-                4.0,
-                surface_h,
-                status.accent.as_linear(),
                 surface_w,
                 surface_h,
             ));
@@ -953,9 +980,6 @@ impl GpuRenderer {
                 .family(base_family(fam))
                 .weight(parse_weight(self.bold_weight.as_deref(), DEFAULT_BOLD_WEIGHT))
                 .color(self.theme.ansi[1].to_glyphon());
-
-            // Left padding
-            status_text.push_str("  ");
 
             // Mode Label (e.g. Normal, Insert, Block)
             let mode_start = status_text.len();
@@ -987,23 +1011,33 @@ impl GpuRenderer {
                 spans.push((title_start..title_end, foreground_attrs));
             }
 
-            // Right-aligned branding info
+            // Right segment: shaped into its own buffer so it can be
+            // pixel-positioned flush with the right edge of the surface.
             let right_text_str = status
                 .right_label
                 .as_deref()
                 .unwrap_or("\u{f0697} spaceterm");
-            let right_text = format!("{}  ", right_text_str);
-            let left_len = status_text.chars().count();
-            let right_len = right_text.chars().count();
-            if left_len + right_len < self.cols {
-                let spaces = self.cols - left_len - right_len;
-                status_text.extend(std::iter::repeat(' ').take(spaces));
-
-                let right_start = status_text.len();
-                status_text.push_str(&right_text);
-                let right_end = status_text.len();
-                spans.push((right_start..right_end, muted_attrs));
+            let right_text = right_text_str.to_string();
+            let right_default_attrs = Attrs::new()
+                .family(base_family(fam))
+                .color(self.theme.ansi[8].to_glyphon());
+            let right_ending = glyphon::cosmic_text::LineEnding::default();
+            if status_right_buffer.lines.is_empty() {
+                status_right_buffer.lines.push(BufferLine::new(
+                    &right_text,
+                    right_ending,
+                    glyphon::AttrsList::new(&right_default_attrs),
+                    Shaping::Advanced,
+                ));
+            } else {
+                status_right_buffer.lines[0].set_text(
+                    &right_text,
+                    right_ending,
+                    glyphon::AttrsList::new(&right_default_attrs),
+                );
             }
+            status_right_buffer.lines.truncate(1);
+            status_right_buffer.shape_until_scroll(&mut self.font_system, false);
 
             // Apply attributes to the text buffer line
             let default_attrs = Attrs::new()
@@ -1036,55 +1070,7 @@ impl GpuRenderer {
             None => Vec::new(),
         };
 
-        if bell_active {
-            let (r, g, b) = self.theme.bell.as_linear();
-            let ndc_x0 = -1.0_f32;
-            let ndc_y0 = 1.0_f32;
-            let ndc_x1 = 1.0_f32;
-            let ndc_y1 = -1.0_f32;
-            all_bg_verts.push(BgVertex {
-                x: ndc_x0,
-                y: ndc_y0,
-                r,
-                g,
-                b,
-            });
-            all_bg_verts.push(BgVertex {
-                x: ndc_x1,
-                y: ndc_y0,
-                r,
-                g,
-                b,
-            });
-            all_bg_verts.push(BgVertex {
-                x: ndc_x0,
-                y: ndc_y1,
-                r,
-                g,
-                b,
-            });
-            all_bg_verts.push(BgVertex {
-                x: ndc_x1,
-                y: ndc_y0,
-                r,
-                g,
-                b,
-            });
-            all_bg_verts.push(BgVertex {
-                x: ndc_x1,
-                y: ndc_y1,
-                r,
-                g,
-                b,
-            });
-            all_bg_verts.push(BgVertex {
-                x: ndc_x0,
-                y: ndc_y1,
-                r,
-                g,
-                b,
-            });
-        }
+        // Bell: tint is applied in rasterize_chrome_strip, not as a bg overlay.
 
         let bg_count = all_bg_verts.len() as u32;
         let bg_bytes: Vec<u8> = all_bg_verts.iter().flat_map(|v| v.to_bytes()).collect();
@@ -1093,17 +1079,23 @@ impl GpuRenderer {
         // The top-chrome strip (band + rounded-top tabs) is composited before the
         // text pass so the tab cards sit under the tab titles.
         let chrome_strip: Vec<ImagePlacement> = chrome
-            .and_then(|c| self.rasterize_chrome_strip(c, surface_w))
+            .and_then(|c| self.rasterize_chrome_strip(c, surface_w, bell_active))
             .into_iter()
             .collect();
         self.chrome_strip_pass
             .prepare(&self.queue, &chrome_strip, surface_w, surface_h);
 
-        // The open dropdown is rasterized to a texture and drawn by the image
-        // pass (which runs after the text pass) so it overlays pane glyphs.
+        // The open dropdown and command palette are rasterized to textures and
+        // drawn by the image pass (after the text pass) so they overlay content.
         let mut all_images: Vec<ImagePlacement> = images.to_vec();
         if let Some(c) = chrome {
             all_images.extend(self.rasterize_dropdown(c, surface_w));
+            if let Some(placement) = self.rasterize_bell_tooltip(c, surface_w) {
+                all_images.push(placement);
+            }
+        }
+        if let Some(p) = palette {
+            all_images.extend(self.rasterize_palette(p, surface_w, surface_h));
         }
         self.image_pass
             .prepare(&self.queue, &all_images, surface_w, surface_h);
@@ -1128,6 +1120,8 @@ impl GpuRenderer {
             .collect();
 
         if status.is_some() {
+            let right_w = buffer_width(&status_right_buffer).ceil();
+            let right_left = (surface_w - right_w).max(0.0).round();
             text_areas.push(TextArea {
                 buffer: &status_buffer,
                 left: 0.0,
@@ -1135,10 +1129,24 @@ impl GpuRenderer {
                 bounds: TextBounds {
                     left: 0,
                     top: status_top.round() as i32,
-                    right: surface_w as i32,
+                    right: right_left as i32,
                     bottom: surface_h as i32,
                 },
                 default_color: self.theme.status_bar_fg.to_glyphon(),
+                scale: 1.0,
+                custom_glyphs: &[],
+            });
+            text_areas.push(TextArea {
+                buffer: &status_right_buffer,
+                left: right_left,
+                top: status_top.round(),
+                bounds: TextBounds {
+                    left: right_left as i32,
+                    top: status_top.round() as i32,
+                    right: surface_w as i32,
+                    bottom: surface_h as i32,
+                },
+                default_color: self.theme.ansi[8].to_glyphon(),
                 scale: 1.0,
                 custom_glyphs: &[],
             });
@@ -1176,6 +1184,7 @@ impl GpuRenderer {
         // Hand the buffers back for reuse next frame (preserves shape caches).
         self.text_buffers = text_buffers;
         self.status_buffer = Some(status_buffer);
+        self.status_right_buffer = Some(status_right_buffer);
 
         let mut encoder = self
             .device
@@ -1339,6 +1348,97 @@ impl GpuRenderer {
         texts
     }
 
+    /// Rasterize the command palette overlay and upload it to the GPU. Returns
+    /// an empty vec when the palette has no items to display.
+    fn rasterize_palette(
+        &mut self,
+        palette: &PaletteView,
+        surface_w: f32,
+        surface_h: f32,
+    ) -> Vec<ImagePlacement> {
+        let ctx = FontCtx {
+            cell_h: self.cell_height,
+            cell_w: self.cell_width,
+            family: self.font_family.as_deref(),
+            font_size: self.font_size,
+            line_height: self.line_height,
+            normal_weight: self.normal_weight.as_deref(),
+            bold_weight: self.bold_weight.as_deref(),
+        };
+        let image = palette_rgba(
+            &mut self.font_system,
+            &mut self.swash_cache,
+            &ctx,
+            &self.theme,
+            palette,
+            surface_w,
+            surface_h,
+        );
+        self.image_pass.upload(
+            &self.device,
+            &self.queue,
+            PALETTE_TEXTURE_ID,
+            &image.rgba,
+            image.width,
+            image.height,
+        );
+        vec![ImagePlacement {
+            height: image.height as f32,
+            id: PALETTE_TEXTURE_ID,
+            v_max: 1.0,
+            width: image.width as f32,
+            x: image.x,
+            y: image.y,
+        }]
+    }
+
+    /// Rasterize a small tooltip below the hovered bell dot and upload it to
+    /// the GPU. Returns `None` when no bell dot is hovered or no dot is visible.
+    fn rasterize_bell_tooltip(
+        &mut self,
+        chrome: &TopChrome,
+        surface_w: f32,
+    ) -> Option<ImagePlacement> {
+        let tab_idx = chrome.bell_tooltip_tab?;
+        let cw = self.cell_width;
+        let ch = self.cell_height;
+        let layout = chrome_layout(chrome, surface_w, cw, ch);
+        let dot = layout.bell_dots.get(tab_idx)?.as_ref()?;
+        let ctx = FontCtx {
+            cell_h: ch,
+            cell_w: cw,
+            family: self.font_family.as_deref(),
+            font_size: self.font_size,
+            line_height: self.line_height,
+            normal_weight: self.normal_weight.as_deref(),
+            bold_weight: self.bold_weight.as_deref(),
+        };
+        let image = bell_tooltip_rgba(
+            &mut self.font_system,
+            &mut self.swash_cache,
+            &ctx,
+            &self.theme,
+            dot,
+            surface_w,
+        );
+        self.image_pass.upload(
+            &self.device,
+            &self.queue,
+            BELL_TOOLTIP_TEXTURE_ID,
+            &image.rgba,
+            image.width,
+            image.height,
+        );
+        Some(ImagePlacement {
+            height: image.height as f32,
+            id: BELL_TOOLTIP_TEXTURE_ID,
+            v_max: 1.0,
+            width: image.width as f32,
+            x: image.x,
+            y: image.y,
+        })
+    }
+
     /// Rasterize the top-chrome strip, the recessed band, the rounded-top tab
     /// cards, and the hairline border, into a texture composited under the chrome
     /// text. The active tab is filled with the terminal background so it merges
@@ -1347,6 +1447,7 @@ impl GpuRenderer {
         &mut self,
         chrome: &TopChrome,
         surface_w: f32,
+        _bell_active: bool,
     ) -> Option<ImagePlacement> {
         let cw = self.cell_width;
         let ch = self.cell_height;
@@ -1392,6 +1493,8 @@ impl GpuRenderer {
         let tab_vpad = ch * 0.2;
         let pill_radius = ch * TAB_CORNER_RADIUS_RATIO;
 
+        let dot_r = (ch * 0.15).max(2.0);
+        let dot_color = self.theme.bell.unwrap_or(self.theme.cursor_bg);
         for (i, tab) in layout.tabs.iter().enumerate() {
             let color = if i == chrome.active_tab { active_bg } else { inactive_bg };
             fill_rounded_rect(
@@ -1402,6 +1505,22 @@ impl GpuRenderer {
                 color,
                 1.0,
             );
+            if chrome.tabs.get(i).is_some_and(|t| t.bell) {
+                // Small circle at the top-right corner of the tab pill.
+                let pill_x = tab.x + tab_hpad;
+                let pill_right = pill_x + tab.w - tab_hpad * 2.0;
+                let pill_y = tab.y + tab_vpad;
+                let cx = pill_right - dot_r - 2.0;
+                let cy = pill_y + dot_r + 2.0;
+                fill_rounded_rect(
+                    &mut rgba,
+                    canvas,
+                    (cx - dot_r, cy - dot_r, dot_r * 2.0, dot_r * 2.0),
+                    dot_r,
+                    dot_color,
+                    1.0,
+                );
+            }
         }
 
         // Hamburger pill uses the same vertical inset and radius as tabs.
@@ -2104,6 +2223,106 @@ fn composite_buffer(
     );
 }
 
+/// Rasterize a small tooltip bubble near `dot` (a bell-dot hit region in screen
+/// coordinates). The tooltip floats below the chrome strip with its center
+/// aligned to the dot center, clamped so it never escapes the left or right
+/// edges of the surface.
+fn bell_tooltip_rgba(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    ctx: &FontCtx,
+    theme: &Theme,
+    dot: &Region,
+    surface_w: f32,
+) -> DropdownImage {
+    const PAD_X: f32 = 8.0;
+    const PAD_Y: f32 = 4.0;
+    const RADIUS: f32 = 4.0;
+    const SHADOW_MARGIN: f32 = 6.0;
+
+    let label_buf = shape_chrome_line(
+        font_system,
+        ctx,
+        "Bell notification",
+        theme.foreground.to_glyphon(),
+        false,
+        true,
+    );
+    let text_w = buffer_width(&label_buf).ceil();
+    let text_h = ctx.line_height;
+
+    let panel_w = text_w + PAD_X * 2.0;
+    let panel_h = text_h + PAD_Y * 2.0;
+    let total_w = (panel_w + SHADOW_MARGIN * 2.0) as u32;
+    let total_h = (panel_h + SHADOW_MARGIN * 2.0) as u32;
+    let canvas = (total_w, total_h);
+
+    // Place the tooltip so its center aligns with the dot center, below the strip.
+    let dot_cx = dot.x + dot.w * 0.5;
+    let tip_x = (dot_cx - panel_w * 0.5 - SHADOW_MARGIN)
+        .max(0.0)
+        .min(surface_w - total_w as f32);
+    let tip_y = dot.y + dot.h + 2.0 - SHADOW_MARGIN;
+
+    let mut rgba = vec![0u8; (total_w * total_h * 4) as usize];
+
+    // Soft drop-shadow.
+    for py in 0..total_h {
+        for px in 0..total_w {
+            let sdf = rounded_rect_sdf(
+                px as f32 + 0.5,
+                py as f32 + 0.5,
+                (SHADOW_MARGIN, SHADOW_MARGIN, panel_w, panel_h),
+                RADIUS,
+            );
+            let falloff = (1.0 - sdf / SHADOW_MARGIN).clamp(0.0, 1.0);
+            if sdf <= 0.0 || falloff <= 0.0 {
+                continue;
+            }
+            let idx = ((py * total_w + px) * 4) as usize;
+            blend_px(&mut rgba, idx, SHADOW_COLOR, falloff * falloff * DROPDOWN_SHADOW_ALPHA);
+        }
+    }
+
+    // Panel background.
+    let border = mix_rgb(theme.menu_bg, Rgb::new(255, 255, 255), MENU_BORDER_MIX);
+    fill_rounded_rect(
+        &mut rgba,
+        canvas,
+        (SHADOW_MARGIN, SHADOW_MARGIN, panel_w, panel_h),
+        RADIUS,
+        border,
+        1.0,
+    );
+    fill_rounded_rect(
+        &mut rgba,
+        canvas,
+        (SHADOW_MARGIN + 1.0, SHADOW_MARGIN + 1.0, panel_w - 2.0, panel_h - 2.0),
+        RADIUS - 1.0,
+        theme.menu_bg,
+        1.0,
+    );
+
+    // Label text.
+    composite_buffer(
+        font_system,
+        swash_cache,
+        &mut rgba,
+        canvas,
+        &label_buf,
+        ((SHADOW_MARGIN + PAD_X) as i32, (SHADOW_MARGIN + PAD_Y) as i32),
+        theme.foreground.to_glyphon(),
+    );
+
+    DropdownImage {
+        height: total_h,
+        rgba,
+        width: total_w,
+        x: tip_x,
+        y: tip_y,
+    }
+}
+
 /// Rasterize the open dropdown overlay (soft shadow, elevated rounded panel,
 /// rounded hover pill, and sans-serif item text) to an RGBA image without the
 /// GPU. Returns `None` when no menu is open.
@@ -2307,6 +2526,274 @@ fn panel_rgba(
     }
 }
 
+/// Render `text` into `rgba` at `offset`, coloring characters listed in
+/// `match_positions` with `accent_color` and the rest with `base_color`.
+/// When `underline` is true, a 1-pixel line is drawn below each matched span.
+fn draw_highlighted_label(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    ctx: &FontCtx,
+    rgba: &mut [u8],
+    canvas: (u32, u32),
+    text: &str,
+    match_positions: &[usize],
+    base_color: Color,
+    accent_color: Color,
+    underline: bool,
+    offset: (i32, i32),
+) {
+    let chars: Vec<char> = text.chars().collect();
+    let (canvas_w, canvas_h) = canvas;
+    let underline_y = offset.1 + ctx.line_height as i32 - 2;
+
+    let mut x = offset.0;
+    let mut i = 0;
+    while i < chars.len() {
+        let is_match = match_positions.binary_search(&i).is_ok();
+        let color = if is_match { accent_color } else { base_color };
+        let mut j = i + 1;
+        while j < chars.len() && (match_positions.binary_search(&j).is_ok()) == is_match {
+            j += 1;
+        }
+        let seg: String = chars[i..j].iter().collect();
+        let buf = shape_chrome_line(font_system, ctx, &seg, color, false, true);
+        let seg_w = buffer_width(&buf).ceil() as i32;
+        composite_buffer(font_system, swash_cache, rgba, canvas, &buf, (x, offset.1), color);
+
+        if is_match && underline && underline_y >= 0 && underline_y < canvas_h as i32 {
+            let uy = underline_y as u32;
+            for px in x.max(0)..(x + seg_w).min(canvas_w as i32) {
+                let idx = (uy * canvas_w + px as u32) as usize * 4;
+                rgba[idx] = accent_color.r();
+                rgba[idx + 1] = accent_color.g();
+                rgba[idx + 2] = accent_color.b();
+                rgba[idx + 3] = 255;
+            }
+        }
+
+        x += seg_w;
+        i = j;
+    }
+}
+
+/// Rasterize the command palette: a centered floating panel with a search input
+/// at the top and a fuzzy-filtered list of commands below. Styled like the
+/// dropdown but wider and vertically centered in the upper portion of the window.
+fn palette_rgba(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    ctx: &FontCtx,
+    theme: &Theme,
+    view: &PaletteView,
+    surface_w: f32,
+    surface_h: f32,
+) -> DropdownImage {
+    let margin = DROPDOWN_SHADOW;
+    let inner_pad = ctx.cell_h * 0.5;
+    let input_h = ctx.cell_h * 1.8;
+    let item_h = ctx.cell_h * 1.7;
+    let display_count = view.items.len().min(PALETTE_MAX_ITEMS);
+    let row_count = display_count.max(1);
+    let panel_w = (surface_w * PALETTE_WIDTH_RATIO).clamp(300.0, 680.0).floor();
+    let panel_h = (inner_pad + input_h + 1.0 + item_h * row_count as f32 + inner_pad)
+        .floor()
+        .max(1.0);
+
+    let width = (panel_w + 2.0 * margin) as u32;
+    let height = (panel_h + 2.0 * margin) as u32;
+    let canvas = (width, height);
+    let panel_rect = (margin, margin, panel_w, panel_h);
+
+    let mut rgba = vec![0u8; (width * height * 4) as usize];
+
+    // Soft drop shadow.
+    for py in 0..height {
+        for px in 0..width {
+            let sdf = rounded_rect_sdf(
+                px as f32 + 0.5,
+                py as f32 + 0.5,
+                panel_rect,
+                DROPDOWN_RADIUS,
+            );
+            let falloff = (1.0 - sdf / margin).clamp(0.0, 1.0);
+            if sdf <= 0.0 || falloff <= 0.0 {
+                continue;
+            }
+            let idx = ((py * width + px) * 4) as usize;
+            blend_px(
+                &mut rgba,
+                idx,
+                SHADOW_COLOR,
+                falloff * falloff * DROPDOWN_SHADOW_ALPHA,
+            );
+        }
+    }
+
+    // Elevated rounded panel with hairline border.
+    let border = mix_rgb(theme.menu_bg, Rgb::new(255, 255, 255), MENU_BORDER_MIX);
+    fill_rounded_rect(&mut rgba, canvas, panel_rect, DROPDOWN_RADIUS, border, 1.0);
+    fill_rounded_rect(
+        &mut rgba,
+        canvas,
+        (margin + 1.0, margin + 1.0, panel_w - 2.0, panel_h - 2.0),
+        DROPDOWN_RADIUS - 1.0,
+        theme.menu_bg,
+        1.0,
+    );
+
+    // Hover highlight on the selected result row.
+    let divider_y = margin + inner_pad + input_h;
+    let results_top = divider_y + 1.0;
+    if display_count > 0 {
+        let sel = view.selected.min(display_count - 1);
+        let hover_rect = (
+            margin + MENU_HOVER_INSET,
+            results_top + sel as f32 * item_h + MENU_HOVER_INSET,
+            panel_w - 2.0 * MENU_HOVER_INSET,
+            item_h - 2.0 * MENU_HOVER_INSET,
+        );
+        let radius = (DROPDOWN_RADIUS - MENU_HOVER_INSET).max(0.0);
+        fill_rounded_rect(&mut rgba, canvas, hover_rect, radius, theme.menu_hover_bg, 1.0);
+    }
+
+    // Hairline divider between the input and the results.
+    fill_rounded_rect(
+        &mut rgba,
+        canvas,
+        (margin, divider_y, panel_w, 1.0),
+        0.0,
+        theme.divider,
+        0.5,
+    );
+
+    let foreground = theme.foreground.to_glyphon();
+    let muted = theme.ansi[8].to_glyphon();
+    let accent = theme.cursor_bg.to_glyphon();
+    let pad_x = (ctx.cell_w * 1.0) as i32;
+    let origin = margin as i32;
+    let input_text_dy = ((input_h - ctx.line_height) / 2.0).max(0.0) as i32;
+    let item_text_dy = ((item_h - ctx.line_height) / 2.0).max(0.0) as i32;
+    let input_top = (margin + inner_pad) as i32;
+
+    // "❯" prompt.
+    let prompt_buf = shape_chrome_line(font_system, ctx, "\u{276f} ", accent, false, true);
+    let prompt_w = buffer_width(&prompt_buf).ceil() as i32;
+    composite_buffer(
+        font_system,
+        swash_cache,
+        &mut rgba,
+        canvas,
+        &prompt_buf,
+        (origin + pad_x, input_top + input_text_dy),
+        accent,
+    );
+
+    // Query text or placeholder.
+    let query_text = if view.query.is_empty() {
+        "type to filter\u{2026}".to_string()
+    } else {
+        view.query.clone()
+    };
+    let query_color = if view.query.is_empty() { muted } else { foreground };
+    let query_buf =
+        shape_chrome_line(font_system, ctx, &query_text, query_color, false, true);
+    let query_w = buffer_width(&query_buf).ceil() as i32;
+    composite_buffer(
+        font_system,
+        swash_cache,
+        &mut rgba,
+        canvas,
+        &query_buf,
+        (origin + pad_x + prompt_w, input_top + input_text_dy),
+        query_color,
+    );
+
+    // Blinking-cursor indicator after the query text.
+    let cursor_buf =
+        shape_chrome_line(font_system, ctx, "\u{2502}", accent, false, false);
+    composite_buffer(
+        font_system,
+        swash_cache,
+        &mut rgba,
+        canvas,
+        &cursor_buf,
+        (origin + pad_x + prompt_w + query_w, input_top + input_text_dy),
+        accent,
+    );
+
+    // Result rows.
+    if display_count == 0 {
+        let no_match =
+            shape_chrome_line(font_system, ctx, &view.empty_message, muted, false, true);
+        composite_buffer(
+            font_system,
+            swash_cache,
+            &mut rgba,
+            canvas,
+            &no_match,
+            (origin + pad_x, results_top as i32 + item_text_dy),
+            muted,
+        );
+    } else {
+        for (i, item) in view.items.iter().take(display_count).enumerate() {
+            let row_y = (results_top + i as f32 * item_h) as i32 + item_text_dy;
+
+            if item.match_positions.is_empty() || view.query.is_empty() {
+                let label_buf =
+                    shape_chrome_line(font_system, ctx, &item.label, foreground, false, true);
+                composite_buffer(
+                    font_system,
+                    swash_cache,
+                    &mut rgba,
+                    canvas,
+                    &label_buf,
+                    (origin + pad_x, row_y),
+                    foreground,
+                );
+            } else {
+                draw_highlighted_label(
+                    font_system,
+                    swash_cache,
+                    ctx,
+                    &mut rgba,
+                    canvas,
+                    &item.label,
+                    &item.match_positions,
+                    foreground,
+                    accent,
+                    view.match_underline,
+                    (origin + pad_x, row_y),
+                );
+            }
+
+            let action_buf =
+                shape_chrome_line(font_system, ctx, &item.action, muted, false, true);
+            let action_w = buffer_width(&action_buf).ceil() as i32;
+            composite_buffer(
+                font_system,
+                swash_cache,
+                &mut rgba,
+                canvas,
+                &action_buf,
+                (origin + panel_w as i32 - action_w - pad_x, row_y),
+                muted,
+            );
+        }
+    }
+
+    // Center horizontally; place in the upper third of the window.
+    let palette_x = ((surface_w - panel_w) / 2.0).max(0.0);
+    let palette_y = surface_h * PALETTE_TOP_RATIO;
+
+    DropdownImage {
+        height,
+        rgba,
+        width,
+        x: (palette_x - margin).round(),
+        y: (palette_y - margin).round(),
+    }
+}
+
 /// Register the embedded [`DEFAULT_FONT_FAMILY`] faces in the font database so
 /// the default font is available even when it is not installed on the system.
 /// Loading is idempotent in effect: if the user already has the same family
@@ -2469,11 +2956,13 @@ mod tests {
                     },
                 ],
             }],
+            bell_tooltip_tab: None,
             open_menu: Some(0),
             open_submenu: None,
             selected_item: selected,
             selected_subitem: None,
             tabs: vec![TabLabel {
+                bell: false,
                 title: "Terminal 1".into(),
             }],
             window_controls: false,

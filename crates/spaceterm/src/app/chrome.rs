@@ -175,8 +175,10 @@ impl App {
 
     /// Build the chrome model for this frame from the current tab/menu state.
     pub(crate) fn build_top_chrome(&self) -> TopChrome {
+        let now = std::time::Instant::now();
         let tabs = (0..self.tabs.len())
             .map(|i| TabLabel {
+                bell: self.tab_bells.get(&i).is_some_and(|&exp| now < exp),
                 title: self.tab_title(i),
             })
             .collect();
@@ -189,6 +191,7 @@ impl App {
             .collect();
         TopChrome {
             active_tab: self.active_tab,
+            bell_tooltip_tab: self.bell_dot_hover,
             controls_side: self.config.window_controls_side,
             menu_style: self.config.menu_style,
             menus,
@@ -286,6 +289,9 @@ impl App {
                         self.run_command(command, focused);
                     }
                 }
+            }
+            ChromeHit::BellDot(i) => {
+                self.tab_bells.remove(&i);
             }
             ChromeHit::None => {
                 if menu_was_open {

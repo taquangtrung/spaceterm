@@ -19,7 +19,9 @@ pub struct Rgb {
 pub struct Theme {
     pub ansi: [Rgb; 16],
     pub background: Rgb,
-    pub bell: Rgb,
+    /// When `Some`, tints the tab bar band briefly on a bell event. `None`
+    /// (the default) disables the visual bell entirely.
+    pub bell: Option<Rgb>,
     pub cursor_bg: Rgb,
     pub cursor_fg: Rgb,
     pub divider: Rgb,
@@ -32,6 +34,8 @@ pub struct Theme {
     pub menu_hover_bg: Rgb,
     pub selection_bg: Rgb,
     pub selection_fg: Rgb,
+    /// Color of the 1px separator line between the status bar and terminal content.
+    pub status_bar_border: Rgb,
     pub status_bar_fg: Rgb,
     /// Fill behind the active tab in the tabbar.
     pub tab_active_bg: Rgb,
@@ -100,7 +104,8 @@ impl Theme {
             selection_bg: Rgb::parse_hex("#fffacd").unwrap(),
             selection_fg: Rgb::parse_hex("#000000").unwrap(),
             divider: Rgb::parse_hex("#51554f").unwrap(),
-            bell: Rgb::parse_hex("#202020").unwrap(),
+            status_bar_border: Rgb::parse_hex("#3b414f").unwrap(),
+            bell: None,
             menu_bg: Rgb::parse_hex("#313841").unwrap(),
             menu_hover_bg: Rgb::parse_hex("#3b4a63").unwrap(),
             status_bar_fg: Rgb::parse_hex("#15181a").unwrap(),
@@ -140,7 +145,7 @@ impl Theme {
             selection_bg: Rgb::parse_hex("#b3b3d9").unwrap(),
             selection_fg: Rgb::parse_hex("#000000").unwrap(),
             divider: Rgb::parse_hex("#cccccc").unwrap(),
-            bell: Rgb::parse_hex("#dddddd").unwrap(),
+            bell: None,
             menu_bg: Rgb::parse_hex("#ffffff").unwrap(),
             menu_hover_bg: Rgb::parse_hex("#e6eefb").unwrap(),
             tab_active_bg: Rgb::parse_hex("#f2f2f2").unwrap(),

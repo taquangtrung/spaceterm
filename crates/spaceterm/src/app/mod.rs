@@ -22,7 +22,7 @@ mod render;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -30,7 +30,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::config::{Config, StatusBarConfig};
+use crate::config::{config_file_paths, Config, StatusBarConfig};
 use crate::model::input::{self, Action, KeyCode, PendingPrefix, WindowKeymap};
 use crate::model::layout::{Direction, FocusDir, PaneId, Rect, Tab};
 use crate::model::mode::Mode;
@@ -47,6 +47,8 @@ use spaceterm_render::{MenuStyle, StatusBar, Theme};
 // ========================================================================
 
 const PTY_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const CONFIG_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const TAB_BELL_DURATION: Duration = Duration::from_secs(3);
 const SPLIT_RATIO: f32 = 0.5;
 /// Cell rows reserved at the bottom of the surface for the status bar.
 pub(crate) const STATUS_BAR_ROWS: usize = 1;
@@ -212,8 +214,21 @@ fn winit_key_to_code(key: &winit::keyboard::Key) -> KeyCode {
 
 /// The application state, driven by winit's `ApplicationHandler` trait.
 pub struct App {
+    /// Tab index currently hovered over a bell dot, drives the hover tooltip.
+    pub(crate) bell_dot_hover: Option<usize>,
     pub(crate) bell_until: Option<Instant>,
+    /// Per-tab bell notification: tab index → expiry `Instant`. Shown as a dot
+    /// on the tab label and cleared automatically after `TAB_BELL_DURATION`.
+    pub(crate) tab_bells: HashMap<usize, Instant>,
     pub(crate) config: Config,
+    /// Snapshot of the config files' modification times taken at last load, used
+    /// to detect when a file has changed and trigger a hot-reload.
+    pub(crate) config_mtimes: Vec<Option<SystemTime>>,
+    /// Next instant at which to re-check config file modification times.
+    pub(crate) config_next_check: Instant,
+    /// Set after the first bare Escape in Insert mode at the shell prompt. A
+    /// second consecutive Escape switches to Normal mode; any other key clears it.
+    pub(crate) insert_esc_pending: bool,
     pub(crate) cursor_pos: (f32, f32),
     pub(crate) dirty: bool,
     /// A transient error notice and the instant it expires, shown in the status
@@ -347,10 +362,18 @@ impl App {
 
         let config = Config::load();
         let window_keymap = WindowKeymap::from_config(config.keybindings.get("window"));
+        let config_mtimes = config_file_paths()
+            .iter()
+            .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+            .collect();
 
         Self {
+            bell_dot_hover: None,
             bell_until: None,
+            tab_bells: HashMap::new(),
             config,
+            config_mtimes,
+            config_next_check: Instant::now() + CONFIG_CHECK_INTERVAL,
             cursor_pos: (0.0, 0.0),
             dirty: true,
             error_notice: None,
@@ -370,6 +393,7 @@ impl App {
             panes: HashMap::new(),
             palette: None,
             pane_titles: HashMap::new(),
+            insert_esc_pending: false,
             pending: PendingPrefix::None,
             quick_select: None,
             renderer: None,
@@ -410,6 +434,23 @@ impl App {
         let id = PaneId(self.next_pane_id);
         self.next_pane_id += 1;
         id
+    }
+
+    /// Check whether any config file has changed since the last load and, if so,
+    /// reload and apply the new settings. Returns true when a reload occurred.
+    pub(crate) fn reload_config_if_changed(&mut self) -> bool {
+        let paths = config_file_paths();
+        let new_mtimes: Vec<Option<SystemTime>> = paths
+            .iter()
+            .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+            .collect();
+        if new_mtimes == self.config_mtimes {
+            return false;
+        }
+        self.config_mtimes = new_mtimes;
+        self.config = Config::load();
+        self.window_keymap = WindowKeymap::from_config(self.config.keybindings.get("window"));
+        true
     }
 
     /// Number of top cell rows reserved for the tabbar/menubar chrome.
@@ -772,9 +813,7 @@ impl App {
             }
         }
         if any_bell {
-            // Suppress the visual flash for:
-            // 1. The shell's prompt-boundary ding (a navigation/edit key the shell can't act on)
-            // 2. Focus change artifacts (unsolicited input bells on Alt-tab or focus switch)
+            // Suppress for edit-key prompt dings and focus-change artifacts.
             let from_edit_key = self
                 .last_edit_key
                 .is_some_and(|t| t.elapsed() < EDIT_KEY_BELL_WINDOW);
@@ -784,7 +823,13 @@ impl App {
             if from_edit_key || from_focus_change {
                 self.last_edit_key = None;
             } else {
-                self.flash_bell();
+                // Mark the active tab with a 3-second notification dot.
+                self.tab_bells
+                    .insert(self.active_tab, Instant::now() + TAB_BELL_DURATION);
+                // Optional background flash (only when visual-bell color is set).
+                if self.config.colors.bell.is_some() {
+                    self.flash_bell();
+                }
             }
         }
         if !new_titles.is_empty() {
@@ -822,15 +867,48 @@ impl App {
     }
 
     fn handle_palette_input(&mut self, palette: &mut Palette, key: &Key, focused: PaneId) {
+        use crate::model::palette::PaletteMode;
         match key {
             Key::Named(NamedKey::Escape) => {
                 palette.close();
                 self.palette = None;
             }
             Key::Named(NamedKey::Enter) => {
-                if let Some(action) = palette.selected_action() {
-                    self.run_command(action, focused);
+                let action = palette.selected_action().map(str::to_string);
+                match palette.mode {
+                    PaletteMode::Commands => {
+                        if let Some(action) = action {
+                            self.run_command(&action, focused);
+                        }
+                    }
+                    PaletteMode::History => {
+                        if let Some(cmd) = action {
+                            if let Some(pane) = self.panes.get_mut(&focused) {
+                                pane.write(cmd.as_bytes());
+                            }
+                        }
+                    }
+                    PaletteMode::RecentDirs => {
+                        if let Some(dir) = action {
+                            // Reject paths containing control characters — a
+                            // malicious OSC 7 sequence could embed a newline to
+                            // inject a second shell command.
+                            let safe = !dir.chars().any(|c| c.is_control());
+                            if safe {
+                                if let Some(pane) = self.panes.get_mut(&focused) {
+                                    // Single-quote the path so shell metacharacters
+                                    // in the directory name are inert. The only
+                                    // character that cannot appear inside single
+                                    // quotes is `'` itself, escaped as `'\''`.
+                                    let escaped = dir.replace('\'', "'\\''");
+                                    let cmd = format!("cd '{}'\n", escaped);
+                                    pane.write(cmd.as_bytes());
+                                }
+                            }
+                        }
+                    }
                 }
+                palette.close();
                 self.palette = None;
             }
             Key::Named(NamedKey::Backspace) => {
@@ -938,6 +1016,28 @@ impl App {
             }
             "open_settings" => {
                 self.open_settings();
+            }
+            "cd_recent" => {
+                let dirs = self
+                    .panes
+                    .get(&focused)
+                    .map(|p| {
+                        let mut seen = std::collections::HashSet::new();
+                        p.scrollback()
+                            .blocks()
+                            .iter()
+                            .rev()
+                            .filter_map(|b| b.cwd.as_deref())
+                            .filter(|&d| seen.insert(d.to_string()))
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                self.palette = Some(Palette::open_recent_dirs(dirs));
+                self.dirty = true;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
             _ => {}
         }
@@ -1352,10 +1452,23 @@ impl ApplicationHandler for App {
                 }
 
                 // Alt-1..9 jumps straight to that tab, browser style.
+                // Alt-X opens the command palette.
                 if mods_state.alt_key() && !mods_state.control_key() {
                     if let KeyCode::Char(c) = key.code {
                         if let Some(n) = c.to_digit(10).filter(|d| (1..=9).contains(d)) {
                             self.handle_action(Action::GotoTab(n as usize), focused);
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                            return;
+                        }
+                        if c == 'x' {
+                            if self.palette.is_some() {
+                                self.palette = None;
+                            } else {
+                                self.palette = Some(Palette::open());
+                            }
+                            self.dirty = true;
                             if let Some(window) = &self.window {
                                 window.request_redraw();
                             }
@@ -1399,6 +1512,28 @@ impl ApplicationHandler for App {
                                 window.request_redraw();
                             }
                             return;
+                        } else if lower == "r" {
+                            if self.palette.is_some() {
+                                self.palette = None;
+                            } else {
+                                self.palette = Some(Palette::open_history());
+                            }
+                            self.dirty = true;
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                            return;
+                        } else if lower == "z" {
+                            if self.palette.is_some() {
+                                self.palette = None;
+                            } else {
+                                self.run_command("cd_recent", focused);
+                            }
+                            self.dirty = true;
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                            return;
                         }
                     }
                 }
@@ -1416,16 +1551,53 @@ impl ApplicationHandler for App {
                     return;
                 }
 
-                let fullscreen = self
+                let at_prompt = self
                     .panes
                     .get(&focused)
-                    .is_some_and(|p| p.grid().is_alt_screen());
+                    .is_some_and(|p| p.is_at_prompt());
+                // Step-through Escape in Insert mode at the shell prompt:
+                //   1st Escape: send to PTY (cancels any inline shell state, e.g.
+                //               zsh Ctrl+R), stay in Insert mode.
+                //   2nd consecutive Escape: switch to Normal mode.
+                // Any other key resets the step counter.
+                let bare_esc = mode == Mode::Insert
+                    && key.code == KeyCode::Escape
+                    && !key.alt
+                    && !key.ctrl
+                    && !key.shift;
+                if bare_esc && at_prompt {
+                    if let Some(pane) = self.panes.get_mut(&focused) {
+                        pane.write(&[0x1b]);
+                    }
+                    if self.insert_esc_pending {
+                        self.insert_esc_pending = false;
+                        let switch = input::Action::SwitchMode(
+                            Mode::Insert.apply(crate::model::mode::ModeEvent::EnterNormal),
+                        );
+                        self.handle_action(switch, focused);
+                    } else {
+                        self.insert_esc_pending = true;
+                    }
+                    self.update_window_title();
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
+                if !bare_esc {
+                    self.insert_esc_pending = false;
+                }
+                let kitty_flags = self
+                    .panes
+                    .get(&focused)
+                    .map(|p| p.kitty_flags())
+                    .unwrap_or(0);
                 let action = input::resolve_with(
                     mode,
                     &key,
                     &mut self.pending,
-                    fullscreen,
                     &self.window_keymap,
+                    kitty_flags,
                 );
                 self.handle_action(action, focused);
                 self.update_window_title();
@@ -1504,6 +1676,23 @@ impl ApplicationHandler for App {
 
                 if self.open_menu.is_some() {
                     self.update_menu_hover(x, y);
+                }
+
+                // Update bell-dot hover so the renderer can show a tooltip.
+                if let Some((cw, ch)) = self.renderer.as_ref().map(|r| r.cell_size()) {
+                    let surface_w = self.viewport_rect().width;
+                    let chrome = self.build_top_chrome();
+                    let hit = spaceterm_render::hit_test(&chrome, surface_w, cw, ch, x, y);
+                    let new_hover = match hit {
+                        spaceterm_render::ChromeHit::BellDot(i) => Some(i),
+                        _ => None,
+                    };
+                    if new_hover != self.bell_dot_hover {
+                        self.bell_dot_hover = new_hover;
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
                 }
 
                 let focused = self.tab().focused();
@@ -1619,6 +1808,16 @@ impl ApplicationHandler for App {
             gtk::main_iteration_do(false);
         }
 
+        if Instant::now() >= self.config_next_check {
+            self.config_next_check = Instant::now() + CONFIG_CHECK_INTERVAL;
+            if self.reload_config_if_changed() {
+                self.dirty = true;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+        }
+
         self.reap_dead_panes();
         let any_output = self.drain_all_panes();
         if any_output {
@@ -1654,6 +1853,17 @@ impl ApplicationHandler for App {
         // Once an error notice expires, redraw once to clear it from the bar.
         if self.error_notice.is_some() && self.active_error_notice().is_none() {
             self.error_notice = None;
+            self.dirty = true;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+
+        // Clear expired tab bell dots and trigger one final redraw to remove them.
+        let now = Instant::now();
+        let before = self.tab_bells.len();
+        self.tab_bells.retain(|_, expires| now < *expires);
+        if self.tab_bells.len() != before {
             self.dirty = true;
             if let Some(window) = &self.window {
                 window.request_redraw();

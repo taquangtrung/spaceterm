@@ -1,0 +1,110 @@
+// spaceterm sample configuration — ~/.config/spaceterm/settings.kdl
+//
+// All options are shown here at their default values.
+// Lines you don't change can be removed; unset options fall back to the default.
+//
+// Keybindings live in a separate file: ~/.config/spaceterm/keys.kdl
+// User themes live in: ~/.config/spaceterm/themes/<name>.kdl
+
+// ── Theme ─────────────────────────────────────────────────────────────────────
+// Built-in values: "dark", "light", "auto" (follows system appearance).
+// Custom: the filename (without .kdl) of a file in ~/.config/spaceterm/themes/.
+theme "dark"
+
+// ── Font ──────────────────────────────────────────────────────────────────────
+// Font family. Falls back to the system monospace font when not set.
+// font "FiraCode Nerd Font"
+
+// Point size.
+font-size "15"
+
+// Named font weight for normal text ("thin", "light", "regular", "medium",
+// "semibold", "bold", "extrabold", "black", or a numeric value like "400").
+// Falls back to the font's default when not set.
+// font-weight "regular"
+
+// Named weight for bold text. Falls back to font-weight when not set.
+// font-weight-bold "bold"
+
+// ── Window ────────────────────────────────────────────────────────────────────
+// Background opacity. 1.0 is fully opaque; lower values require a compositor.
+opacity "1"
+
+// Title bar presentation.
+//   "modern" — borderless: the tab strip doubles as the title bar with custom
+//              minimize/maximize/close controls.
+//   "system" — native OS window decorations; the tab strip sits inside them.
+title-bar-style "modern"
+
+// Which edge of the title bar carries the window controls.
+//   "left"  — controls on the left (default, macOS-style).
+//   "right" — controls on the right (Windows-style).
+window-controls-side "left"
+
+// Menu presentation in the tab strip.
+//   "modern"  — a single ☰ hamburger button opens a command dropdown.
+//   "classic" — a File / Edit / View / Window menubar row above the tab strip.
+menu-style "modern"
+
+// Underline fuzzy-matched characters in the command palette results list.
+palette-match-underline false
+
+// ── Cursor ────────────────────────────────────────────────────────────────────
+// Per-mode cursor shapes: "block", "bar" (vertical beam), or "underline".
+cursor {
+    insert "bar"
+    normal "block"
+    visual "block"
+    block-focus "bar"
+}
+
+// ── Status bar ────────────────────────────────────────────────────────────────
+status-bar {
+    // Show or hide the entire status bar (freeing its reserved row when hidden).
+    show true
+
+    // Show the current mode label (NORMAL / INSERT / VISUAL …).
+    show-mode true
+
+    // Show the focused pane title in the center.
+    show-title true
+
+    // Show the branding label on the right.
+    show-branding true
+
+    // Nerd Font icons used for each mode. Replace with plain ASCII if you do
+    // not have a Nerd Font installed ("N", "I", "B", "S" are common fallbacks).
+    normal-icon ""
+    insert-icon "󰏫"
+    block-icon "󰒅"
+    branding-icon "󰚗"
+}
+
+// ── Color overrides ───────────────────────────────────────────────────────────
+// Override individual colors from the active theme preset.
+// All keys are optional; remove the block entirely to use unmodified preset colors.
+//
+// Values shown are the "dark" preset defaults.
+//
+// colors {
+//     background       "#2a2f31"
+//     foreground       "#d8d8d8"
+//     cursor-bg        "#52ad70"
+//     cursor-fg        "#000000"
+//     selection-bg     "#fffacd"
+//     selection-fg     "#000000"
+//     split            "#51554f"   // pane divider lines
+//     status-bar-border "#3b414f"  // 1px line above the status bar
+//     visual-bell      "#202020"   // background flash on bell (disabled when unset)
+//
+//     // 8 normal ANSI colors: black red green yellow blue magenta cyan white
+//     ansi    "#000000" "#c22727" "#71b312" "#faa213"
+//             "#4fa2fa" "#bb67b2" "#21afbf" "#c0c0c0"
+//
+//     // 8 bright ANSI colors: same order as above
+//     brights "#7a7a7a" "#d43f30" "#71b312" "#ebb909"
+//             "#5da2eb" "#c97df5" "#04cfe1" "#e1ebfa"
+//
+//     // Override a single 256-color palette entry (index 0-255).
+//     indexed 136 "#af8700"
+// }

@@ -216,6 +216,20 @@ const DELETE: u8 = 0x7f;
 const ESCAPE: u8 = 0x1b;
 const CARRIAGE_RETURN: u8 = b'\r';
 
+// Kitty keyboard protocol: functional-key codepoints.
+// https://sw.kovidgoyal.net/kitty/keyboard-protocol/#functional-key-definitions
+const KP_INSERT: u32 = 57348;
+const KP_DELETE: u32 = 57349;
+const KP_LEFT: u32 = 57350;
+const KP_RIGHT: u32 = 57351;
+const KP_UP: u32 = 57352;
+const KP_DOWN: u32 = 57353;
+const KP_PAGE_UP: u32 = 57354;
+const KP_PAGE_DOWN: u32 = 57355;
+const KP_HOME: u32 = 57356;
+const KP_END: u32 = 57357;
+const KP_F1: u32 = 57364;
+
 // ========================================================================
 // Window keymap
 // ========================================================================
@@ -418,10 +432,10 @@ fn parse_function_key(name: &str) -> Option<KeyCode> {
 
 /// Resolve a key in the given mode using the default window keymap.
 /// `pending` tracks multi-key sequences (e.g. `]b`); it is updated in place.
-/// `fullscreen` is true when a fullscreen app holds the pane (the alternate
-/// screen); it keeps `Esc` bound to the PTY instead of entering Normal mode.
-pub fn resolve(mode: Mode, key: &Key, pending: &mut PendingPrefix, fullscreen: bool) -> Action {
-    resolve_with(mode, key, pending, fullscreen, &WindowKeymap::default())
+/// `flags` is the active Kitty keyboard protocol flags for the focused pane
+/// (0 = legacy xterm encoding).
+pub fn resolve(mode: Mode, key: &Key, pending: &mut PendingPrefix, flags: u32) -> Action {
+    resolve_with(mode, key, pending, &WindowKeymap::default(), flags)
 }
 
 /// Like [`resolve`], but using the supplied window keymap for the configurable
@@ -430,27 +444,24 @@ pub fn resolve_with(
     mode: Mode,
     key: &Key,
     pending: &mut PendingPrefix,
-    fullscreen: bool,
     window: &WindowKeymap,
+    flags: u32,
 ) -> Action {
     match mode {
-        Mode::Insert => resolve_insert(key, fullscreen),
+        Mode::Insert => resolve_insert(key, flags),
         Mode::Normal => resolve_normal(key, pending, window),
         Mode::Visual => resolve_visual(key, pending),
-        Mode::BlockFocus => resolve_block_focus(key),
+        Mode::BlockFocus => resolve_block_focus(key, flags),
     }
 }
 
-fn resolve_insert(key: &Key, fullscreen: bool) -> Action {
+fn resolve_insert(key: &Key, flags: u32) -> Action {
     if is_entry_chord(key) {
         return Action::SwitchMode(Mode::Insert.apply(ModeEvent::EnterNormal));
     }
-    // Esc enters Normal mode, except while a fullscreen app owns the screen,
-    // where Esc belongs to that app (e.g. vim, less, htop).
-    if key.code == KeyCode::Escape && !key.ctrl && !key.alt && !fullscreen {
-        return Action::SwitchMode(Mode::Insert.apply(ModeEvent::EnterNormal));
-    }
-    Action::SendBytes(encode(key))
+    // Escape always goes to the PTY. Context-aware mode switching (e.g. at the
+    // shell prompt) is handled one layer up in the application event loop.
+    Action::SendBytes(encode(key, flags))
 }
 
 /// Build the char-search action for the key that follows `f`/`F`/`t`/`T`. A
@@ -704,11 +715,11 @@ fn resolve_visual(key: &Key, pending: &mut PendingPrefix) -> Action {
     }
 }
 
-fn resolve_block_focus(key: &Key) -> Action {
+fn resolve_block_focus(key: &Key, flags: u32) -> Action {
     if key.code == KeyCode::Escape {
         return Action::SwitchMode(Mode::BlockFocus.apply(ModeEvent::Escape));
     }
-    Action::ForwardToBlock(encode(key))
+    Action::ForwardToBlock(encode(key, flags))
 }
 
 fn is_entry_chord(key: &Key) -> bool {
@@ -716,35 +727,195 @@ fn is_entry_chord(key: &Key) -> bool {
 }
 
 /// Encode a key as the bytes a terminal program expects on the PTY.
-fn encode(key: &Key) -> Vec<u8> {
-    match key.code {
-        KeyCode::Backspace => vec![DELETE],
-        KeyCode::Char('\0') => Vec::new(),
-        KeyCode::Char(c) => encode_char(c, key.ctrl),
-        KeyCode::Delete => ss3(b'P'),
-        KeyCode::Down => csi(b'B'),
-        KeyCode::End => csi(b'F'),
-        KeyCode::Enter => vec![CARRIAGE_RETURN],
-        KeyCode::Escape => vec![ESCAPE],
-        KeyCode::F(n) => encode_f(n),
-        KeyCode::Home => csi(b'H'),
-        KeyCode::Insert => csi_param(b'2', b'~'),
-        KeyCode::Left => csi(b'D'),
-        KeyCode::PageDown => csi_param(b'6', b'~'),
-        KeyCode::PageUp => csi_param(b'5', b'~'),
-        KeyCode::Right => csi(b'C'),
-        KeyCode::Space => vec![b' '],
-        KeyCode::Tab => vec![b'\t'],
-        KeyCode::Up => csi(b'A'),
+/// `flags` is the active Kitty keyboard protocol bitmask for the pane
+/// (0 = legacy xterm encoding).
+fn encode(key: &Key, flags: u32) -> Vec<u8> {
+    if flags != 0 {
+        encode_kitty(key)
+    } else {
+        encode_xterm(key)
     }
 }
 
-fn encode_char(c: char, ctrl: bool) -> Vec<u8> {
-    if ctrl && c.is_ascii_alphabetic() {
-        return vec![(c.to_ascii_uppercase() as u8) & CONTROL_MASK];
-    }
-    c.to_string().into_bytes()
+// ---- xterm baseline encoding ------------------------------------------------
+
+/// xterm modifier byte: 1 + shift + 2*alt + 4*ctrl. Value 1 means no modifier.
+fn xterm_modifier(key: &Key) -> u8 {
+    1 + (key.shift as u8) + 2 * (key.alt as u8) + 4 * (key.ctrl as u8)
 }
+
+/// Prepend an ESC byte (Alt prefix convention).
+fn esc_prefix(mut bytes: Vec<u8>) -> Vec<u8> {
+    bytes.insert(0, ESCAPE);
+    bytes
+}
+
+/// Navigation key: bare CSI when no modifier, `\e[1;NX` with one.
+fn nav_csi_xterm(final_byte: u8, m: u8) -> Vec<u8> {
+    if m == 1 {
+        csi(final_byte)
+    } else {
+        format!("\x1b[1;{m}{}", final_byte as char).into_bytes()
+    }
+}
+
+/// Tilde-form key: `\e[k~` bare, `\e[k;N~` with modifier.
+fn tilde_xterm(param: u8, m: u8) -> Vec<u8> {
+    if m == 1 {
+        csi_param(param, b'~')
+    } else {
+        format!("\x1b[{param};{m}~").into_bytes()
+    }
+}
+
+/// xterm encoding for function keys F1-F12 with optional modifier.
+fn encode_f_xterm(n: u8, m: u8) -> Vec<u8> {
+    match n {
+        1 => {
+            if m > 1 { format!("\x1b[1;{m}P").into_bytes() } else { ss3(b'P') }
+        }
+        2 => {
+            if m > 1 { format!("\x1b[1;{m}Q").into_bytes() } else { ss3(b'Q') }
+        }
+        3 => {
+            if m > 1 { format!("\x1b[1;{m}R").into_bytes() } else { ss3(b'R') }
+        }
+        4 => {
+            if m > 1 { format!("\x1b[1;{m}S").into_bytes() } else { ss3(b'S') }
+        }
+        5 => tilde_xterm(15, m),
+        6 => tilde_xterm(17, m),
+        7 => tilde_xterm(18, m),
+        8 => tilde_xterm(19, m),
+        9 => tilde_xterm(20, m),
+        10 => tilde_xterm(21, m),
+        11 => tilde_xterm(23, m),
+        12 => tilde_xterm(24, m),
+        _ => Vec::new(),
+    }
+}
+
+fn encode_xterm(key: &Key) -> Vec<u8> {
+    let m = xterm_modifier(key);
+    let bytes = match key.code {
+        KeyCode::Backspace => vec![DELETE],
+        KeyCode::Char('\0') => return Vec::new(),
+        KeyCode::Char(c) => {
+            if key.ctrl && c.is_ascii_alphabetic() {
+                vec![(c.to_ascii_uppercase() as u8) & CONTROL_MASK]
+            } else {
+                c.to_string().into_bytes()
+            }
+        }
+        KeyCode::Delete => tilde_xterm(3, m),
+        KeyCode::Down => nav_csi_xterm(b'B', m),
+        KeyCode::End => {
+            if m > 1 { format!("\x1b[1;{m}F").into_bytes() } else { csi(b'F') }
+        }
+        KeyCode::Enter => vec![CARRIAGE_RETURN],
+        KeyCode::Escape => vec![ESCAPE],
+        KeyCode::F(n) => encode_f_xterm(n, m),
+        KeyCode::Home => {
+            if m > 1 { format!("\x1b[1;{m}H").into_bytes() } else { csi(b'H') }
+        }
+        KeyCode::Insert => tilde_xterm(2, m),
+        KeyCode::Left => nav_csi_xterm(b'D', m),
+        KeyCode::PageDown => tilde_xterm(6, m),
+        KeyCode::PageUp => tilde_xterm(5, m),
+        KeyCode::Right => nav_csi_xterm(b'C', m),
+        KeyCode::Space => vec![b' '],
+        KeyCode::Tab => {
+            if key.shift {
+                vec![ESCAPE, b'[', b'Z'] // backtab / reverse-tab
+            } else {
+                vec![b'\t']
+            }
+        }
+        KeyCode::Up => nav_csi_xterm(b'A', m),
+    };
+    // Alt prefix: prepend ESC (never on bare Escape to avoid double-ESC).
+    if key.alt && !matches!(key.code, KeyCode::Escape | KeyCode::Char('\0')) {
+        esc_prefix(bytes)
+    } else {
+        bytes
+    }
+}
+
+// ---- Kitty keyboard protocol encoding ---------------------------------------
+
+/// Kitty modifier value: 1 + shift + 2*alt + 4*ctrl. Value 1 means no modifier.
+fn kitty_modifier(key: &Key) -> u32 {
+    1 + (key.shift as u32) + 2 * (key.alt as u32) + 4 * (key.ctrl as u32)
+}
+
+/// `CSI codepoint u` or `CSI codepoint ; modifier u` (omit `;1`).
+fn kitty_csi(codepoint: u32, modifier: u32) -> Vec<u8> {
+    if modifier == 1 {
+        format!("\x1b[{codepoint}u").into_bytes()
+    } else {
+        format!("\x1b[{codepoint};{modifier}u").into_bytes()
+    }
+}
+
+/// The base Unicode codepoint of a character key (lowercase for ASCII alpha
+/// so Ctrl+Shift+a uses codepoint 97, not 65).
+fn base_codepoint(c: char, shift: bool) -> u32 {
+    if shift && c.is_ascii_uppercase() {
+        c.to_ascii_lowercase() as u32
+    } else {
+        c as u32
+    }
+}
+
+fn encode_kitty(key: &Key) -> Vec<u8> {
+    let m = kitty_modifier(key);
+    match key.code {
+        KeyCode::Char('\0') => Vec::new(),
+        KeyCode::Char(c) => {
+            // No modifier or lone Shift: send raw UTF-8. Shift is already
+            // encoded in the char winit provides ('A' for Shift+a).
+            if m == 1 || m == 2 {
+                return c.to_string().into_bytes();
+            }
+            kitty_csi(base_codepoint(c, key.shift), m)
+        }
+        KeyCode::Space => {
+            if m == 1 { vec![b' '] } else { kitty_csi(32, m) }
+        }
+        KeyCode::Tab => {
+            if m == 1 {
+                vec![b'\t']
+            } else if key.shift && !key.ctrl && !key.alt {
+                vec![ESCAPE, b'[', b'Z'] // backtab
+            } else {
+                kitty_csi(9, m)
+            }
+        }
+        KeyCode::Enter => {
+            if m == 1 { vec![CARRIAGE_RETURN] } else { kitty_csi(13, m) }
+        }
+        KeyCode::Escape => {
+            if m == 1 { vec![ESCAPE] } else { kitty_csi(27, m) }
+        }
+        KeyCode::Backspace => {
+            if m == 1 { vec![DELETE] } else { kitty_csi(127, m) }
+        }
+        KeyCode::Insert => kitty_csi(KP_INSERT, m),
+        KeyCode::Delete => kitty_csi(KP_DELETE, m),
+        KeyCode::Left => kitty_csi(KP_LEFT, m),
+        KeyCode::Right => kitty_csi(KP_RIGHT, m),
+        KeyCode::Up => kitty_csi(KP_UP, m),
+        KeyCode::Down => kitty_csi(KP_DOWN, m),
+        KeyCode::PageUp => kitty_csi(KP_PAGE_UP, m),
+        KeyCode::PageDown => kitty_csi(KP_PAGE_DOWN, m),
+        KeyCode::Home => kitty_csi(KP_HOME, m),
+        KeyCode::End => kitty_csi(KP_END, m),
+        KeyCode::F(n @ 1..=12) => kitty_csi(KP_F1 + (n as u32 - 1), m),
+        KeyCode::F(_) => Vec::new(),
+    }
+}
+
+// ---- Low-level sequence builders --------------------------------------------
 
 fn csi(final_byte: u8) -> Vec<u8> {
     vec![ESCAPE, b'[', final_byte]
@@ -754,28 +925,8 @@ fn csi_param(param: u8, final_byte: u8) -> Vec<u8> {
     vec![ESCAPE, b'[', param, final_byte]
 }
 
-fn csi_two_params(p1: u8, p2: u8, final_byte: u8) -> Vec<u8> {
-    vec![ESCAPE, b'[', p1, b';', p2, final_byte]
-}
-
 fn ss3(final_byte: u8) -> Vec<u8> {
     vec![ESCAPE, b'O', final_byte]
-}
-
-fn encode_f(n: u8) -> Vec<u8> {
-    match n {
-        1 => ss3(b'P'),
-        2 => ss3(b'Q'),
-        3 => ss3(b'R'),
-        4 => ss3(b'S'),
-        5..=10 => {
-            let code = 11 + (n - 5);
-            format!("\x1b[{code}~").into_bytes()
-        }
-        11 => csi_two_params(b'2', b'3', b'~'),
-        12 => csi_two_params(b'2', b'4', b'~'),
-        _ => Vec::new(),
-    }
 }
 
 // ========================================================================
@@ -797,7 +948,7 @@ mod tests {
 
     fn resolve_simple(mode: Mode, key: &Key) -> Action {
         let mut pending = PendingPrefix::None;
-        resolve(mode, key, &mut pending, false)
+        resolve(mode, key, &mut pending, 0)
     }
 
     #[test]
@@ -829,15 +980,10 @@ mod tests {
     }
 
     #[test]
-    fn test_esc_enters_normal_unless_fullscreen() {
+    fn test_esc_is_always_sent_to_pty_in_insert_mode() {
         let mut pending = PendingPrefix::None;
         assert_eq!(
-            resolve(Mode::Insert, &key(KeyCode::Escape), &mut pending, false),
-            Action::SwitchMode(Mode::Normal)
-        );
-        // A fullscreen app keeps Esc bound to the PTY.
-        assert_eq!(
-            resolve(Mode::Insert, &key(KeyCode::Escape), &mut pending, true),
+            resolve(Mode::Insert, &key(KeyCode::Escape), &mut pending, 0),
             Action::SendBytes(vec![0x1b])
         );
     }
@@ -894,10 +1040,10 @@ mod tests {
     #[test]
     fn test_gg_jumps_to_top_of_buffer() {
         let mut pending = PendingPrefix::None;
-        let action = resolve(Mode::Normal, &key(KeyCode::Char('g')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('g')), &mut pending, 0);
         assert_eq!(action, Action::Ignore);
         assert_eq!(pending, PendingPrefix::G);
-        let action = resolve(Mode::Normal, &key(KeyCode::Char('g')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('g')), &mut pending, 0);
         assert_eq!(action, Action::MoveCursor(CursorMove::Top));
         assert_eq!(pending, PendingPrefix::None);
     }
@@ -906,11 +1052,11 @@ mod tests {
     fn test_char_search_sets_prefix_then_resolves_target() {
         let mut pending = PendingPrefix::None;
         // `t` opens a forward-till search rather than acting immediately.
-        let action = resolve(Mode::Normal, &key(KeyCode::Char('t')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('t')), &mut pending, 0);
         assert_eq!(action, Action::Ignore);
         assert_eq!(pending, PendingPrefix::TillForward);
         // The next key is the search target.
-        let action = resolve(Mode::Normal, &key(KeyCode::Char('x')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('x')), &mut pending, 0);
         assert_eq!(
             action,
             Action::FindChar(FindChar {
@@ -938,16 +1084,16 @@ mod tests {
     fn test_gt_switches_tabs() {
         let mut pending = PendingPrefix::None;
         assert_eq!(
-            resolve(Mode::Normal, &key(KeyCode::Char('g')), &mut pending, false),
+            resolve(Mode::Normal, &key(KeyCode::Char('g')), &mut pending, 0),
             Action::Ignore
         );
         assert_eq!(
-            resolve(Mode::Normal, &key(KeyCode::Char('t')), &mut pending, false),
+            resolve(Mode::Normal, &key(KeyCode::Char('t')), &mut pending, 0),
             Action::NextTab
         );
-        resolve(Mode::Normal, &key(KeyCode::Char('g')), &mut pending, false);
+        resolve(Mode::Normal, &key(KeyCode::Char('g')), &mut pending, 0);
         assert_eq!(
-            resolve(Mode::Normal, &key(KeyCode::Char('T')), &mut pending, false),
+            resolve(Mode::Normal, &key(KeyCode::Char('T')), &mut pending, 0),
             Action::PrevTab
         );
     }
@@ -995,10 +1141,10 @@ mod tests {
     #[test]
     fn test_bracket_close_b_navigates_next_block() {
         let mut pending = PendingPrefix::None;
-        let action = resolve(Mode::Normal, &key(KeyCode::Char(']')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char(']')), &mut pending, 0);
         assert_eq!(action, Action::Ignore);
         assert_eq!(pending, PendingPrefix::BracketClose);
-        let action = resolve(Mode::Normal, &key(KeyCode::Char('b')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('b')), &mut pending, 0);
         assert_eq!(action, Action::FocusBlock(BlockNav::Next));
         assert_eq!(pending, PendingPrefix::None);
     }
@@ -1006,10 +1152,10 @@ mod tests {
     #[test]
     fn test_bracket_open_b_navigates_previous_block() {
         let mut pending = PendingPrefix::None;
-        let action = resolve(Mode::Normal, &key(KeyCode::Char('[')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('[')), &mut pending, 0);
         assert_eq!(action, Action::Ignore);
         assert_eq!(pending, PendingPrefix::BracketOpen);
-        let action = resolve(Mode::Normal, &key(KeyCode::Char('b')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('b')), &mut pending, 0);
         assert_eq!(action, Action::FocusBlock(BlockNav::Previous));
         assert_eq!(pending, PendingPrefix::None);
     }
@@ -1021,7 +1167,7 @@ mod tests {
             ctrl: true,
             ..key(KeyCode::Char('h'))
         };
-        let action = resolve(Mode::Normal, &ctrl_h, &mut pending, false);
+        let action = resolve(Mode::Normal, &ctrl_h, &mut pending, 0);
         assert_eq!(action, Action::FocusPane(FocusDir::Left));
         assert_eq!(pending, PendingPrefix::None);
     }
@@ -1029,7 +1175,7 @@ mod tests {
     #[test]
     fn test_bracket_prefix_with_unknown_key_is_ignored() {
         let mut pending = PendingPrefix::BracketClose;
-        let action = resolve(Mode::Normal, &key(KeyCode::Char('x')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('x')), &mut pending, 0);
         assert_eq!(action, Action::Ignore);
         assert_eq!(pending, PendingPrefix::None);
     }
@@ -1061,10 +1207,10 @@ mod tests {
     #[test]
     fn test_za_toggles_fold() {
         let mut pending = PendingPrefix::None;
-        let action = resolve(Mode::Normal, &key(KeyCode::Char('z')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('z')), &mut pending, 0);
         assert_eq!(action, Action::Ignore);
         assert_eq!(pending, PendingPrefix::Z);
-        let action = resolve(Mode::Normal, &key(KeyCode::Char('a')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('a')), &mut pending, 0);
         assert_eq!(action, Action::ToggleFold);
         assert_eq!(pending, PendingPrefix::None);
     }
@@ -1072,7 +1218,7 @@ mod tests {
     #[test]
     fn test_z_followed_by_unknown_is_ignored() {
         let mut pending = PendingPrefix::Z;
-        let action = resolve(Mode::Normal, &key(KeyCode::Char('x')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('x')), &mut pending, 0);
         assert_eq!(action, Action::Ignore);
         assert_eq!(pending, PendingPrefix::None);
     }
@@ -1080,7 +1226,7 @@ mod tests {
     #[test]
     fn test_q_enters_quick_select() {
         let mut pending = PendingPrefix::None;
-        let action = resolve(Mode::Normal, &key(KeyCode::Char('q')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('q')), &mut pending, 0);
         assert_eq!(action, Action::QuickSelect);
         assert_eq!(pending, PendingPrefix::QuickSelect);
     }
@@ -1088,7 +1234,7 @@ mod tests {
     #[test]
     fn test_quick_select_label_jumps() {
         let mut pending = PendingPrefix::QuickSelect;
-        let action = resolve(Mode::Normal, &key(KeyCode::Char('s')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('s')), &mut pending, 0);
         assert_eq!(action, Action::QuickJump('s'));
         assert_eq!(pending, PendingPrefix::None);
     }
@@ -1096,7 +1242,7 @@ mod tests {
     #[test]
     fn test_quick_select_escape_cancels() {
         let mut pending = PendingPrefix::QuickSelect;
-        let action = resolve(Mode::Normal, &key(KeyCode::Escape), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Escape), &mut pending, 0);
         assert_eq!(action, Action::QuickCancel);
         assert_eq!(pending, PendingPrefix::None);
     }
@@ -1104,7 +1250,7 @@ mod tests {
     #[test]
     fn test_quick_select_non_alpha_cancels() {
         let mut pending = PendingPrefix::QuickSelect;
-        let action = resolve(Mode::Normal, &key(KeyCode::Enter), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Enter), &mut pending, 0);
         assert_eq!(action, Action::QuickCancel);
         assert_eq!(pending, PendingPrefix::None);
     }
@@ -1112,7 +1258,7 @@ mod tests {
     #[test]
     fn test_slash_enters_search_input() {
         let mut pending = PendingPrefix::None;
-        let action = resolve(Mode::Normal, &key(KeyCode::Char('/')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('/')), &mut pending, 0);
         assert_eq!(action, Action::SearchStart);
         assert_eq!(pending, PendingPrefix::SearchInput);
     }
@@ -1120,10 +1266,10 @@ mod tests {
     #[test]
     fn test_search_input_collects_chars() {
         let mut pending = PendingPrefix::SearchInput;
-        let action = resolve(Mode::Normal, &key(KeyCode::Char('h')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('h')), &mut pending, 0);
         assert_eq!(action, Action::SearchChar('h'));
         assert_eq!(pending, PendingPrefix::SearchInput);
-        let action = resolve(Mode::Normal, &key(KeyCode::Char('i')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('i')), &mut pending, 0);
         assert_eq!(action, Action::SearchChar('i'));
         assert_eq!(pending, PendingPrefix::SearchInput);
     }
@@ -1131,7 +1277,7 @@ mod tests {
     #[test]
     fn test_search_input_enter_executes() {
         let mut pending = PendingPrefix::SearchInput;
-        let action = resolve(Mode::Normal, &key(KeyCode::Enter), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Enter), &mut pending, 0);
         assert_eq!(action, Action::SearchExecute);
         assert_eq!(pending, PendingPrefix::None);
     }
@@ -1139,7 +1285,7 @@ mod tests {
     #[test]
     fn test_search_input_escape_cancels() {
         let mut pending = PendingPrefix::SearchInput;
-        let action = resolve(Mode::Normal, &key(KeyCode::Escape), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Escape), &mut pending, 0);
         assert_eq!(action, Action::SearchCancel);
         assert_eq!(pending, PendingPrefix::None);
     }
@@ -1147,7 +1293,7 @@ mod tests {
     #[test]
     fn test_search_input_backspace() {
         let mut pending = PendingPrefix::SearchInput;
-        let action = resolve(Mode::Normal, &key(KeyCode::Backspace), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Backspace), &mut pending, 0);
         assert_eq!(action, Action::SearchBackspace);
         assert_eq!(pending, PendingPrefix::SearchInput);
     }
@@ -1184,12 +1330,12 @@ mod tests {
             ..key(KeyCode::Char('w'))
         };
         assert_eq!(
-            resolve(Mode::Normal, &ctrl_w, &mut pending, false),
+            resolve(Mode::Normal, &ctrl_w, &mut pending, 0),
             Action::Ignore
         );
         assert_eq!(pending, PendingPrefix::CtrlW);
         assert_eq!(
-            resolve(Mode::Normal, &key(KeyCode::Char('v')), &mut pending, false),
+            resolve(Mode::Normal, &key(KeyCode::Char('v')), &mut pending, 0),
             Action::SplitPane(Direction::Vertical)
         );
         assert_eq!(pending, PendingPrefix::None);
@@ -1227,10 +1373,10 @@ mod tests {
     #[test]
     fn test_visual_gg_jumps_to_top() {
         let mut pending = PendingPrefix::None;
-        let action = resolve(Mode::Visual, &key(KeyCode::Char('g')), &mut pending, false);
+        let action = resolve(Mode::Visual, &key(KeyCode::Char('g')), &mut pending, 0);
         assert_eq!(action, Action::Ignore);
         assert_eq!(pending, PendingPrefix::G);
-        let action = resolve(Mode::Visual, &key(KeyCode::Char('g')), &mut pending, false);
+        let action = resolve(Mode::Visual, &key(KeyCode::Char('g')), &mut pending, 0);
         assert_eq!(action, Action::MoveCursor(CursorMove::Top));
     }
 
@@ -1253,10 +1399,10 @@ mod tests {
     #[test]
     fn test_dd_deletes_line() {
         let mut pending = PendingPrefix::None;
-        let action = resolve(Mode::Normal, &key(KeyCode::Char('d')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('d')), &mut pending, 0);
         assert_eq!(action, Action::Ignore);
         assert_eq!(pending, PendingPrefix::Delete);
-        let action = resolve(Mode::Normal, &key(KeyCode::Char('d')), &mut pending, false);
+        let action = resolve(Mode::Normal, &key(KeyCode::Char('d')), &mut pending, 0);
         assert_eq!(action, Action::DeleteLine);
         assert_eq!(pending, PendingPrefix::None);
     }
@@ -1264,9 +1410,9 @@ mod tests {
     #[test]
     fn test_dw_deletes_word() {
         let mut pending = PendingPrefix::None;
-        resolve(Mode::Normal, &key(KeyCode::Char('d')), &mut pending, false);
+        resolve(Mode::Normal, &key(KeyCode::Char('d')), &mut pending, 0);
         assert_eq!(
-            resolve(Mode::Normal, &key(KeyCode::Char('w')), &mut pending, false),
+            resolve(Mode::Normal, &key(KeyCode::Char('w')), &mut pending, 0),
             Action::DeleteWordForward
         );
     }
@@ -1275,7 +1421,7 @@ mod tests {
     fn test_ctrl_w_c_closes_pane() {
         let mut pending = PendingPrefix::CtrlW;
         assert_eq!(
-            resolve(Mode::Normal, &key(KeyCode::Char('c')), &mut pending, false),
+            resolve(Mode::Normal, &key(KeyCode::Char('c')), &mut pending, 0),
             Action::ClosePane
         );
     }
@@ -1286,14 +1432,14 @@ mod tests {
         for code in [KeyCode::Char('s'), KeyCode::Char('S')] {
             let mut pending = PendingPrefix::CtrlW;
             assert_eq!(
-                resolve(Mode::Normal, &key(code), &mut pending, false),
+                resolve(Mode::Normal, &key(code), &mut pending, 0),
                 Action::SplitPane(Direction::Horizontal)
             );
             assert_eq!(pending, PendingPrefix::None);
         }
         let mut pending = PendingPrefix::CtrlW;
         assert_eq!(
-            resolve(Mode::Normal, &key(KeyCode::Char('v')), &mut pending, false),
+            resolve(Mode::Normal, &key(KeyCode::Char('v')), &mut pending, 0),
             Action::SplitPane(Direction::Vertical)
         );
     }
@@ -1340,37 +1486,19 @@ mod tests {
         // The rebound follow key now splits vertically.
         let mut pending = PendingPrefix::CtrlW;
         assert_eq!(
-            resolve_with(
-                Mode::Normal,
-                &key(KeyCode::Char('b')),
-                &mut pending,
-                false,
-                &keymap,
-            ),
+            resolve_with(Mode::Normal, &key(KeyCode::Char('b')), &mut pending, &keymap, 0),
             Action::SplitPane(Direction::Vertical)
         );
         // The default `Ctrl-w v` no longer splits vertically.
         let mut pending = PendingPrefix::CtrlW;
         assert_eq!(
-            resolve_with(
-                Mode::Normal,
-                &key(KeyCode::Char('v')),
-                &mut pending,
-                false,
-                &keymap,
-            ),
+            resolve_with(Mode::Normal, &key(KeyCode::Char('v')), &mut pending, &keymap, 0),
             Action::Ignore
         );
         // An unmentioned action keeps its default (`Ctrl-w c` still closes).
         let mut pending = PendingPrefix::CtrlW;
         assert_eq!(
-            resolve_with(
-                Mode::Normal,
-                &key(KeyCode::Char('c')),
-                &mut pending,
-                false,
-                &keymap,
-            ),
+            resolve_with(Mode::Normal, &key(KeyCode::Char('c')), &mut pending, &keymap, 0),
             Action::ClosePane
         );
     }
@@ -1389,7 +1517,7 @@ mod tests {
             ..key(KeyCode::Char('x'))
         };
         assert_eq!(
-            resolve_with(Mode::Normal, &alt_x, &mut pending, false, &keymap),
+            resolve_with(Mode::Normal, &alt_x, &mut pending, &keymap, 0),
             Action::SplitPane(Direction::Horizontal)
         );
 
@@ -1400,18 +1528,12 @@ mod tests {
             ..key(KeyCode::Char('b'))
         };
         assert_eq!(
-            resolve_with(Mode::Normal, &ctrl_b, &mut pending, false, &keymap),
+            resolve_with(Mode::Normal, &ctrl_b, &mut pending, &keymap, 0),
             Action::Ignore
         );
         assert_eq!(pending, PendingPrefix::CtrlW);
         assert_eq!(
-            resolve_with(
-                Mode::Normal,
-                &key(KeyCode::Char('o')),
-                &mut pending,
-                false,
-                &keymap,
-            ),
+            resolve_with(Mode::Normal, &key(KeyCode::Char('o')), &mut pending, &keymap, 0),
             Action::CloseOtherPanes
         );
     }
@@ -1422,13 +1544,13 @@ mod tests {
         for code in [KeyCode::Char('c'), KeyCode::Char('q')] {
             let mut pending = PendingPrefix::CtrlW;
             assert_eq!(
-                resolve(Mode::Normal, &key(code), &mut pending, false),
+                resolve(Mode::Normal, &key(code), &mut pending, 0),
                 Action::ClosePane
             );
         }
         let mut pending = PendingPrefix::CtrlW;
         assert_eq!(
-            resolve(Mode::Normal, &key(KeyCode::Char('o')), &mut pending, false),
+            resolve(Mode::Normal, &key(KeyCode::Char('o')), &mut pending, 0),
             Action::CloseOtherPanes
         );
         assert_eq!(pending, PendingPrefix::None);

@@ -11,7 +11,10 @@ use crate::terminal::pane::{BLOCK_RESERVE_ROWS, MAX_IMAGE_ROWS};
 use crate::terminal::webview;
 use spaceterm_core::spaceterm_proto::EmitBlock;
 use spaceterm_render::renderer::{PaneRect, PaneView};
-use spaceterm_render::{Color, CursorShape, Grid, ImagePlacement, RgbColor, Style, Theme, ThemeRgb};
+use spaceterm_render::{
+    Color, CursorShape, Grid, ImagePlacement, PaletteItem, PaletteView, RgbColor, Style, Theme,
+    ThemeRgb,
+};
 
 use super::{status_bar, App, ImageBlock, ReflowSource};
 
@@ -229,7 +232,35 @@ impl App {
             &self.config.status_bar,
         );
         let status = self.config.status_bar.enabled.then_some(&status);
-        renderer.render(&views, status, Some(&chrome), bell_active, &placements);
+        let palette_view = self.palette.as_ref().map(|p| PaletteView {
+            empty_message: if p.mode == crate::model::palette::PaletteMode::History {
+                "No matching history".to_string()
+            } else if p.mode == crate::model::palette::PaletteMode::RecentDirs {
+                "No recent directories".to_string()
+            } else {
+                "No matching commands".to_string()
+            },
+            items: p
+                .filtered
+                .iter()
+                .map(|&i| PaletteItem {
+                    action: p.entries[i].action.clone(),
+                    label: p.entries[i].label.clone(),
+                    match_positions: p.entries[i].match_positions.clone(),
+                })
+                .collect(),
+            match_underline: self.config.palette_match_underline,
+            query: p.query.clone(),
+            selected: p.selected,
+        });
+        renderer.render(
+            &views,
+            status,
+            Some(&chrome),
+            bell_active,
+            &placements,
+            palette_view.as_ref(),
+        );
 
         let focused = self.tabs[self.active_tab].focused();
         // Tiles for panes outside the active tab are hidden so background tabs
@@ -286,7 +317,7 @@ impl App {
             selection: None,
             cursor_shape: CursorShape::Block,
         };
-        renderer.render(std::slice::from_ref(&view), None, None, false, &[]);
+        renderer.render(std::slice::from_ref(&view), None, None, false, &[], None);
     }
 
     pub(crate) fn create_block_tiles(&mut self, entries: &[(PaneId, BlockEntry)]) {
