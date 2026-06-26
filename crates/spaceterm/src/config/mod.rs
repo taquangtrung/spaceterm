@@ -4,7 +4,7 @@
 //! split across two files:
 //! - `settings.kdl` — appearance and behavior (theme, fonts, colors, menu style,
 //!   status bar).
-//! - `keys.kdl` — keybindings, as top-level mode blocks.
+//! - `keybindings.kdl` — keybindings, as top-level mode blocks.
 //!
 //! A legacy single-file `spaceterm.kdl` (settings + a `keybindings` block) is
 //! still read when neither split file is present.
@@ -48,23 +48,23 @@
 //! }
 //! ```
 //!
-//! `keys.kdl` (mode blocks at the top level):
+//! `keybindings.kdl` (mode blocks at the top level):
 //! ```kdl
 //! normal {
-//!     binding "Ctrl-Space" "toggle_mode"
+//!     binding "C+Space" "toggle_mode"
 //!     binding "j" "focus_down"
 //! }
 //! insert {
-//!     binding "Ctrl-Space" "toggle_mode"
+//!     binding "C+Space" "toggle_mode"
 //! }
 //! // Window management (split / close / focus). The key is one or two chords;
-//! // a two-chord binding sets the leader (default `Ctrl-w`). Actions:
+//! // a two-chord binding sets the leader (default `C+w`). Actions:
 //! // split_vertical, split_horizontal, close_pane, close_other_panes,
 //! // focus_left, focus_down, focus_up, focus_right.
 //! window {
-//!     binding "Ctrl-w v" "split_vertical"
-//!     binding "Ctrl-w c" "close_pane"
-//!     binding "Ctrl-h" "focus_left"
+//!     binding "S+M+-" "split_vertical"
+//!     binding "C+S+q" "close_pane"
+//!     binding "C+h" "focus_left"
 //! }
 //! ```
 
@@ -135,6 +135,8 @@ pub struct Config {
     pub opacity: f32,
     /// Draw an underline under fuzzy-matched characters in the command palette.
     pub palette_match_underline: bool,
+    /// Thickness of the line drawn between adjacent panes, in logical pixels. Default: 2.
+    pub pane_border_width: f32,
     /// Right-click pastes from the clipboard instead of opening the context menu.
     pub paste_on_right_click: bool,
     /// Maximum scrollback rows per pane. `None` uses the compiled-in default (10 000).
@@ -338,6 +340,8 @@ struct KdlConfig {
     #[knuffel(child, unwrap(argument))]
     palette_match_underline: Option<String>,
     #[knuffel(child, unwrap(argument))]
+    pane_border_width: Option<String>,
+    #[knuffel(child, unwrap(argument))]
     paste_on_right_click: Option<String>,
     #[knuffel(child, unwrap(argument))]
     window_controls_side: Option<String>,
@@ -478,7 +482,7 @@ struct KdlKeybindings {
     modes: Vec<KdlModeBindings>,
 }
 
-/// The standalone `keys.kdl` schema: mode blocks at the top level (no wrapping
+/// The standalone `keybindings.kdl` schema: mode blocks at the top level (no wrapping
 /// `keybindings` node), e.g. `normal { binding "j" "focus_down" }`.
 #[derive(knuffel::Decode)]
 struct KdlKeys {
@@ -508,12 +512,12 @@ struct KdlBinding {
 
 impl Config {
     /// Load configuration from `~/.config/spaceterm/`. Settings come from
-    /// `settings.kdl` and keybindings from `keys.kdl`. If neither exists, fall
+    /// `settings.kdl` and keybindings from `keybindings.kdl`. If neither exists, fall
     /// back to the legacy single-file `spaceterm.kdl`; failing that, defaults.
     pub fn load() -> Self {
         let dir = config_dir();
         let settings_path = dir.join("settings.kdl");
-        let keys_path = dir.join("keys.kdl");
+        let keys_path = dir.join("keybindings.kdl");
 
         if settings_path.exists() || keys_path.exists() {
             let settings = std::fs::read_to_string(&settings_path).unwrap_or_default();
@@ -537,7 +541,7 @@ impl Config {
         Self::parse(&text)
     }
 
-    /// Parse settings (`settings.kdl`) and keybindings (`keys.kdl`) from separate
+    /// Parse settings (`settings.kdl`) and keybindings (`keybindings.kdl`) from separate
     /// sources. Keybindings in `keys` replace any present in `settings`.
     pub fn parse_with_keys(settings: &str, keys: &str) -> Self {
         let mut config = Self::parse(settings);
@@ -650,6 +654,12 @@ impl Config {
                 .clamp(0.1, 1.0),
             ligatures: parse_bool(kdl.ligatures.as_deref(), true),
             palette_match_underline: parse_bool(kdl.palette_match_underline.as_deref(), false),
+            pane_border_width: kdl
+                .pane_border_width
+                .as_deref()
+                .and_then(|s| s.parse::<f32>().ok())
+                .map(|w| w.max(1.0))
+                .unwrap_or(1.0),
             paste_on_right_click: parse_bool(kdl.paste_on_right_click.as_deref(), false),
             scrollback_lines: kdl.scrollback_lines.as_deref().and_then(|s| s.parse::<usize>().ok()).filter(|&n| n > 0),
             shell: kdl.shell.filter(|s| !s.trim().is_empty()),
@@ -662,7 +672,7 @@ impl Config {
 
     /// Serialize the appearance/behavior settings as `settings.kdl` text. The
     /// output round-trips through [`Self::parse`]. Keybindings live in a separate
-    /// `keys.kdl` and are intentionally not written here.
+    /// `keybindings.kdl` and are intentionally not written here.
     pub fn to_kdl(&self) -> String {
         let menu_style = match self.menu_style {
             MenuStyle::Classic => "classic",
@@ -698,6 +708,10 @@ impl Config {
         out.push_str(&format!(
             "palette-match-underline {}\n",
             kdl_bool(self.palette_match_underline)
+        ));
+        out.push_str(&format!(
+            "pane-border-width {}\n",
+            kdl_string(&self.pane_border_width.to_string())
         ));
         out.push_str(&format!(
             "ligatures {}\n",
@@ -844,6 +858,7 @@ impl Default for Config {
             menu_style: MenuStyle::default(),
             opacity: 1.0,
             palette_match_underline: false,
+            pane_border_width: 1.0,
             paste_on_right_click: false,
             scrollback_lines: None,
             shell: None,
@@ -908,7 +923,7 @@ pub fn config_file_paths() -> Vec<PathBuf> {
     let dir = config_dir();
     vec![
         dir.join("settings.kdl"),
-        dir.join("keys.kdl"),
+        dir.join("keybindings.kdl"),
         dir.join("spaceterm.kdl"),
     ]
 }
@@ -1042,13 +1057,13 @@ fn cursor_config_from_kdl(kdl: KdlCursor) -> CursorConfig {
     }
 }
 
-/// Parse a standalone `keys.kdl` into the mode -> (key -> action) map. An empty
+/// Parse a standalone `keybindings.kdl` into the mode -> (key -> action) map. An empty
 /// or unparseable file yields an empty map (callers keep their defaults).
 fn parse_keys(text: &str) -> HashMap<String, HashMap<String, String>> {
     if text.trim().is_empty() {
         return HashMap::new();
     }
-    match knuffel::parse::<KdlKeys>("keys.kdl", text) {
+    match knuffel::parse::<KdlKeys>("keybindings.kdl", text) {
         Ok(keys) => keys
             .modes
             .into_iter()
@@ -1347,7 +1362,7 @@ window {
         // Settings come from settings.kdl.
         assert_eq!(config.theme, ThemeSetting::Light);
         assert_eq!(config.menu_style, MenuStyle::Classic);
-        // Keybindings come from keys.kdl (top-level mode blocks).
+        // Keybindings come from keybindings.kdl (top-level mode blocks).
         assert_eq!(
             config.keybindings.get("normal").and_then(|m| m.get("j")),
             Some(&"focus_down".to_string())

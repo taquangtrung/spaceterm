@@ -192,6 +192,8 @@ pub struct PaletteItem {
     pub label: String,
     /// Char indices in `label` that matched the query, used to highlight them.
     pub match_positions: Vec<usize>,
+    /// Keyboard shortcut hint shown on the right (e.g. `"Ctrl-Shift-T"`).
+    pub shortcut: String,
 }
 
 /// The command palette state the renderer needs to draw its overlay.
@@ -293,6 +295,8 @@ pub struct GpuRenderer {
     /// System fonts for SVG text, loaded lazily on first SVG with text and then
     /// reused (the scan costs ~150ms, so it is deferred off the startup path).
     svg_fontdb: Option<std::sync::Arc<resvg::usvg::fontdb::Database>>,
+    /// Thickness of the 1-D line drawn between adjacent panes (in logical pixels).
+    divider_width: f32,
 }
 
 #[repr(C)]
@@ -448,12 +452,18 @@ impl GpuRenderer {
             image_pass,
             chrome_strip_pass,
             svg_fontdb: None,
+            divider_width: DIVIDER_THICKNESS,
         }
     }
 
     /// Apply a new color theme.
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
+    }
+
+    /// Set the thickness (in logical pixels) of the line drawn between adjacent panes.
+    pub fn set_divider_width(&mut self, width: f32) {
+        self.divider_width = width.max(1.0);
     }
 
     /// Decode `encoded` image bytes (PNG/JPEG/GIF/WebP) and cache them as a GPU
@@ -994,7 +1004,7 @@ impl GpuRenderer {
                     let a = panes[i].rect;
                     let b = panes[j].rect;
                     let divider =
-                        compute_divider(a, b, surface_w, surface_h, self.theme.divider.as_linear());
+                        compute_divider(a, b, surface_w, surface_h, self.theme.divider.as_linear(), self.divider_width);
                     if let Some(dv) = divider {
                         all_bg_verts.extend_from_slice(&dv);
                     }
@@ -1357,14 +1367,19 @@ impl GpuRenderer {
             let title_x = close.x + close.w;
             let avail = ((tab.x + tab.w) - (title_x + pad)).max(cw);
             let max_chars = (avail / cw).floor() as usize;
-            let title = truncate_label(&chrome.tabs[i].title, max_chars);
+            let raw_title = if chrome.tabs[i].zoomed {
+                format!("\u{25a1} {}", chrome.tabs[i].title)
+            } else {
+                chrome.tabs[i].title.clone()
+            };
+            let title = truncate_label(&raw_title, max_chars);
             let active = i == chrome.active_tab;
             let color = if active {
                 self.theme.tab_active_fg.to_glyphon()
             } else {
                 muted
             };
-            let buffer = self.chrome_line_buffer(&title, color, active, false);
+            let buffer = self.chrome_line_buffer(&title, color, active, true);
             texts.push(ChromeText {
                 bounds: text_bounds(title_x, tab.y, tab.x + tab.w, tab.y + tab.h),
                 buffer,
@@ -1373,7 +1388,7 @@ impl GpuRenderer {
                 top: vcenter(tab.y, tab.h),
             });
 
-            let close_buf = self.chrome_line_buffer("\u{00d7}", muted, false, false);
+            let close_buf = self.chrome_line_buffer("\u{00d7}", muted, false, true);
             texts.push(ChromeText {
                 bounds: text_bounds(close.x, close.y, close.x + close.w, close.y + close.h),
                 buffer: close_buf,
@@ -1385,7 +1400,7 @@ impl GpuRenderer {
 
         // New-tab button.
         let new_tab = layout.new_tab;
-        let plus = self.chrome_line_buffer("+", muted, false, false);
+        let plus = self.chrome_line_buffer("+", muted, false, true);
         texts.push(ChromeText {
             bounds: text_bounds(
                 new_tab.x,
@@ -2045,29 +2060,37 @@ fn compute_divider(
     surface_w: f32,
     surface_h: f32,
     divider_color: (f32, f32, f32),
+    width: f32,
 ) -> Option<[BgVertex; 6]> {
-    let vertical = (a.y - b.y).abs() < 1.0 && a.height == b.height;
-    let horizontal = (a.x - b.x).abs() < 1.0 && a.width == b.width;
-    if !vertical && !horizontal {
-        return None;
-    }
+    // A vertical divider exists when one pane's right edge meets the other's left
+    // edge and their y-ranges overlap (handles mixed-height layouts).
+    let a_right = a.x + a.width;
+    let b_right = b.x + b.width;
+    let a_bot = a.y + a.height;
+    let b_bot = b.y + b.height;
 
-    let (px0, py0, px1, py1) = if vertical {
-        let x = if a.x < b.x {
-            a.x + a.width
-        } else {
-            b.x + b.width
-        };
-        let x = x - DIVIDER_THICKNESS / 2.0;
-        (x, a.y.min(b.y), x + DIVIDER_THICKNESS, a.y + a.height)
+    let (px0, py0, px1, py1) = if (a_right - b.x).abs() < 1.0 || (b_right - a.x).abs() < 1.0 {
+        let y0 = a.y.max(b.y);
+        let y1 = a_bot.min(b_bot);
+        if y1 <= y0 {
+            return None;
+        }
+        let x = if a.x < b.x { a_right } else { b_right };
+        let x = x - width / 2.0;
+        (x, y0, x + width, y1)
+    } else if (a_bot - b.y).abs() < 1.0 || (b_bot - a.y).abs() < 1.0 {
+        // A horizontal divider when one pane's bottom edge meets the other's top
+        // and their x-ranges overlap (handles mixed-width layouts).
+        let x0 = a.x.max(b.x);
+        let x1 = a_right.min(b_right);
+        if x1 <= x0 {
+            return None;
+        }
+        let y = if a.y < b.y { a_bot } else { b_bot };
+        let y = y - width / 2.0;
+        (x0, y, x1, y + width)
     } else {
-        let y = if a.y < b.y {
-            a.y + a.height
-        } else {
-            b.y + b.height
-        };
-        let y = y - DIVIDER_THICKNESS / 2.0;
-        (a.x.min(b.x), y, a.x + a.width, y + DIVIDER_THICKNESS)
+        return None;
     };
 
     let (r, g, b) = divider_color;
@@ -3152,18 +3175,27 @@ fn palette_rgba(
                 );
             }
 
-            let action_buf =
-                shape_chrome_line(font_system, ctx, &item.action, muted, false, true);
-            let action_w = buffer_width(&action_buf).ceil() as i32;
-            composite_buffer(
-                font_system,
-                swash_cache,
-                &mut rgba,
-                canvas,
-                &action_buf,
-                (origin + panel_w as i32 - action_w - pad_x, row_y),
-                muted,
-            );
+            let hint = if !item.shortcut.is_empty() {
+                item.shortcut.as_str()
+            } else if !item.action.is_empty() {
+                item.action.as_str()
+            } else {
+                ""
+            };
+            if !hint.is_empty() {
+                let hint_buf =
+                    shape_chrome_line(font_system, ctx, hint, muted, false, true);
+                let hint_w = buffer_width(&hint_buf).ceil() as i32;
+                composite_buffer(
+                    font_system,
+                    swash_cache,
+                    &mut rgba,
+                    canvas,
+                    &hint_buf,
+                    (origin + panel_w as i32 - hint_w - pad_x, row_y),
+                    muted,
+                );
+            }
         }
     }
 
@@ -3350,6 +3382,7 @@ mod tests {
             tabs: vec![TabLabel {
                 bell: false,
                 title: "Terminal 1".into(),
+                zoomed: false,
             }],
             context_menu: None,
             url_tooltip: None,

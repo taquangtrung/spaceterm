@@ -141,6 +141,7 @@ impl App {
         self.config.colors.apply(&mut initial_theme);
         renderer.set_theme(initial_theme);
         renderer.set_ligatures(self.config.ligatures);
+        renderer.set_divider_width(self.config.pane_border_width);
 
         let (cols, rows) = renderer.grid_size();
         let want_rows = content_rows(rows);

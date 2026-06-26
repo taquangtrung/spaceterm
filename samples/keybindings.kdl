@@ -1,0 +1,40 @@
+// spaceterm sample keybindings — ~/.config/spaceterm/keybindings.kdl
+//
+// All bindings are shown here at their default values.
+// Remove or edit any line; unmentioned actions keep their built-in defaults.
+//
+// Each binding is `binding "<chord>" "<action>"`.
+//
+// Chords use `+`-separated modifier abbreviations followed by the key name,
+// matching Emacs / rightkeys style:
+//   C = Ctrl, S = Shift, M = Meta/Alt
+//   Named keys: Space, Enter, Esc/Escape, Tab, Backspace, Delete, Home, End,
+//     PageUp, PageDown, Up, Down, Left, Right, Insert, F1..F12.
+//   A single character is itself (e.g. "j").
+//   Two chords separated by a space form a sequence (e.g. "C+w o"):
+//     the first sets the leader, the follow key (matched by code, modifiers
+//     ignored) selects the action.
+//
+// Only the `window` mode is configurable today. `normal`, `insert`, and
+// `visual` use built-in Vim-style defaults.
+
+window {
+    // Split the focused pane.
+    binding "S+M+-" "split_horizontal"
+    binding "S+M+\\" "split_vertical"
+
+    // Zoom the focused pane to fill the window (toggle).
+    binding "S+M+=" "zoom_pane"
+
+    // Close the focused pane.
+    binding "C+S+q" "close_pane"
+
+    // Close every pane except the focused one.
+    binding "S+M+o" "close_other_panes"
+
+    // Move focus between panes.
+    binding "C+h" "focus_left"
+    binding "C+j" "focus_down"
+    binding "C+k" "focus_up"
+    binding "C+l" "focus_right"
+}

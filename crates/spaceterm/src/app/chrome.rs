@@ -195,6 +195,7 @@ impl App {
                 } else {
                     self.tab_title(i)
                 },
+                zoomed: self.tabs[i].is_zoomed(),
             })
             .collect();
         let menus = menu_defs(self.config.menu_style)

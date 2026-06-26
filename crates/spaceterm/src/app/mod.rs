@@ -518,8 +518,10 @@ impl App {
         self.config = Config::load();
         self.window_keymap = WindowKeymap::from_config(self.config.keybindings.get("window"));
         let ligatures = self.config.ligatures;
+        let pane_border_width = self.config.pane_border_width;
         if let Some(r) = &mut self.renderer {
             r.set_ligatures(ligatures);
+            r.set_divider_width(pane_border_width);
         }
         if !self.config.cursor.blink {
             self.blink_phase = true;
@@ -688,14 +690,14 @@ impl App {
     }
 
     /// Close `pane_id` in whichever tab holds it, collapsing its split into the
-    /// sibling. The last pane of a tab is not closed here (tabs are closed via
-    /// [`Self::close_tab`]). Drops all per-pane state and re-lays-out if the
-    /// affected tab is the active one.
+    /// sibling. When it is the last pane in its tab, the whole tab is closed.
+    /// Drops all per-pane state and re-lays-out if the affected tab is the active one.
     fn close_pane_in_any_tab(&mut self, pane_id: PaneId) {
         let Some(tab_idx) = self.tabs.iter().position(|t| t.panes().contains(&pane_id)) else {
             return;
         };
         if self.tabs[tab_idx].panes().len() <= 1 {
+            self.close_tab(tab_idx);
             return;
         }
         self.panes.remove(&pane_id);
@@ -824,7 +826,11 @@ impl App {
 
     /// Close tab `index`, dropping all its panes. The last tab is never closed.
     pub(crate) fn close_tab(&mut self, index: usize) {
-        if self.tabs.len() <= 1 || index >= self.tabs.len() {
+        if index >= self.tabs.len() {
+            return;
+        }
+        if self.tabs.len() <= 1 {
+            self.exit_requested = true;
             return;
         }
         for id in self.tabs[index].panes() {
@@ -1864,7 +1870,7 @@ impl ApplicationHandler for App {
                             if self.palette.is_some() {
                                 self.palette = None;
                             } else {
-                                self.palette = Some(Palette::open());
+                                self.palette = Some(Palette::open(&self.window_keymap));
                             }
                             self.dirty = true;
                             if let Some(window) = &self.window {
@@ -1918,7 +1924,7 @@ impl ApplicationHandler for App {
                             if self.palette.is_some() {
                                 self.palette = None;
                             } else {
-                                self.palette = Some(Palette::open());
+                                self.palette = Some(Palette::open(&self.window_keymap));
                             }
                             self.dirty = true;
                             if let Some(window) = &self.window {
@@ -2019,6 +2025,11 @@ impl ApplicationHandler for App {
                     kitty_flags,
                 );
                 self.handle_action(action, focused);
+                if self.exit_requested {
+                    self.exit_requested = false;
+                    self.quit(event_loop);
+                    return;
+                }
                 self.update_window_title();
                 if let Some(window) = &self.window {
                     window.request_redraw();

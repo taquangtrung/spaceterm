@@ -291,6 +291,7 @@ impl App {
                     action: p.entries[i].action.clone(),
                     label: p.entries[i].label.clone(),
                     match_positions: p.entries[i].match_positions.clone(),
+                    shortcut: p.entries[i].shortcut.clone(),
                 })
                 .collect(),
             match_underline: self.config.palette_match_underline,

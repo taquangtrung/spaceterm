@@ -64,6 +64,8 @@ pub struct TabLabel {
     /// When true, a small bell dot is drawn on the tab to signal an unread notification.
     pub bell: bool,
     pub title: String,
+    /// When true, the focused pane in this tab is zoomed to fill the viewport.
+    pub zoomed: bool,
 }
 
 /// One dropdown menu: a `title` (shown only in the classic menubar) and its
@@ -593,6 +595,7 @@ mod tests {
                 .map(|i| TabLabel {
                     bell: false,
                     title: format!("Tab {i}"),
+                    zoomed: false,
                 })
                 .collect(),
             url_tooltip: None,

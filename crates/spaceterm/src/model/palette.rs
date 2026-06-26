@@ -7,6 +7,8 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+use super::input::WindowKeymap;
+
 // ========================================================================
 // Constants
 // ========================================================================
@@ -33,6 +35,8 @@ pub struct PaletteEntry {
     pub label: String,
     /// Char indices in `label` that matched the current query (for highlight).
     pub match_positions: Vec<usize>,
+    /// Keyboard shortcut hint shown on the right (e.g. `"Ctrl-Shift-T"`).
+    pub shortcut: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -50,8 +54,8 @@ pub struct Palette {
 // ========================================================================
 
 impl Palette {
-    pub fn open() -> Self {
-        let entries = builtin_commands();
+    pub fn open(keymap: &WindowKeymap) -> Self {
+        let entries = builtin_commands(keymap);
         let filtered = (0..entries.len()).collect();
         Palette {
             active: true,
@@ -85,6 +89,7 @@ impl Palette {
                 action: dir.clone(),
                 label: dir,
                 match_positions: Vec::new(),
+                shortcut: String::new(),
             })
             .collect::<Vec<_>>();
         let filtered = (0..entries.len()).collect();
@@ -214,6 +219,7 @@ fn load_history_entries() -> Vec<PaletteEntry> {
             action: cmd.clone(),
             label: cmd,
             match_positions: Vec::new(),
+            shortcut: String::new(),
         })
         .collect()
 }
@@ -276,40 +282,50 @@ fn home_dir() -> Option<PathBuf> {
 // Built-in commands
 // ========================================================================
 
-fn builtin_commands() -> Vec<PaletteEntry> {
-    let entries = [
-        ("cd_recent", "CD: Recent Directory"),
-        ("close_pane", "Close Pane"),
-        ("close_tab", "Close Tab"),
-        ("focus_down", "Focus Pane Down"),
-        ("focus_left", "Focus Pane Left"),
-        ("focus_right", "Focus Pane Right"),
-        ("focus_up", "Focus Pane Up"),
-        ("new_tab", "New Tab"),
-        ("next_block", "Next Block"),
-        ("next_tab", "Next Tab"),
-        ("open_settings", "Settings"),
-        ("prev_block", "Previous Block"),
-        ("prev_tab", "Previous Tab"),
-        ("quick_select", "Quick Select"),
-        ("recent_tab_back", "Recent Tab (Backward)"),
-        ("recent_tab_forward", "Recent Tab (Forward)"),
-        ("search", "Search Blocks"),
-        ("split_horizontal", "Split Horizontal"),
-        ("split_vertical", "Split Vertical"),
-        ("theme_auto", "Theme: Auto"),
-        ("theme_dark", "Theme: Dark"),
-        ("theme_light", "Theme: Light"),
-        ("toggle_fold", "Toggle Fold"),
-        ("toggle_mode", "Toggle Mode (Insert/Normal)"),
-        ("yank_block", "Yank Block Source"),
+fn builtin_commands(keymap: &WindowKeymap) -> Vec<PaletteEntry> {
+    // (action, label, static shortcut hint — empty means look up from keymap)
+    let entries: &[(&str, &str, &str)] = &[
+        ("cd_recent",           "CD: Recent Directory",         "Ctrl-Shift-Z"),
+        ("close_pane",          "Close Pane",                   ""),
+        ("close_tab",           "Close Tab",                    "Ctrl-Shift-W"),
+        ("focus_down",          "Focus Pane Down",              ""),
+        ("focus_left",          "Focus Pane Left",              ""),
+        ("focus_right",         "Focus Pane Right",             ""),
+        ("focus_up",            "Focus Pane Up",                ""),
+        ("new_tab",             "New Tab",                      "Ctrl-Shift-T"),
+        ("next_block",          "Next Block",                   "Ctrl-Shift-Down"),
+        ("next_tab",            "Next Tab",                     "Ctrl-Tab"),
+        ("open_settings",       "Settings",                     "Ctrl-,"),
+        ("prev_block",          "Previous Block",               "Ctrl-Shift-Up"),
+        ("prev_tab",            "Previous Tab",                 "Ctrl-Shift-Tab"),
+        ("quick_select",        "Quick Select",                 ""),
+        ("recent_tab_back",     "Recent Tab (Backward)",        ""),
+        ("recent_tab_forward",  "Recent Tab (Forward)",         ""),
+        ("search",              "Search Blocks",                ""),
+        ("split_horizontal",    "Split Horizontal",             ""),
+        ("split_vertical",      "Split Vertical",               ""),
+        ("theme_auto",          "Theme: Auto",                  ""),
+        ("theme_dark",          "Theme: Dark",                  ""),
+        ("theme_light",         "Theme: Light",                 ""),
+        ("toggle_fold",         "Toggle Fold",                  ""),
+        ("toggle_mode",         "Toggle Mode (Insert/Normal)",  ""),
+        ("toggle_pane_zoom",    "Zoom Pane",                    ""),
+        ("yank_block",          "Yank Block Source",            ""),
     ];
     entries
-        .into_iter()
-        .map(|(action, label)| PaletteEntry {
-            action: action.into(),
-            label: label.into(),
-            match_positions: Vec::new(),
+        .iter()
+        .map(|(action, label, static_hint)| {
+            let shortcut = if !static_hint.is_empty() {
+                static_hint.to_string()
+            } else {
+                keymap.chord_hint(action)
+            };
+            PaletteEntry {
+                action: action.to_string(),
+                label: label.to_string(),
+                match_positions: Vec::new(),
+                shortcut,
+            }
         })
         .collect()
 }
@@ -324,7 +340,7 @@ mod tests {
 
     #[test]
     fn test_palette_open_has_entries() {
-        let p = Palette::open();
+        let p = Palette::open(&WindowKeymap::default());
         assert!(p.active);
         assert!(!p.entries.is_empty());
         assert_eq!(p.filtered.len(), p.entries.len());
@@ -341,7 +357,7 @@ mod tests {
 
     #[test]
     fn test_palette_filter_narrows() {
-        let mut p = Palette::open();
+        let mut p = Palette::open(&WindowKeymap::default());
         let total = p.entries.len();
         for c in "split".chars() {
             p.push_char(c);
@@ -352,7 +368,7 @@ mod tests {
 
     #[test]
     fn test_palette_selection_navigates() {
-        let mut p = Palette::open();
+        let mut p = Palette::open(&WindowKeymap::default());
         assert_eq!(p.selected, 0);
         p.move_down();
         assert_eq!(p.selected, 1);
@@ -362,7 +378,7 @@ mod tests {
 
     #[test]
     fn test_palette_close_resets() {
-        let mut p = Palette::open();
+        let mut p = Palette::open(&WindowKeymap::default());
         p.push_char('s');
         p.move_down();
         p.close();
@@ -372,14 +388,14 @@ mod tests {
 
     #[test]
     fn test_palette_selected_action() {
-        let p = Palette::open();
+        let p = Palette::open(&WindowKeymap::default());
         let action = p.selected_action().unwrap();
         assert_eq!(action, "cd_recent");
     }
 
     #[test]
     fn test_palette_backspace() {
-        let mut p = Palette::open();
+        let mut p = Palette::open(&WindowKeymap::default());
         p.push_char('s');
         p.push_char('p');
         p.pop_char();
@@ -409,7 +425,7 @@ mod tests {
 
     #[test]
     fn test_filter_sets_match_positions() {
-        let mut p = Palette::open();
+        let mut p = Palette::open(&WindowKeymap::default());
         for c in "new tab".chars() {
             p.push_char(c);
         }

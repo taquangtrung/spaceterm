@@ -93,6 +93,8 @@ pub enum Action {
     SendBytes(Vec<u8>),
     SplitPane(Direction),
     SwitchMode(Mode),
+    /// Toggle the focused pane between full-viewport zoom and normal split layout.
+    ZoomPane,
     ToggleFold,
     YankBlock,
     YankSelection,
@@ -192,6 +194,7 @@ pub enum WindowAction {
     FocusUp,
     SplitHorizontal,
     SplitVertical,
+    Zoom,
 }
 
 /// User-configurable window-management key bindings. A binding is either a
@@ -248,6 +251,7 @@ impl WindowAction {
             WindowAction::FocusUp => Action::FocusPane(FocusDir::Up),
             WindowAction::SplitHorizontal => Action::SplitPane(Direction::Horizontal),
             WindowAction::SplitVertical => Action::SplitPane(Direction::Vertical),
+            WindowAction::Zoom => Action::ZoomPane,
         }
     }
 
@@ -262,6 +266,7 @@ impl WindowAction {
             "focus_up" => WindowAction::FocusUp,
             "split_horizontal" => WindowAction::SplitHorizontal,
             "split_vertical" => WindowAction::SplitVertical,
+            "toggle_pane_zoom" | "zoom_pane" => WindowAction::Zoom,
             _ => return None,
         })
     }
@@ -311,10 +316,27 @@ impl WindowKeymap {
 
     /// The action a direct chord triggers, if any.
     fn direct_action(&self, key: &Key) -> Option<WindowAction> {
-        self.direct
-            .iter()
-            .find(|(chord, _)| chord == key)
-            .map(|(_, action)| *action)
+        // Try exact match first. Ctrl+letter keys are reported with their lowercase
+        // character by X11/xkb regardless of Shift, so most Ctrl bindings match here.
+        if let Some(a) = self.direct.iter().find(|(chord, _)| chord == key) {
+            return Some(a.1);
+        }
+        // winit reports `logical_key`, which applies the Shift character transformation
+        // (Shift+\ -> '|', Shift+- -> '_', Shift+= -> '+', Shift+o -> 'O', ...).
+        // Config specs use the physical key label, so retry with the unshifted char.
+        if key.shift {
+            if let KeyCode::Char(c) = key.code {
+                if let Some(base) = unshift_char(c) {
+                    let base_key = Key { code: KeyCode::Char(base), ..*key };
+                    return self
+                        .direct
+                        .iter()
+                        .find(|(chord, _)| chord == &base_key)
+                        .map(|(_, a)| *a);
+                }
+            }
+        }
+        None
     }
 
     /// The action the follow key selects after the leader, if any.
@@ -327,8 +349,10 @@ impl WindowKeymap {
 }
 
 impl Default for WindowKeymap {
-    /// The built-in Vim-style window bindings: `Ctrl-w` leads `v`/`s`/`S`/`c`/
-    /// `q`/`o` for split and close, and `Ctrl-h`/`j`/`k`/`l` focus directly.
+    /// The built-in window bindings: `S+M+-` splits horizontally,
+    /// `S+M+\` splits vertically, `S+M+o` closes other panes, `S+M+=`
+    /// toggles zoom, `C+S+q` closes the pane, and `C+h`/`j`/`k`/`l` focus
+    /// directly.
     fn default() -> Self {
         let ctrl = |c: char| Key {
             alt: false,
@@ -336,29 +360,82 @@ impl Default for WindowKeymap {
             ctrl: true,
             shift: false,
         };
+        let ctrl_shift = |c: char| Key {
+            alt: false,
+            code: KeyCode::Char(c),
+            ctrl: true,
+            shift: true,
+        };
+        let shift_alt = |c: char| Key {
+            alt: true,
+            code: KeyCode::Char(c),
+            ctrl: false,
+            shift: true,
+        };
         Self {
             direct: vec![
+                (shift_alt('-'), WindowAction::SplitHorizontal),
+                (shift_alt('\\'), WindowAction::SplitVertical),
+                (shift_alt('o'), WindowAction::CloseOthers),
+                (shift_alt('='), WindowAction::Zoom),
+                (ctrl_shift('q'), WindowAction::Close),
                 (ctrl('h'), WindowAction::FocusLeft),
                 (ctrl('j'), WindowAction::FocusDown),
                 (ctrl('k'), WindowAction::FocusUp),
                 (ctrl('l'), WindowAction::FocusRight),
             ],
             leader: ctrl('w'),
-            sequence: vec![
-                (KeyCode::Char('v'), WindowAction::SplitVertical),
-                (KeyCode::Char('s'), WindowAction::SplitHorizontal),
-                (KeyCode::Char('S'), WindowAction::SplitHorizontal),
-                (KeyCode::Char('c'), WindowAction::Close),
-                (KeyCode::Char('q'), WindowAction::Close),
-                (KeyCode::Char('o'), WindowAction::CloseOthers),
-            ],
+            sequence: vec![],
         }
     }
 }
 
-/// Parse a key-binding spec of one or two chords (e.g. `"Ctrl-h"` or
-/// `"Ctrl-w v"`) into its keys. Returns `None` on any unrecognized chord or a
-/// length outside 1..=2.
+impl WindowKeymap {
+    /// Return the formatted shortcut hint for a palette command name
+    /// (e.g. `"Ctrl-H"` for `"focus_left"`), or an empty string when unbound.
+    pub fn chord_hint(&self, command: &str) -> String {
+        let Some(action) = WindowAction::from_name(command) else {
+            return String::new();
+        };
+        self.direct
+            .iter()
+            .find(|(_, a)| *a == action)
+            .map(|(key, _)| format_key(key))
+            .unwrap_or_default()
+    }
+}
+
+/// Format a [`Key`] as a human-readable shortcut string (e.g. `"Ctrl-Shift-T"`).
+pub fn format_key(key: &Key) -> String {
+    let mut s = String::new();
+    if key.ctrl  { s.push_str("Ctrl-"); }
+    if key.shift { s.push_str("Shift-"); }
+    if key.alt   { s.push_str("Alt-"); }
+    match key.code {
+        KeyCode::Char(c)  => s.push(c),
+        KeyCode::Backspace => s.push_str("Backspace"),
+        KeyCode::Delete   => s.push_str("Del"),
+        KeyCode::Down     => s.push_str("Down"),
+        KeyCode::End      => s.push_str("End"),
+        KeyCode::Enter    => s.push_str("Enter"),
+        KeyCode::Escape   => s.push_str("Esc"),
+        KeyCode::F(n)     => { s.push('F'); s.push_str(&n.to_string()); }
+        KeyCode::Home     => s.push_str("Home"),
+        KeyCode::Insert   => s.push_str("Ins"),
+        KeyCode::Left     => s.push_str("Left"),
+        KeyCode::PageDown => s.push_str("PgDn"),
+        KeyCode::PageUp   => s.push_str("PgUp"),
+        KeyCode::Right    => s.push_str("Right"),
+        KeyCode::Space    => s.push_str("Space"),
+        KeyCode::Tab      => s.push_str("Tab"),
+        KeyCode::Up       => s.push_str("Up"),
+    }
+    s
+}
+
+/// Parse a key-binding spec of one or two chords (e.g. `"C+h"` or `"C+w v"`)
+/// into its keys. Returns `None` on any unrecognized chord or a length outside
+/// 1..=2.
 fn parse_chord_sequence(spec: &str) -> Option<Vec<Key>> {
     let keys = spec
         .split_whitespace()
@@ -371,24 +448,59 @@ fn parse_chord_sequence(spec: &str) -> Option<Vec<Key>> {
     }
 }
 
-/// Parse a single chord like `"Ctrl-Shift-Space"` into a [`Key`]. Modifiers are
-/// `-`-separated and case-insensitive; the final segment is the key name.
+/// Map a Shift-modified character back to its physical key for US QWERTY,
+/// so binding specs like `"S+M+\\"` match the winit `logical_key` `'|'`.
+fn unshift_char(c: char) -> Option<char> {
+    Some(match c {
+        'A'..='Z' => c.to_ascii_lowercase(),
+        '!' => '1', '@' => '2', '#' => '3', '$' => '4', '%' => '5',
+        '^' => '6', '&' => '7', '*' => '8', '(' => '9', ')' => '0',
+        '_' => '-', '+' => '=', '{' => '[', '}' => ']', '|' => '\\',
+        ':' => ';', '"' => '\'', '<' => ',', '>' => '.', '?' => '/',
+        '~' => '`',
+        _ => return None,
+    })
+}
+
+/// Parse a single chord like `"C+S+Space"` or `"C+w"` into a [`Key`].
+/// Modifiers are `+`-separated and precede the key name. Accepted modifier
+/// tokens (case-sensitive abbreviations take priority):
+///   `C` or `ctrl`/`control` = Ctrl,
+///   `S` or `shift` = Shift,
+///   `M` or `alt`/`meta`/`option` = Alt.
+///
+/// A literal `+` key is written as a trailing `++` (e.g. `"C+S++"`), which
+/// produces two consecutive empty segments when split on `+`.
 fn parse_chord(token: &str) -> Option<Key> {
-    let parts: Vec<&str> = token.split('-').collect();
-    let (mods, name) = parts.split_at(parts.len().checked_sub(1)?);
+    let parts: Vec<&str> = token.split('+').collect();
+    let n = parts.len();
+
+    // Two consecutive trailing empty segments mean the key literal is `+`
+    // (e.g. "C+S++" splits into ["C", "S", "", ""]).
+    let (mods, code) = if n >= 2 && parts[n - 1].is_empty() && parts[n - 2].is_empty() {
+        (&parts[..n - 2], KeyCode::Char('+'))
+    } else {
+        let (m, name) = parts.split_at(n.checked_sub(1)?);
+        (m, parse_key_code(name[0])?)
+    };
 
     let mut key = Key {
         alt: false,
-        code: parse_key_code(name[0])?,
+        code,
         ctrl: false,
         shift: false,
     };
     for modifier in mods {
-        match modifier.to_ascii_lowercase().as_str() {
-            "alt" | "option" | "meta" => key.alt = true,
-            "ctrl" | "control" => key.ctrl = true,
-            "shift" => key.shift = true,
-            _ => return None,
+        match *modifier {
+            "C" => key.ctrl = true,
+            "S" => key.shift = true,
+            "M" => key.alt = true,
+            _ => match modifier.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => key.ctrl = true,
+                "shift" => key.shift = true,
+                "alt" | "meta" | "option" => key.alt = true,
+                _ => return None,
+            },
         }
     }
     Some(key)
@@ -450,14 +562,19 @@ pub fn resolve_with(
     flags: u32,
 ) -> Action {
     match mode {
-        Mode::Insert => resolve_insert(key, flags),
+        Mode::Insert => resolve_insert(key, flags, window),
         Mode::Normal => resolve_normal(key, pending, window),
         Mode::Visual => resolve_visual(key, pending),
-        Mode::BlockFocus => resolve_block_focus(key, flags),
+        Mode::BlockFocus => resolve_block_focus(key, flags, window),
     }
 }
 
-fn resolve_insert(key: &Key, flags: u32) -> Action {
+fn resolve_insert(key: &Key, flags: u32, window: &WindowKeymap) -> Action {
+    // Window direct chords intercept in every mode so pane management works
+    // regardless of what the terminal is doing.
+    if let Some(action) = window.direct_action(key) {
+        return action.to_action();
+    }
     if is_entry_chord(key) {
         return Action::SwitchMode(Mode::Insert.apply(ModeEvent::EnterNormal));
     }
@@ -719,9 +836,12 @@ fn resolve_visual(key: &Key, pending: &mut PendingPrefix) -> Action {
     }
 }
 
-fn resolve_block_focus(key: &Key, flags: u32) -> Action {
+fn resolve_block_focus(key: &Key, flags: u32, window: &WindowKeymap) -> Action {
     if key.code == KeyCode::Escape {
         return Action::SwitchMode(Mode::BlockFocus.apply(ModeEvent::Escape));
+    }
+    if let Some(action) = window.direct_action(key) {
+        return action.to_action();
     }
     Action::ForwardToBlock(encode(key, flags))
 }
@@ -1378,7 +1498,8 @@ mod tests {
     }
 
     #[test]
-    fn test_ctrl_w_prefix_splits_panes() {
+    fn test_ctrl_w_prefix_is_empty_sequence() {
+        // C+w still opens the leader prefix, but no follow keys are bound by default.
         let mut pending = PendingPrefix::None;
         let ctrl_w = Key {
             ctrl: true,
@@ -1390,10 +1511,9 @@ mod tests {
         );
         assert_eq!(pending, PendingPrefix::CtrlW);
         assert_eq!(
-            resolve(Mode::Normal, &key(KeyCode::Char('v')), &mut pending, 0),
-            Action::SplitPane(Direction::Vertical)
+            resolve(Mode::Normal, &key(KeyCode::Char('o')), &mut pending, 0),
+            Action::Ignore
         );
-        assert_eq!(pending, PendingPrefix::None);
     }
 
     #[test]
@@ -1473,36 +1593,54 @@ mod tests {
     }
 
     #[test]
-    fn test_ctrl_w_c_closes_pane() {
-        let mut pending = PendingPrefix::CtrlW;
+    fn test_ctrl_shift_q_closes_pane() {
+        let ctrl_shift_q = Key {
+            alt: false,
+            code: KeyCode::Char('q'),
+            ctrl: true,
+            shift: true,
+        };
+        let mut pending = PendingPrefix::None;
         assert_eq!(
-            resolve(Mode::Normal, &key(KeyCode::Char('c')), &mut pending, 0),
+            resolve(Mode::Normal, &ctrl_shift_q, &mut pending, 0),
             Action::ClosePane
         );
     }
 
     #[test]
-    fn test_ctrl_w_split_aliases() {
-        // `s` and `S` both split horizontally; `v` splits vertically.
-        for code in [KeyCode::Char('s'), KeyCode::Char('S')] {
+    fn test_default_split_bindings() {
+        // Shift-Alt-- splits horizontally; Shift-Alt-\ splits vertically.
+        let shift_alt = |c: char| Key {
+            alt: true,
+            code: KeyCode::Char(c),
+            ctrl: false,
+            shift: true,
+        };
+        let mut pending = PendingPrefix::None;
+        assert_eq!(
+            resolve(Mode::Normal, &shift_alt('-'), &mut pending, 0),
+            Action::SplitPane(Direction::Horizontal)
+        );
+        let mut pending = PendingPrefix::None;
+        assert_eq!(
+            resolve(Mode::Normal, &shift_alt('\\'), &mut pending, 0),
+            Action::SplitPane(Direction::Vertical)
+        );
+        // The old Ctrl-w v/s/S no longer trigger splits by default.
+        for code in [KeyCode::Char('v'), KeyCode::Char('s'), KeyCode::Char('S')] {
             let mut pending = PendingPrefix::CtrlW;
             assert_eq!(
                 resolve(Mode::Normal, &key(code), &mut pending, 0),
-                Action::SplitPane(Direction::Horizontal)
+                Action::Ignore
             );
-            assert_eq!(pending, PendingPrefix::None);
         }
-        let mut pending = PendingPrefix::CtrlW;
-        assert_eq!(
-            resolve(Mode::Normal, &key(KeyCode::Char('v')), &mut pending, 0),
-            Action::SplitPane(Direction::Vertical)
-        );
     }
 
     #[test]
     fn test_parse_chord_modifiers_and_named_keys() {
+        // Abbreviated single-letter modifiers (case-sensitive).
         assert_eq!(
-            parse_chord("Ctrl-w"),
+            parse_chord("C+w"),
             Some(Key {
                 alt: false,
                 code: KeyCode::Char('w'),
@@ -1511,7 +1649,17 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_chord("Ctrl-Shift-Space"),
+            parse_chord("C+S+Space"),
+            Some(Key {
+                alt: false,
+                code: KeyCode::Space,
+                ctrl: true,
+                shift: true,
+            })
+        );
+        // Full names still accepted.
+        assert_eq!(
+            parse_chord("ctrl+shift+Space"),
             Some(Key {
                 alt: false,
                 code: KeyCode::Space,
@@ -1521,13 +1669,42 @@ mod tests {
         );
         assert_eq!(parse_chord("F5").map(|k| k.code), Some(KeyCode::F(5)));
         assert_eq!(parse_chord("v").map(|k| k.code), Some(KeyCode::Char('v')));
-        assert_eq!(parse_chord("Hyper-x"), None);
+        assert_eq!(parse_chord("Hyper+x"), None);
+        // `-` key is just the last segment; no special escaping needed.
+        assert_eq!(
+            parse_chord("S+M+-"),
+            Some(Key {
+                alt: true,
+                code: KeyCode::Char('-'),
+                ctrl: false,
+                shift: true,
+            })
+        );
+        assert_eq!(
+            parse_chord("C+-"),
+            Some(Key {
+                alt: false,
+                code: KeyCode::Char('-'),
+                ctrl: true,
+                shift: false,
+            })
+        );
+        // `+` key is written as a trailing `++`.
+        assert_eq!(
+            parse_chord("C+S++"),
+            Some(Key {
+                alt: false,
+                code: KeyCode::Char('+'),
+                ctrl: true,
+                shift: true,
+            })
+        );
     }
 
     #[test]
     fn test_parse_chord_sequence_length_bounds() {
-        assert_eq!(parse_chord_sequence("Ctrl-w v").map(|k| k.len()), Some(2));
-        assert_eq!(parse_chord_sequence("Ctrl-h").map(|k| k.len()), Some(1));
+        assert_eq!(parse_chord_sequence("C+w v").map(|k| k.len()), Some(2));
+        assert_eq!(parse_chord_sequence("C+h").map(|k| k.len()), Some(1));
         assert_eq!(parse_chord_sequence(""), None);
         assert_eq!(parse_chord_sequence("a b c"), None);
     }
@@ -1535,25 +1712,37 @@ mod tests {
     #[test]
     fn test_config_rebinds_window_action_and_drops_default() {
         let mut bindings = HashMap::new();
-        bindings.insert("Ctrl-w b".to_string(), "split_vertical".to_string());
+        bindings.insert("C+w b".to_string(), "split_horizontal".to_string());
         let keymap = WindowKeymap::from_config(Some(&bindings));
 
-        // The rebound follow key now splits vertically.
+        // The rebound sequence key now splits horizontally.
         let mut pending = PendingPrefix::CtrlW;
         assert_eq!(
             resolve_with(Mode::Normal, &key(KeyCode::Char('b')), &mut pending, &keymap, 0),
-            Action::SplitPane(Direction::Vertical)
+            Action::SplitPane(Direction::Horizontal)
         );
-        // The default `Ctrl-w v` no longer splits vertically.
-        let mut pending = PendingPrefix::CtrlW;
+        // The default S+M+- is dropped because split_horizontal was rebound.
+        let shift_alt_minus = Key {
+            alt: true,
+            code: KeyCode::Char('-'),
+            ctrl: false,
+            shift: true,
+        };
+        let mut pending = PendingPrefix::None;
         assert_eq!(
-            resolve_with(Mode::Normal, &key(KeyCode::Char('v')), &mut pending, &keymap, 0),
+            resolve_with(Mode::Normal, &shift_alt_minus, &mut pending, &keymap, 0),
             Action::Ignore
         );
-        // An unmentioned action keeps its default (`Ctrl-w c` still closes).
-        let mut pending = PendingPrefix::CtrlW;
+        // An unmentioned action keeps its default (Ctrl-Shift-q still closes).
+        let ctrl_shift_q = Key {
+            alt: false,
+            code: KeyCode::Char('q'),
+            ctrl: true,
+            shift: true,
+        };
+        let mut pending = PendingPrefix::None;
         assert_eq!(
-            resolve_with(Mode::Normal, &key(KeyCode::Char('c')), &mut pending, &keymap, 0),
+            resolve_with(Mode::Normal, &ctrl_shift_q, &mut pending, &keymap, 0),
             Action::ClosePane
         );
     }
@@ -1561,8 +1750,8 @@ mod tests {
     #[test]
     fn test_config_custom_leader_and_direct_focus() {
         let mut bindings = HashMap::new();
-        bindings.insert("Alt-x".to_string(), "split_horizontal".to_string());
-        bindings.insert("Ctrl-b o".to_string(), "close_other_panes".to_string());
+        bindings.insert("M+x".to_string(), "split_horizontal".to_string());
+        bindings.insert("C+b o".to_string(), "close_other_panes".to_string());
         let keymap = WindowKeymap::from_config(Some(&bindings));
 
         // A direct, non-default chord splits horizontally.
@@ -1576,7 +1765,7 @@ mod tests {
             Action::SplitPane(Direction::Horizontal)
         );
 
-        // The leader is now Ctrl-b; Ctrl-b then o closes other panes.
+        // The leader is now C+b; C+b then o closes other panes.
         let mut pending = PendingPrefix::None;
         let ctrl_b = Key {
             ctrl: true,
@@ -1594,21 +1783,18 @@ mod tests {
     }
 
     #[test]
-    fn test_ctrl_w_close_aliases() {
-        // `c` and `q` close the focused pane; `o` closes every other pane.
-        for code in [KeyCode::Char('c'), KeyCode::Char('q')] {
-            let mut pending = PendingPrefix::CtrlW;
-            assert_eq!(
-                resolve(Mode::Normal, &key(code), &mut pending, 0),
-                Action::ClosePane
-            );
-        }
-        let mut pending = PendingPrefix::CtrlW;
+    fn test_shift_alt_o_closes_other_panes() {
+        let shift_alt_o = Key {
+            alt: true,
+            code: KeyCode::Char('o'),
+            ctrl: false,
+            shift: true,
+        };
+        let mut pending = PendingPrefix::None;
         assert_eq!(
-            resolve(Mode::Normal, &key(KeyCode::Char('o')), &mut pending, 0),
+            resolve(Mode::Normal, &shift_alt_o, &mut pending, 0),
             Action::CloseOtherPanes
         );
-        assert_eq!(pending, PendingPrefix::None);
     }
 
     // ---- Kitty keyboard protocol encoding -----------------------------------

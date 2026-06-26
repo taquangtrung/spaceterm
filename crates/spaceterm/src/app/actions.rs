@@ -90,6 +90,9 @@ impl App {
             Action::CloseOtherPanes => {
                 self.close_other_panes(focused);
             }
+            Action::ZoomPane => {
+                self.tab_mut().toggle_zoom();
+            }
             Action::MoveTabLeft => {
                 if self.active_tab > 0 {
                     let dst = self.active_tab - 1;

@@ -3,7 +3,7 @@
 // All options are shown here at their default values.
 // Lines you don't change can be removed; unset options fall back to the default.
 //
-// Keybindings live in a separate file: ~/.config/spaceterm/keys.kdl
+// Keybindings live in a separate file: ~/.config/spaceterm/keybindings.kdl
 // User themes live in: ~/.config/spaceterm/themes/<name>.kdl
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
@@ -59,6 +59,9 @@ menu-style "modern"
 // Underline fuzzy-matched characters in the command palette results list.
 palette-match-underline false
 
+// Thickness of the line drawn between adjacent split panes, in logical pixels.
+pane-border-width "1"
+
 // Right-click pastes from the clipboard instead of opening the context menu.
 paste-on-right-click false
 
@@ -108,7 +111,7 @@ status-bar {
 //     cursor-fg        "#000000"
 //     selection-bg     "#fffacd"
 //     selection-fg     "#000000"
-//     split            "#51554f"   // pane divider lines
+//     split            "#51554f"   // pane separator line color (see also pane-border-width)
 //     status-bar-border "#3b414f"  // 1px line above the status bar
 //     visual-bell      "#e08020"   // tab-bar flash color on bell (uses built-in default when unset)
 //
